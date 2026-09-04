@@ -1789,17 +1789,18 @@ class SimpleTransport {
       }
       _fbReady = false;
     }
-    // No PSRAM (ADV) — try body-only 40.8KB in internal SRAM with stricter heap guard
-    // This still fixes body flicker (main chat area) without risking OOM reboot.
-    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 50000)) {
+    // No PSRAM (ADV) — try body-only 8-bit 20.4KB in internal SRAM (vs 40.8KB 16-bit)
+    // 8-bit uses palette, still flicker-free but halves RAM and avoids OOM reboot on FN8 (blue/black flash).
+    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 40000)) {
       _fbReady = false;
       return;
     }
     _fb.setPsram(false);
-    _fb.setColorDepth(16);
+    _fb.setColorDepth(8);
     if (_fb.createSprite(SCREEN_W, BODY_H)) {
       _fbReady = true;
       _fbHeight = BODY_H;
+      // 8-bit palette approx for UI_BG navy / UI_FG white — LovyanGFX auto-maps 565 via palette
       _fb.fillScreen(UI_BG);
       _fb.setTextSize(1);
       _fb.setTextWrap(false);
