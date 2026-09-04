@@ -1060,7 +1060,7 @@ static void drawBottomInput(){
     float alpha = (phase + 1.0f) * 0.5f; // 0..1
     uint8_t g = (uint8_t)(alpha * 255);
     uint16_t col = d.color565(0, g, 0); // green cursor fades in/out
-    d.fillRect(curX, INPUT_Y+2, 2, CHAR_H+2, col);
+    d.fillRect(curX, 123, 6, 9, col);
   }
   // hint for history when blank
   if(gInputLen==0 && gHistCount>0){
@@ -1089,8 +1089,8 @@ void draw_chat_view(){
     int y=1;
     for(int li=startLogical; li<endLogical; ++li){
       const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
-      canvas.setTextColor(0x8410, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
-      canvas.drawFastVLine(64, y, ROW_H, 0x8410);
+      canvas.setTextColor(0x5AEB, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
+      canvas.drawFastVLine(64, y, ROW_H, 0x5AEB);
       char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
       char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt2=out; bool hasNick=false;
       if(txt2[0]=='<' ){ const char* end=strchr(txt2,'>'); if(end){ size_t nlen=end-txt2-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt2,sizeof(bodyTmp)); }
@@ -1120,9 +1120,9 @@ void draw_chat_view(){
     // Header dividers muted grey, text white
     int x=2;
     // Draw truncated title with muted brackets
-    d.setTextColor(0x8410, UI_BG); d.setCursor(x,2); d.print("["); x+=CHAR_W;
+    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print("["); x+=CHAR_W;
     d.setTextColor(0xFFFF, UI_BG); d.setCursor(x,2); d.print(title); x+=strlen(title)*CHAR_W;
-    d.setTextColor(0x8410, UI_BG); d.setCursor(x,2); d.print("]"); x+=CHAR_W;
+    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print("]"); x+=CHAR_W;
     // Fixed HUD anchors
     // Mute at X=145
     char audioTag[7]; uint16_t audioCol;
@@ -1157,7 +1157,7 @@ void draw_chat_view(){
     int curPos=gInputCursor-gInputScroll; int curX=2+CHAR_W+curPos*CHAR_W;
     if(curX>=2 && curX<SCREEN_W-2){
       float phase=sinf((float)millis()/150.0f); float alpha=(phase+1.0f)*0.5f; uint8_t g=(uint8_t)(alpha*255); uint16_t col=d.color565(0,g,0);
-      d.fillRect(curX, INPUT_Y+2, 2, CHAR_H+2, col);
+      d.fillRect(curX, 123, 6, 9, col);
     }
     if(gInputLen==0 && gHistCount>0){ d.setTextColor(UI_DIM, UI_BG); d.setCursor(SCREEN_W-40,INPUT_Y+4); d.print("^v hist"); }
   }
@@ -1182,10 +1182,10 @@ static void drawChatViewport(){
     const ChatLine* cl=ringAt(tab, li);
     if(!cl) continue;
     // COMPACT COLUMN ARRAYS: dimmed timestamp, divider at 64, nick right-aligned, body at 70, ROW 10 with 2px padding
-    canvas.setTextColor(0x8410, UI_BG); // muted grey dimmed timestamp
+    canvas.setTextColor(0x5AEB, UI_BG); // muted grey 0x5AEB per spec
     canvas.setCursor(2, y+1);
     canvas.print(cl->stamp);
-    canvas.drawFastVLine(64, y, ROW_H, 0x8410); // solid vertical dividing line at X=64
+    canvas.drawFastVLine(64, y, ROW_H, 0x5AEB); // solid vertical dividing line at X=64
     char out[MAX_LINE_LEN+1];
     safeCopy(out, cl->text, sizeof(out));
     sanitizeGlyphs(out);
@@ -1324,11 +1324,50 @@ void handle_keyboard_inputs(){
   auto st = M5Cardputer.Keyboard.keysState();
   // HIGH-PRIORITY KEYBOARD MACRO PRECEDENCE: Fn block at absolute top per spec
   if(st.fn){
-    for(char c: st.word){
+    for(char c : st.word){
       if(c=='s' || c=='S'){
         gCfg.current_audio = gCfg.current_audio ? 0 : 1;
         digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH);
         ui_needs_redraw = true;
+        return;
+      }
+      if(c=='b' || c=='B'){
+        run_bouncer_setup_menu();
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c=='t' || c=='T'){
+        // 3-stage LED validation: purple double-flash -> cyan breathing -> orange solid
+        logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
+        for(int r=0;r<2;++r){ neopixelWrite(LED_PIN,60,0,60); vTaskDelay(pdMS_TO_TICKS(100)); neopixelWrite(LED_PIN,0,0,0); vTaskDelay(pdMS_TO_TICKS(100)); }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
+        for(int b=0;b<=40;b+=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); }
+        for(int b=40;b>=0;b-=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
+        neopixelWrite(LED_PIN,40,15,0); vTaskDelay(pdMS_TO_TICKS(1500)); neopixelWrite(LED_PIN,0,0,0);
+        ui_needs_redraw = true; logStatus("LED Diagnostic Cycle Complete."); return;
+      }
+      if(c=='n' || c=='N'){ display_network_jump_hud(); ui_needs_redraw = true; return; }
+      if(c=='/' || c==']' || c=='l' || c=='L'){
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index + i) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
+        }
+        return;
+      }
+      if(c==',' || c=='[' || c=='h' || c=='H'){
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index - i + total_tabs) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
+        }
         return;
       }
     }
@@ -1354,93 +1393,6 @@ void handle_keyboard_inputs(){
       if(k==0x50){ int total_tabs=gTabCount; current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1; ui_needs_redraw = true; return; }
     }
   }
-  // LIVE INJECTION: Fn+B/T/N and Server Skip hotkeys per spec - check status.fn modifier
-  if(st.fn){
-    for(char c : st.word){
-      if(c=='b' || c=='B'){
-        // pause chat loops, call bouncer setup menu
-        run_bouncer_setup_menu();
-        ui_needs_redraw = true;
-        return;
-      }
-      if(c=='t' || c=='T'){
-        // TEST MODE 1 - THE MENTION ALERT (Purple Double-Pulse)
-        logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
-        for(int r=0; r<2; ++r){
-          neopixelWrite(LED_PIN, 60, 0, 60);
-          uint16_t purp = canvas.color565(60, 0, 60);
-          (void)purp;
-          vTaskDelay(pdMS_TO_TICKS(100));
-          neopixelWrite(LED_PIN, 0, 0, 0);
-          vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
-        logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
-        for(int b=0; b<=40; b+=4){
-          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
-          neopixelWrite(LED_PIN, 0, b, 60);
-          (void)col2;
-          vTaskDelay(pdMS_TO_TICKS(25));
-        }
-        for(int b=40; b>=0; b-=4){
-          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
-          neopixelWrite(LED_PIN, 0, b, 60);
-          (void)col2;
-          vTaskDelay(pdMS_TO_TICKS(25));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
-        logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
-        {
-          uint16_t col3 = canvas.color565(40, 15, 0);
-          (void)col3;
-          neopixelWrite(LED_PIN, 40, 15, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        neopixelWrite(LED_PIN, 0, 0, 0);
-        ui_needs_redraw = true;
-        logStatus("LED Diagnostic Cycle Complete.");
-        return;
-      }
-      if(c=='n' || c=='N'){
-        display_network_jump_hud();
-        ui_needs_redraw = true;
-        return;
-      }
-      if(c=='/' || c==']' || c=='l' || c=='L'){
-        // Fn + Right Arrow - DYNAMIC SERVER SKIP LOGIC forward: loop until server changes
-        int total_tabs = gTabCount;
-        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-        for(int i=1; i<total_tabs; ++i){
-          int idx = (current_tab_index + i) % total_tabs;
-          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-          if(!eqI(srv, curServer)){
-            current_tab_index = idx;
-            ui_needs_redraw = true;
-            return;
-          }
-        }
-        return;
-      }
-      if(c==',' || c=='[' || c=='h' || c=='H'){
-        // Fn + Left Arrow - server skip backward
-        int total_tabs = gTabCount;
-        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-        for(int i=1; i<total_tabs; ++i){
-          int idx = (current_tab_index - i + total_tabs) % total_tabs;
-          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-          if(!eqI(srv, curServer)){
-            current_tab_index = idx;
-            ui_needs_redraw = true;
-            return;
-          }
-        }
-        return;
-      }
-    }
-  }
-  // spec wrapper - dirty flag only on active keystroke/char/tab/message
   ui_needs_redraw = true;
 }
 // Overlay navigation helpers for timezone/format
@@ -1463,12 +1415,13 @@ void run_bouncer_setup_menu(){
   bool prevScanner = gInScanner;
   gInScanner = true;
   ui_needs_redraw = true;
-  const char* prompts[4] = {"bnc_host", "bnc_user", "bnc_net", "bnc_pass"};
-  for(int step=0; step<4; ++step){
+  const char* prompts[5] = {"bnc_host", "bnc_port", "bnc_user", "bnc_net", "bnc_pass"};
+  for(int step=0; step<5; ++step){
     char buf[64];
     if(step==0) safeCopy(buf, bnc_host.c_str(), sizeof(buf));
-    else if(step==1) safeCopy(buf, bnc_user, sizeof(buf));
-    else if(step==2) safeCopy(buf, bnc_net, sizeof(buf));
+    else if(step==1){ char portStr[8]; snprintf(portStr,sizeof(portStr),"%d", bnc_port); safeCopy(buf, portStr, sizeof(buf)); }
+    else if(step==2) safeCopy(buf, bnc_user, sizeof(buf));
+    else if(step==3) safeCopy(buf, bnc_net, sizeof(buf));
     else safeCopy(buf, bnc_pass, sizeof(buf));
     int len = strlen(buf);
     int cursor = len;
@@ -1480,7 +1433,7 @@ void run_bouncer_setup_menu(){
     canvas.setTextSize(1);
     canvas.setTextColor(UI_FG, UI_BG);
     canvas.setCursor(4,4);
-    canvas.printf("Bouncer Setup %d/4", step+1);
+    canvas.printf("Bouncer Setup %d/5", step+1);
     canvas.setCursor(4,18);
     canvas.printf("%s:", prompts[step]);
     canvas.setCursor(4,110);
@@ -1536,9 +1489,10 @@ void run_bouncer_setup_menu(){
       vTaskDelay(pdMS_TO_TICKS(30));
     }
     if(step==0) bnc_host = String(buf);
-    else if(step==1){ strncpy(bnc_user, buf, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser, buf, sizeof(gCfg.bncUser)); }
-    else if(step==2){ strncpy(bnc_net, buf, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
-    else if(step==3){ strncpy(bnc_pass, buf, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass, buf, sizeof(gCfg.bncPass)); }
+    else if(step==1){ bnc_port = atoi(buf); }
+    else if(step==2){ strncpy(bnc_user, buf, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser, buf, sizeof(gCfg.bncUser)); }
+    else if(step==3){ strncpy(bnc_net, buf, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
+    else if(step==4){ strncpy(bnc_pass, buf, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass, buf, sizeof(gCfg.bncPass)); }
   }
   saveConfig();
   gInScanner = prevScanner;
@@ -2357,6 +2311,17 @@ static void serviceKeyboard(){
   wakeFromSleep();
   gLastInputMs=millis();
   auto ks = M5Cardputer.Keyboard.keysState();
+  // HIGH-PRIORITY KEYBOARD MACRO PRECEDENCE: Fn block at absolute top per spec
+  if(ks.fn){
+    for(char c : ks.word){
+      if(c=='s' || c=='S'){ gCfg.current_audio = gCfg.current_audio ? 0 : 1; digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH); ui_needs_redraw = true; return; }
+      if(c=='b' || c=='B'){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
+      if(c=='t' || c=='T'){ logStatus("Testing LED: Mention Alert (Purple Double Pulse)..."); for(int r=0;r<2;++r){ neopixelWrite(LED_PIN,60,0,60); vTaskDelay(pdMS_TO_TICKS(100)); neopixelWrite(LED_PIN,0,0,0); vTaskDelay(pdMS_TO_TICKS(100)); } vTaskDelay(pdMS_TO_TICKS(1000)); logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)..."); for(int b=0;b<=40;b+=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); } for(int b=40;b>=0;b-=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); } vTaskDelay(pdMS_TO_TICKS(1000)); logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)..."); neopixelWrite(LED_PIN,40,15,0); vTaskDelay(pdMS_TO_TICKS(1500)); neopixelWrite(LED_PIN,0,0,0); ui_needs_redraw=true; logStatus("LED Diagnostic Cycle Complete."); return; }
+      if(c=='n' || c=='N'){ display_network_jump_hud(); ui_needs_redraw = true; return; }
+      if(c==']' || c=='/' ){ int total_tabs=gTabCount; const char* cur=gTabs[current_tab_index].server[0]?gTabs[current_tab_index].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); for(int i=1;i<total_tabs;++i){ int idx=(current_tab_index+i)%total_tabs; const char* srv=gTabs[idx].server[0]?gTabs[idx].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); if(!eqI(srv,cur)){ current_tab_index=idx; ui_needs_redraw=true; return; } } return; }
+      if(c=='[' || c==','){ int total_tabs=gTabCount; const char* cur=gTabs[current_tab_index].server[0]?gTabs[current_tab_index].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); for(int i=1;i<total_tabs;++i){ int idx=(current_tab_index-i+total_tabs)%total_tabs; const char* srv=gTabs[idx].server[0]?gTabs[idx].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); if(!eqI(srv,cur)){ current_tab_index=idx; ui_needs_redraw=true; return; } } return; }
+    }
+  }
   // Quick Settings overlay active - 5-row grid handling per spec
   if(gQuickOverlay){
     // LIVE INJECTION: Fn+B/T/N and Server Skip hotkeys even inside overlay per spec
