@@ -956,6 +956,53 @@ class SimpleTransport {
     _channelListTruncated=false;
     _channelListLoading=false;
   }
+
+  // Rule 1: Comprehensive channel/tab clearing for server switch
+  void clearChannelTabsComprehensive(const String& targetServerId) {
+    // Completely empty active channels + visual Tab metadata for target server
+    // before it repopulates — prevents stacking on every switch
+    for (int i = (int)_tabs.size() - 1; i >= 0; --i) {
+      if (_tabs[i].type == TabType::Channel || _tabs[i].type == TabType::Query) {
+        // If target specified, only clear that server's tabs; else clear all non-status
+        if (targetServerId.isEmpty() || _tabs[i].serverId == targetServerId) {
+          bool isActiveTab = (i == _activeTab);
+          _tabs.erase(_tabs.begin() + i);
+          if (isActiveTab) _activeTab = 0;
+          else if (i < _activeTab) --_activeTab;
+        }
+      }
+    }
+    if (_activeTab < 0) _activeTab = 0;
+    if (_activeTab >= (int)_tabs.size()) _activeTab = (int)_tabs.size() - 1;
+    if (_tabs.empty()) ensureStatusTab();
+  }
+
+  // Rule 2: Reset sprite and render state metrics for clean tab ribbon
+  void resetTabSpriteState() {
+    // Reset tab bar sprite to pristine RatSpeak ribbon (black bg, cyan ready)
+    if (_spritesReady) {
+      _tabBarSprite.fillScreen(UI_BG);
+      _tabBarSprite.setTextSize(1);
+      _tabBarSprite.setTextWrap(false);
+    } else {
+      // Direct mode fallback — clear nav area
+      if (M5Cardputer.Display.width() > 0) {
+        M5Cardputer.Display.fillRect(0, TAB_Y, SCREEN_W, TAB_H, UI_BG);
+      }
+    }
+    // Reset any cached tab counts / scroll / unread metrics and sprite indices
+    for (auto &t : _tabs) {
+      t.unread = false;
+      t.mention = false;
+      t.scroll = 0;
+    }
+    _serverListSelected = 0;
+    _serverListScroll = 0;
+    _channelListSelected = 0;
+    _channelListScroll = 0;
+    markNavDirty();
+    markAllDirty();
+  }
   void checkRamAndPauseIfNeeded() {
     if (!isHeapLow()) return;
     // Find LRU paused candidate: server not active, not already paused, with most tabs/lines
@@ -6181,29 +6228,48 @@ void IrcClientApp::switchServer(int idx) {
   if (idx<0 || idx>=(int)_servers.size() || idx==_activeServerIdx) return;
   syncConfigToActiveServer();
   saveServers();
-  deduplicateTabs();
+  // Rule 1: Comprehensive clearing — empty active channels + visual Tab metadata
+  // Use target server ID to completely clear its Channel/Query tabs before repopulation
+  // This prevents stacking on every switch (duplicates from autoJoinRestoredChannels/findTab)
+  ServerProfile &target = _servers[idx];
+  clearChannelTabsComprehensive(target.id);
   clearDuplicateChannelLists();
-  // Pause current if heap low, else keep
+  // Rule 2: Reset sprite and render metrics for clean ribbon
+  // ActiveTab reset to 0 and tab bar sprite cleared so ribbon redraws from scratch
+  _activeTab = 0;
+  resetTabSpriteState();
+  // Also clear any pending channel list UI state
+  _channelListOpen = false;
   // Switch
   _activeServerIdx = idx;
   ServerProfile &p = _servers[idx];
   if (p.paused) resumeServer(idx);
   applyServerProfileToConfig(p);
   p.lastActiveMs = millis();
-  // Ensure status tab for new server and migrate legacy
+  // Ensure status tab for new server and migrate legacy (fresh after comprehensive clear)
   ensureStatusTab();
-  migrateLegacyTabs();
+  // Do not migrate legacy after comprehensive clear — would reintroduce stale tabs
+  // deduplicate still needed in case of race
   deduplicateTabs();
-  // Find active tab for this server
+  // Find active tab for this server — after clear, only Status remains, so active is Status
   int found = -1;
-  for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].serverId==p.id) { found=i; break; }
+  for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].serverId==p.id && _tabs[i].type==TabType::Status) { found=i; break; }
   if (found>=0) _activeTab = found;
-  else { // first tab of server is status, ensure
-    for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].type==TabType::Status && _tabs[i].serverId==p.id) { found=i; break; }
+  else {
+    for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].serverId==p.id) { found=i; break; }
     if (found>=0) _activeTab = found;
+    else _activeTab = 0;
+  }
+  // Clamp and reset per-tab scroll/unread for clean render
+  if (_activeTab < 0) _activeTab = 0;
+  if (_activeTab >= (int)_tabs.size()) _activeTab = (int)_tabs.size()-1;
+  if (_activeTab >=0 && _activeTab < (int)_tabs.size()) {
+    _tabs[_activeTab].unread = false;
+    _tabs[_activeTab].mention = false;
+    _tabs[_activeTab].scroll = 0;
   }
   saveServers();
-  // Reconnect with new profile
+  // Reconnect with new profile — will repopulate channels via autoJoin
   scheduleReconnect("Switch to " + p.id);
   markAllDirty();
   logStatus("Switched to server " + p.id + " " + p.host);
