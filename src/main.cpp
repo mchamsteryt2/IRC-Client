@@ -45,10 +45,10 @@ static constexpr uint32_t CONFIG_BUTTON_SHORT_DEBOUNCE_MS = 180;
 static constexpr uint32_t CONFIG_BUTTON_LONG_PRESS_MS = 700;
 static constexpr uint32_t TITLE_SCREEN_MS = 1800;
 
-static constexpr size_t MAX_TAB_LINES = 100;
+static constexpr size_t MAX_TAB_LINES = 350;
 static constexpr size_t MAX_TABS = 24;
-static constexpr size_t MAX_USERS_PER_TAB = 100;
-static constexpr size_t MAX_CHANNEL_LIST_ENTRIES = 100;
+static constexpr size_t MAX_USERS_PER_TAB = 256;
+static constexpr size_t MAX_CHANNEL_LIST_ENTRIES = 320;
 static constexpr size_t MAX_INPUT_CHARS = 700;
 static constexpr uint32_t WIFI_CONNECT_TIMEOUT_MS = 20000;
 static constexpr uint32_t PING_INTERVAL_MS = 60000;
