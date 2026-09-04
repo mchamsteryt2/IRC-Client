@@ -15,6 +15,7 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <esp_system.h>
+#include <esp_heap_caps.h>
 #if __has_include("esp_psram.h")
 #include <esp_psram.h>
 #endif
@@ -1777,12 +1778,6 @@ class SimpleTransport {
 
   void initFrameBuffer() {
     if (_spritesReady) return;
-    // ADV has NO PSRAM (all versions) — 512KB internal SRAM only
-    // Full 240x135@16=64.8KB must never be allocated (heap panic).
-    // Zone sprites 240x12/14/16 @8-bit ~10KB are safe only on PSRAM boards;
-    // on ADV we keep direct rendering with RatSpeak colors and space-padded overwrite.
-    // This matches the 512KB no-PSRAM constraint while preserving flicker mitigation
-    // via no-clear direct body and TAB_H/INPUT_H zone layout.
     bool hasPsram = false;
 #if defined(CONFIG_SPIRAM_SUPPORT)
     hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
@@ -1790,7 +1785,8 @@ class SimpleTransport {
     hasPsram = ESP.getPsramSize() >= 70000;
 #endif
     if (!hasPsram) {
-      // No PSRAM on any Cardputer-Adv — stay direct, high-contrast cyan on black still applies
+      // ADV has NO PSRAM — defer 10KB 8-bit zone sprites until after WiFi (heap panic at 0s)
+      // Direct rendering until then; ensureZoneSprites() will retry after WiFi stable.
       _spritesReady = false;
       return;
     }
@@ -1813,6 +1809,45 @@ class SimpleTransport {
       if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
       if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
     }
+  }
+
+  bool ensureZoneSprites() {
+    if (_spritesReady) return true;
+    // Only retry on ADV (no PSRAM) after WiFi stable and 12s uptime to avoid 0s panic
+    bool hasPsram = false;
+#if defined(CONFIG_SPIRAM_SUPPORT)
+    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
+#else
+    hasPsram = ESP.getPsramSize() >= 70000;
+#endif
+    if (hasPsram) return false; // already tried in initFrameBuffer
+    if (millis() < 12000) return false;
+    if (!_wifiReady) return false;
+    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 60000)) return false;
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 12000) return false;
+    auto try8 = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
+      spr.setPsram(false);
+      spr.setColorDepth(8);
+      spr.setTextSize(1);
+      spr.setTextWrap(false);
+      if (!spr.createSprite(w, h)) return false;
+      spr.fillScreen(UI_BG);
+      return true;
+    };
+    bool ok = true;
+    ok &= try8(_topBarSprite, SCREEN_W, STATUS_H);
+    ok &= try8(_tabBarSprite, SCREEN_W, TAB_H);
+    ok &= try8(_inputSprite, SCREEN_W, INPUT_H);
+    _spritesReady = ok;
+    if (!ok) {
+      if (_topBarSprite.width() > 0) _topBarSprite.deleteSprite();
+      if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
+      if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
+    } else {
+      // Force full redraw once sprites ready
+      markAllDirty();
+    }
+    return ok;
   }
 
   void showBootTitle() {
@@ -5139,6 +5174,7 @@ class SimpleTransport {
 
   void draw() {
     if (_screenSleeping) return;
+    if (!_spritesReady) ensureZoneSprites();
     bool full = _dirty;
     if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
