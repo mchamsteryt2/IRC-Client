@@ -14,6 +14,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
+#include <esp_system.h>
 
 static constexpr int SD_SCK = 40;
 static constexpr int SD_MISO = 39;
@@ -34,9 +35,9 @@ static constexpr uint16_t UI_BORDER = 0x2945;
 
 static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
-static constexpr int HEADER_H = 14;
-static constexpr int INPUT_H = 26;
-static constexpr int NAV_H = 10;
+static constexpr int HEADER_H = 12;
+static constexpr int INPUT_H = 24;
+static constexpr int NAV_H = 9;
 static constexpr int NAV_Y = SCREEN_H - INPUT_H - NAV_H;
 static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = NAV_Y - BODY_Y - 1;
@@ -44,8 +45,8 @@ static constexpr int INPUT_Y = SCREEN_H - INPUT_H;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
 static constexpr int ROW_H = CHAR_H + 2;
-static constexpr int NICK_PANE_W = 76;
-static constexpr int TIMESTAMP_W_CHARS = 6;
+static constexpr int NICK_PANE_W = 64;
+static constexpr int TIMESTAMP_W_CHARS = 5;
 static constexpr int CONFIG_BUTTON_PIN = 0;
 static constexpr uint32_t CONFIG_BUTTON_SHORT_DEBOUNCE_MS = 180;
 static constexpr uint32_t CONFIG_BUTTON_LONG_PRESS_MS = 700;
@@ -223,6 +224,66 @@ struct Config {
   String logRoot = "/IRC";
 };
 
+// Multi-server support — each profile maps to a network that can be paused out of RAM
+static constexpr size_t MAX_SERVERS = 4;
+static constexpr uint32_t MIN_HEAP_BYTES = 35000; // pause LRU network if heap drops below this
+static constexpr const char* SERVERS_PATH = "/irc/servers.txt";
+static constexpr const char* PAUSED_ROOT = "/irc/paused";
+
+struct ServerProfile {
+  String id; // e.g. "libera", "oftc", "custom1"
+  String host;
+  uint16_t port = 6667;
+  bool useTLS = false;
+  bool tlsInsecure = true;
+  String nick = "CardADV";
+  String user = "cardputer";
+  String realname = "Cardputer IRC";
+  String pass;
+  std::vector<String> autoJoin;
+  bool bncEnabled = false;
+  BouncerMode bncMode = BouncerMode::Generic;
+  String bncUser, bncNetwork, bncClient, sojuBindNetId, bncPass;
+  bool saslEnabled = false;
+  String saslUser, saslPass, saslMechanism = "PLAIN";
+  bool paused = false;
+  uint32_t lastActiveMs = 0;
+  String toLine() const {
+    // id|host|port|tls|tlsInsecure|nick|user|realname|pass|autojoin(comma)|bncEnabled|bncMode|...
+    // Keep simple pipe-separated; autojoin uses ',' and is single field
+    String s = id + "|" + host + "|" + String(port) + "|" + (useTLS?"1":"0") + "|" + (tlsInsecure?"1":"0") + "|"
+             + nick + "|" + user + "|" + realname + "|" + pass + "|" + joinStrings(autoJoin, ",") + "|"
+             + (bncEnabled?"1":"0") + "|" + bouncerModeToString(bncMode) + "|" + bncUser + "|" + bncNetwork + "|" + bncClient + "|" + sojuBindNetId + "|" + bncPass + "|"
+             + (saslEnabled?"1":"0") + "|" + saslUser + "|" + saslPass + "|" + saslMechanism + "|" + (paused?"1":"0");
+    return s;
+  }
+  static ServerProfile fromLine(const String& line) {
+    ServerProfile p;
+    // split by '|'
+    std::vector<String> parts;
+    int start = 0;
+    for (int i = 0; i <= (int)line.length(); ++i) {
+      if (i == (int)line.length() || line[i] == '|') {
+        parts.push_back(line.substring(start, i));
+        start = i + 1;
+      }
+    }
+    auto get = [&](size_t idx, const String& def="") -> String { return idx < parts.size() ? parts[idx] : def; };
+    p.id = get(0); p.host = get(1); p.port = (uint16_t)get(2).toInt(); p.useTLS = get(3)=="1"; p.tlsInsecure = get(4)=="1";
+    p.nick = get(5); p.user = get(6); p.realname = get(7); p.pass = get(8);
+    p.autoJoin = splitCsv(get(9));
+    p.bncEnabled = get(10)=="1"; p.bncMode = parseBouncerMode(get(11)); p.bncUser=get(12); p.bncNetwork=get(13); p.bncClient=get(14); p.sojuBindNetId=get(15); p.bncPass=get(16);
+    p.saslEnabled = get(17)=="1"; p.saslUser=get(18); p.saslPass=get(19); p.saslMechanism=get(20).isEmpty()?"PLAIN":get(20); p.paused = get(21)=="1";
+    return p;
+  }
+  static std::vector<String> splitCsv(String s) {
+    std::vector<String> out; int st=0; while(st<=(int)s.length()){int c=s.indexOf(',',st); String it=c<0?s.substring(st):s.substring(st,c); it.trim(); if(!it.isEmpty()) out.push_back(it); if(c<0) break; st=c+1;} return out;
+  }
+  static String joinStrings(const std::vector<String>& v, const String& sep){ String o; for(size_t i=0;i<v.size();++i){ if(i) o+=sep; o+=v[i]; } return o; }
+  static BouncerMode parseBouncerMode(String s){ s.toLowerCase(); s.trim(); return s=="soju"?BouncerMode::Soju:BouncerMode::Generic; }
+  static String bouncerModeToString(BouncerMode m){ return m==BouncerMode::Soju?"soju":"generic"; }
+};
+
 struct TagEntry {
   String key;
   String value;
@@ -321,6 +382,8 @@ struct Tab {
   bool usersDirty = false;
   bool namesBatchActive = false;
   int scroll = 0;
+  String serverId; // which ServerProfile this tab belongs to
+  bool paused = false;
 };
 
 struct TextStyle {
@@ -594,8 +657,15 @@ class IrcClientApp {
     initSD();
     _sdMutex = xSemaphoreCreateRecursiveMutex();
     loadConfig();
+    loadServers();
+    ensureServersFromConfig();
+    // apply active server profile to cfg (overwrites single-server fields)
+    if (!_servers.empty() && _activeServerIdx>=0 && _activeServerIdx<(int)_servers.size()) {
+      applyServerProfileToConfig(_servers[_activeServerIdx]);
+      _selfNick = _cfg.nick;
+    }
     metricsLog(String(APP_NAME) + " metrics ready: bouncer=" +
-      (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
+      (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")) + " servers=" + String(_servers.size()) + " heap=" + String(ESP.getFreeHeap()/1024) + "k");
     applyConfiguredDisplaySettings();
     refreshBatteryStatus(true);
     _lastUserActivityMs = millis();
@@ -627,6 +697,7 @@ class IrcClientApp {
     M5Cardputer.update();
     serviceButtons();
     if (_configOpen) handleConfigKeyboard();
+    else if (_serverListOpen) handleServerListKeyboard();
     else if (_channelListOpen) handleChannelListKeyboard();
     else handleKeyboard();
     serviceWiFi();
@@ -641,6 +712,9 @@ class IrcClientApp {
     serviceTextScroll();
     refreshBatteryStatus();
     serviceDisplayTimeout();
+    // Multi-server RAM guard — pause LRU network if heap low
+    static uint32_t _lastRamCheck = 0;
+    if (millis() - _lastRamCheck > 4000) { _lastRamCheck = millis(); checkRamAndPauseIfNeeded(); }
     if (millis() - _lastUiRefresh >= UI_REFRESH_MS) {
       draw();
       _lastUiRefresh = millis();
@@ -687,6 +761,7 @@ class IrcClientApp {
   }
   int currentSection() const {
     if (_configOpen) return SEC_SETTINGS;
+    if (_serverListOpen) return SEC_SERVERS;
     return sectionForTab(_activeTab);
   }
   int firstTabInSection(int sec) const {
@@ -709,21 +784,28 @@ class IrcClientApp {
   void switchToSection(int sec) {
     if (sec < 0) sec = SEC_COUNT-1;
     if (sec >= SEC_COUNT) sec = 0;
+    if (sec == SEC_SERVERS) {
+      // Servers section shows server list (multi-server)
+      if (_serverListOpen) { markNavDirty(); return; }
+      if (_configOpen) closeConfigPage();
+      if (_channelListOpen) closeChannelListPage();
+      openServerList();
+      return;
+    }
+    // Leaving server list if open
+    if (_serverListOpen) closeServerList();
     // Skip empty channel/chat sections if possible, but allow settings always
-    // Try to find non-empty section in direction if target empty
     int orig = sec;
     for (int tries=0; tries<SEC_COUNT; ++tries) {
       if (sec == SEC_SETTINGS) break;
-      if (firstTabInSection(sec) >= 0 || sec==SEC_SERVERS) break; // servers always has status
+      if (firstTabInSection(sec) >= 0) break;
       sec = (sec + 1) % SEC_COUNT;
       if (sec==orig) break;
     }
     if (sec == SEC_SETTINGS) {
       if (!_configOpen) { openConfigPage(); markAllDirty(); return; }
-      // already in settings
       markNavDirty(); return;
     }
-    // Leaving settings
     if (_configOpen) { closeConfigPage(); }
     int idx = firstTabInSection(sec);
     if (idx >= 0) {
@@ -731,11 +813,100 @@ class IrcClientApp {
       _tabs[_activeTab].unread=false; _tabs[_activeTab].mention=false; _tabs[_activeTab].scroll=0;
       markAllDirty(); markStateDirty();
     } else {
-      // No tabs in section - stay but update nav highlight
       markNavDirty();
     }
   }
   void cycleSection(int delta) { switchToSection(currentSection()+delta); }
+
+  // Multi-server helpers
+  String currentServerId() const {
+    if (_servers.empty()) return _cfg.serverPreset;
+    if (_activeServerIdx >= 0 && _activeServerIdx < (int)_servers.size()) return _servers[_activeServerIdx].id;
+    return _cfg.serverPreset;
+  }
+  ServerProfile* activeServer() {
+    if (_servers.empty() || _activeServerIdx < 0 || _activeServerIdx >= (int)_servers.size()) return nullptr;
+    return &_servers[_activeServerIdx];
+  }
+  void applyServerProfileToConfig(const ServerProfile& p) {
+    _cfg.serverPreset = p.id;
+    _cfg.endpointHost = p.host;
+    _cfg.endpointPort = p.port;
+    _cfg.useTLS = p.useTLS;
+    _cfg.tlsInsecure = p.tlsInsecure;
+    _cfg.nick = p.nick;
+    _cfg.username = p.user;
+    _cfg.realname = p.realname;
+    _cfg.serverPass = p.pass;
+    _cfg.autoJoin = p.autoJoin;
+    _cfg.bncEnabled = p.bncEnabled;
+    _cfg.bncMode = p.bncMode;
+    _cfg.bncUser = p.bncUser;
+    _cfg.bncNetwork = p.bncNetwork;
+    _cfg.bncClient = p.bncClient;
+    _cfg.sojuBindNetId = p.sojuBindNetId;
+    _cfg.bncPass = p.bncPass;
+    _cfg.saslEnabled = p.saslEnabled;
+    _cfg.saslUser = p.saslUser;
+    _cfg.saslPass = p.saslPass;
+    _cfg.saslMechanism = p.saslMechanism;
+    _selfNick = _cfg.nick;
+  }
+  void syncConfigToActiveServer() {
+    ServerProfile* s = activeServer(); if (!s) return;
+    s->host = _cfg.endpointHost; s->port = _cfg.endpointPort; s->useTLS = _cfg.useTLS; s->tlsInsecure = _cfg.tlsInsecure;
+    s->nick = _cfg.nick; s->user = _cfg.username; s->realname = _cfg.realname; s->pass = _cfg.serverPass;
+    s->autoJoin = _cfg.autoJoin;
+    s->bncEnabled = _cfg.bncEnabled; s->bncMode = _cfg.bncMode; s->bncUser=_cfg.bncUser; s->bncNetwork=_cfg.bncNetwork; s->bncClient=_cfg.bncClient; s->sojuBindNetId=_cfg.sojuBindNetId; s->bncPass=_cfg.bncPass;
+    s->saslEnabled=_cfg.saslEnabled; s->saslUser=_cfg.saslUser; s->saslPass=_cfg.saslPass; s->saslMechanism=_cfg.saslMechanism;
+    s->lastActiveMs = millis();
+  }
+  bool isHeapLow() const {
+    // ESP.getFreeHeap() available via Arduino; also esp_get_free_heap_size()
+    uint32_t freeHeap = ESP.getFreeHeap();
+    return freeHeap < MIN_HEAP_BYTES;
+  }
+  void checkRamAndPauseIfNeeded() {
+    if (!isHeapLow()) return;
+    // Find LRU paused candidate: server not active, not already paused, with most tabs/lines
+    int candidate = -1;
+    size_t maxLines = 0;
+    for (int i = 0; i < (int)_servers.size(); ++i) {
+      if (i == _activeServerIdx) continue;
+      if (_servers[i].paused) continue;
+      size_t lines = 0;
+      for (auto &t : _tabs) if (t.serverId == _servers[i].id) lines += t.lines.size();
+      if (lines > maxLines) { maxLines = lines; candidate = i; }
+    }
+    if (candidate >= 0 && maxLines > 0) {
+      pauseServer(candidate);
+      metricsLog("Auto-paused server out of RAM: " + _servers[candidate].id + " heap=" + String(ESP.getFreeHeap()));
+    } else if (isHeapLow()) {
+      // No server to pause — try pausing oldest channel tab of active server
+      int oldest = -1; uint32_t oldestMs = UINT32_MAX;
+      // Approximate LRU via lowest index not active tab and with many lines
+      for (int i = 0; i < (int)_tabs.size(); ++i) {
+        if (i == _activeTab) continue;
+        if (_tabs[i].type != TabType::Channel && _tabs[i].type != TabType::Query) continue;
+        if (_tabs[i].lines.size() > 50 && _tabs[i].serverId == currentServerId()) { oldest = i; break; }
+      }
+      if (oldest >= 0) {
+        String sid = _tabs[oldest].serverId;
+        pauseTabsForServer(sid, true); // pause one tab
+      }
+    }
+  }
+  void pauseServer(int idx);
+  void resumeServer(int idx);
+  void pauseTabsForServer(const String& serverId, bool onlyOneTab = false);
+  void loadServers();
+  void saveServers();
+  void ensureServersFromConfig();
+  void switchServer(int idx);
+  void openServerList();
+  void closeServerList();
+  void drawServerListPage();
+  void handleServerListKeyboard();
 
  private:
   Config _cfg;
@@ -744,6 +915,12 @@ class IrcClientApp {
   SimpleTransport _transport;
   std::vector<Tab> _tabs;
   int _activeTab = 0;
+  // Multi-server
+  std::vector<ServerProfile> _servers;
+  int _activeServerIdx = 0;
+  bool _serverListOpen = false;
+  int _serverListSelected = 0;
+  int _serverListScroll = 0;
   String _input;
   String _rxBuffer;
   String _selfNick;
@@ -1964,6 +2141,7 @@ class IrcClientApp {
     if (pressed && !_configButtonLongHandled && now - _configButtonDownAt >= CONFIG_BUTTON_LONG_PRESS_MS) {
       _configButtonLongHandled = true;
       if (_channelListOpen) closeChannelListPage();
+      if (_serverListOpen) closeServerList();
       if (_configOpen) closeConfigPage();
       else openConfigPage();
       _lastConfigButtonMs = now;
@@ -1972,10 +2150,12 @@ class IrcClientApp {
     if (!pressed && _configButtonPrev) {
       recordUserActivity();
       if (!_configButtonLongHandled && now - _lastConfigButtonMs > CONFIG_BUTTON_SHORT_DEBOUNCE_MS) {
-        if (!_configOpen && !_channelListOpen) {
+        if (!_configOpen && !_channelListOpen && !_serverListOpen) {
           _cfg.nickPaneEnabled = !_cfg.nickPaneEnabled;
           appendLine(statusTab(), String("*** Nick pane ") + (_cfg.nickPaneEnabled ? "on" : "off"));
           markStateDirty();
+        } else if (_serverListOpen) {
+          closeServerList();
         }
         _lastConfigButtonMs = now;
       }
@@ -2403,6 +2583,19 @@ class IrcClientApp {
     f.println("screen_brightness=" + String(cfg.screenBrightness));
     f.close();
     giveSdLock();
+    // Sync active server profile and persist servers list
+    // Do not hold SdLock across saveServers (it takes its own)
+    // Update active server from cfg
+    if (!_servers.empty() && _activeServerIdx>=0 && _activeServerIdx<(int)_servers.size()) {
+      ServerProfile &sp = _servers[_activeServerIdx];
+      // If preset changed, update id to match
+      if (sp.id != cfg.serverPreset) sp.id = cfg.serverPreset;
+      sp.host = cfg.endpointHost; sp.port = cfg.endpointPort; sp.useTLS=cfg.useTLS; sp.tlsInsecure=cfg.tlsInsecure;
+      sp.nick=cfg.nick; sp.user=cfg.username; sp.realname=cfg.realname; sp.pass=cfg.serverPass; sp.autoJoin=cfg.autoJoin;
+      sp.bncEnabled=cfg.bncEnabled; sp.bncMode=cfg.bncMode; sp.bncUser=cfg.bncUser; sp.bncNetwork=cfg.bncNetwork; sp.bncClient=cfg.bncClient; sp.sojuBindNetId=cfg.sojuBindNetId; sp.bncPass=cfg.bncPass;
+      sp.saslEnabled=cfg.saslEnabled; sp.saslUser=cfg.saslUser; sp.saslPass=cfg.saslPass; sp.saslMechanism=cfg.saslMechanism;
+      saveServers();
+    }
   }
 
   void activateConfigField() {
@@ -3737,6 +3930,10 @@ class IrcClientApp {
 
   Tab& statusTab() {
     ensureStatusTab();
+    String sid = currentServerId();
+    for (auto &t : _tabs) if (t.type==TabType::Status && t.serverId==sid) return t;
+    // fallback global
+    for (auto &t : _tabs) if (t.type==TabType::Status) return t;
     return _tabs[0];
   }
 
@@ -3745,24 +3942,59 @@ class IrcClientApp {
       Tab t;
       t.name = "status";
       t.type = TabType::Status;
+      t.serverId = currentServerId();
       _tabs.push_back(t);
       _activeTab = 0;
+      return;
     }
+    String sid = currentServerId();
+    for (auto &t : _tabs) if (t.type==TabType::Status && t.serverId==sid) return;
+    // create per-server status tab
+    Tab t;
+    t.name = "status";
+    t.type = TabType::Status;
+    t.serverId = sid;
+    _tabs.push_back(t);
   }
 
   Tab* findTab(const String& name) {
+    String sid = currentServerId();
     for (Tab& tab : _tabs) {
-      if (equalsIgnoreCase(tab.name, name)) return &tab;
+      if (!equalsIgnoreCase(tab.name, name)) continue;
+      // Status tabs are per-server now; global tabs have empty serverId for legacy
+      if (tab.type == TabType::Status) {
+        if (tab.serverId == sid || (tab.serverId.isEmpty() && sid.isEmpty())) return &tab;
+        // also match global status when searching for status
+        if (equalsIgnoreCase(name, "status") && tab.serverId.isEmpty()) return &tab;
+        continue;
+      }
+      if (tab.serverId == sid || tab.serverId.isEmpty()) return &tab;
     }
+    return nullptr;
+  }
+  Tab* findTabForServer(const String& name, const String& serverId) {
+    for (Tab& tab : _tabs) if (equalsIgnoreCase(tab.name, name) && tab.serverId == serverId) return &tab;
     return nullptr;
   }
 
   Tab& getOrCreateTab(const String& name, TabType type) {
     if (Tab* existing = findTab(name)) return *existing;
-    if (_tabs.size() >= MAX_TABS) return statusTab();
+    // RAM guard: if heap low, try to pause LRU network first
+    if (isHeapLow()) checkRamAndPauseIfNeeded();
+    if (_tabs.size() >= MAX_TABS) {
+      // Try to pause oldest background tab to make room
+      if (isHeapLow()) {
+        for (int i = (int)_tabs.size()-1; i>=0; --i) if (i != _activeTab && _tabs[i].lines.size()>20) { _tabs[i].lines.clear(); _tabs[i].lines.shrink_to_fit(); break; }
+      }
+      if (_tabs.size() >= MAX_TABS) return statusTab();
+    }
     Tab tab;
     tab.name = name;
     tab.type = type;
+    tab.serverId = currentServerId();
+    // Enforce per-server tab limit
+    int perServerCount = 0; for (auto &t: _tabs) if (t.serverId == tab.serverId) ++perServerCount;
+    if (perServerCount >= (int)MAX_TABS_PER_SERVER) return statusTab();
     _tabs.push_back(tab);
     _dirty = true;
     markStateDirty();
@@ -4729,6 +4961,9 @@ class IrcClientApp {
     if (_configOpen) {
       drawConfigPage();
       drawNavBar();
+    } else if (_serverListOpen) {
+      drawServerListPage();
+      drawNavBar();
     } else if (_channelListOpen) {
       drawChannelListPage();
       drawNavBar();
@@ -5023,14 +5258,14 @@ class IrcClientApp {
     uint16_t titleBg = UI_BG;
     uint16_t titleFg = hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG);
     gfx.setTextColor(titleFg, titleBg);
-    gfx.setCursor(14, 3);
+    gfx.setCursor(14, 2);
     gfx.print(dispTitle);
 
     int rx = SCREEN_W - (net.length() * CHAR_W) - 2;
     int minRx = batteryX + batteryTotalW + 4;
     if (rx < minRx) rx = minRx;
     gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(rx, 3);
+    gfx.setCursor(rx, 2);
     gfx.print(net);
     drawBatteryIndicator(gfx, UI_BG);
   }
@@ -5043,7 +5278,7 @@ class IrcClientApp {
     static constexpr int gapW = 1;
 
     int x = (SCREEN_W - (bodyW + tipW + gapW)) / 2;
-    int y = 3;
+    int y = 2;
 
     gfx.fillRect(x - 1, y - 1, bodyW + tipW + gapW + 2, bodyH + 2, bg);
     gfx.drawRect(x, y, bodyW, bodyH, UI_FG);
@@ -5075,13 +5310,13 @@ class IrcClientApp {
     // Modern floating pill — ratspeak style
     gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_BG);
     gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_BORDER);
-    // Pill container
+    // Pill container — subtle, fits 135px height
     const int pillX = 4;
     const int pillY = NAV_Y + 1;
     const int pillW = SCREEN_W - 8;
     const int pillH = NAV_H - 2;
-    gfx.fillRoundRect(pillX, pillY, pillW, pillH, 4, UI_CARD);
-    gfx.drawRoundRect(pillX, pillY, pillW, pillH, 4, UI_BORDER);
+    gfx.fillRoundRect(pillX, pillY, pillW, pillH, 3, UI_CARD);
+    gfx.drawRoundRect(pillX, pillY, pillW, pillH, 3, UI_BORDER);
     const char* labels[SEC_COUNT] = {"SERVERS", "CHANS", "CHATS", "SET"};
     const char* icons[SEC_COUNT] = {"o", "#", "@", "*"};
     int cur = currentSection();
@@ -5092,9 +5327,9 @@ class IrcClientApp {
       bool active = (i == cur);
       bool mention = sectionHasMention(i);
       bool unread = sectionHasUnread(i);
-      // Active pill
+      // Active pill — radius = half height for perfect capsule, inset 1px for border gap
       if (active) {
-        gfx.fillRoundRect(x + 1, pillY + 1, w - 2, pillH - 2, 3, UI_ACCENT);
+        gfx.fillRoundRect(x + 1, pillY + 1, w - 2, pillH - 2, 2, UI_ACCENT);
         gfx.setTextColor(UI_BG, UI_ACCENT);
       } else {
         uint16_t fg = mention ? UI_WARN : (unread ? UI_FG : UI_DIM);
@@ -5555,6 +5790,292 @@ class IrcClientApp {
     }
   }
 };
+
+// Multi-server out-of-RAM pausing implementation
+void IrcClientApp::loadServers() {
+  _servers.clear();
+  if (!_sdReady || !SD.exists(SERVERS_PATH)) return;
+  if (!takeSdLock(100)) return;
+  File f = SD.open(SERVERS_PATH, FILE_READ);
+  if (!f) { giveSdLock(); return; }
+  while (f.available()) {
+    String line = f.readStringUntil('\n'); line.replace("\r",""); line.trim();
+    if (line.isEmpty() || line.startsWith("#")) continue;
+    if (_servers.size() >= MAX_SERVERS) break;
+    ServerProfile p = ServerProfile::fromLine(line);
+    if (p.id.isEmpty() || p.host.isEmpty()) continue;
+    _servers.push_back(p);
+  }
+  f.close();
+  giveSdLock();
+}
+void IrcClientApp::saveServers() {
+  if (!_sdReady) return;
+  if (!takeSdLock(100)) return;
+  ensureDirRecursive("/irc");
+  if (SD.exists(SERVERS_PATH)) SD.remove(SERVERS_PATH);
+  File f = SD.open(SERVERS_PATH, FILE_WRITE);
+  if (!f) { giveSdLock(); return; }
+  for (auto &s : _servers) f.println(s.toLine());
+  f.close();
+  giveSdLock();
+}
+void IrcClientApp::ensureServersFromConfig() {
+  if (!_servers.empty()) {
+    // sync active idx to current preset if not found
+    String curId = _cfg.serverPreset;
+    for (int i=0;i<(int)_servers.size();++i) if (_servers[i].id==curId) { _activeServerIdx=i; return; }
+    return;
+  }
+  // Migrate single config to servers list
+  ServerProfile p;
+  p.id = _cfg.serverPreset;
+  p.host = _cfg.endpointHost; p.port = _cfg.endpointPort; p.useTLS=_cfg.useTLS; p.tlsInsecure=_cfg.tlsInsecure;
+  p.nick=_cfg.nick; p.user=_cfg.username; p.realname=_cfg.realname; p.pass=_cfg.serverPass; p.autoJoin=_cfg.autoJoin;
+  p.bncEnabled=_cfg.bncEnabled; p.bncMode=_cfg.bncMode; p.bncUser=_cfg.bncUser; p.bncNetwork=_cfg.bncNetwork; p.bncClient=_cfg.bncClient; p.sojuBindNetId=_cfg.sojuBindNetId; p.bncPass=_cfg.bncPass;
+  p.saslEnabled=_cfg.saslEnabled; p.saslUser=_cfg.saslUser; p.saslPass=_cfg.saslPass; p.saslMechanism=_cfg.saslMechanism;
+  p.lastActiveMs = millis();
+  _servers.push_back(p);
+  _activeServerIdx = 0;
+  saveServers();
+}
+void IrcClientApp::pauseTabsForServer(const String& serverId, bool onlyOneTab) {
+  if (serverId.isEmpty()) return;
+  if (!takeSdLock(100)) return;
+  String base = String(PAUSED_ROOT) + "/" + safeFileName(serverId);
+  ensureDirRecursive(base);
+  // need to handle recursion deadlock for ensureDir, so we already hold lock recursively
+  int pausedCount = 0;
+  for (auto &tab : _tabs) {
+    if (tab.serverId != serverId) continue;
+    if (tab.paused) continue;
+    if (tab.type==TabType::Status && !onlyOneTab) continue; // keep status unless pausing all
+    // Save tab
+    String path = base + "/" + safeFileName(tab.name) + ".paused";
+    File f = SD.open(path, FILE_WRITE);
+    if (!f) continue;
+    f.println("name=" + tab.name);
+    f.println("type=" + String((int)tab.type));
+    f.println("topic=" + tab.topic);
+    for (auto &l : tab.lines) f.println(l.stampLog + "|" + l.stampShort + "|" + (l.highlight?"1":"0") + (l.own?"1":"0") + (l.notice?"1":"0") + "|" + l.raw);
+    f.close();
+    // Free RAM: keep only last 5 lines for preview, or clear
+    if (onlyOneTab) {
+      if (tab.lines.size() > 5) { tab.lines.erase(tab.lines.begin(), tab.lines.end()-5); }
+      tab.paused = true;
+      giveSdLock();
+      // mark server paused partially
+      for (auto &s : _servers) if (s.id==serverId) s.paused = false; // not fully paused
+      return;
+    } else {
+      tab.lines.clear(); tab.lines.shrink_to_fit();
+      tab.users.clear(); tab.users.shrink_to_fit();
+      tab.paused = true;
+      pausedCount++;
+    }
+  }
+  giveSdLock();
+  if (pausedCount>0) {
+    for (auto &s : _servers) if (s.id==serverId) s.paused = true;
+    saveServers();
+    logStatus("Paused " + String(pausedCount) + " tabs for " + serverId + " (heap " + String(ESP.getFreeHeap()) + ")");
+    markAllDirty();
+  }
+}
+void IrcClientApp::pauseServer(int idx) {
+  if (idx<0 || idx>=(int)_servers.size()) return;
+  if (_servers[idx].paused) return;
+  if (idx==_activeServerIdx) {
+    // pausing active server: switch away first
+    int nxt = -1;
+    for (int i=0;i<(int)_servers.size();++i) if (i!=idx && !_servers[i].paused) { nxt=i; break; }
+    if (nxt>=0) switchServer(nxt);
+    else return; // cannot pause active if no alternative
+  }
+  pauseTabsForServer(_servers[idx].id, false);
+  _servers[idx].paused = true;
+  saveServers();
+}
+void IrcClientApp::resumeServer(int idx) {
+  if (idx<0 || idx>=(int)_servers.size()) return;
+  if (!_servers[idx].paused) return;
+  String sid = _servers[idx].id;
+  String base = String(PAUSED_ROOT) + "/" + safeFileName(sid);
+  if (!takeSdLock(100)) return;
+  if (!SD.exists(base)) { giveSdLock(); _servers[idx].paused=false; saveServers(); return; }
+  // Restore each paused tab file
+  File dir = SD.open(base);
+  if (!dir) { giveSdLock(); return; }
+  // Iterate files in dir (SD open dir)
+  // For simplicity, iterate known tabs by scanning _tabs for paused
+  for (auto &tab : _tabs) {
+    if (tab.serverId != sid || !tab.paused) continue;
+    String path = base + "/" + safeFileName(tab.name) + ".paused";
+    if (!SD.exists(path)) continue;
+    File f = SD.open(path, FILE_READ);
+    if (!f) continue;
+    tab.lines.clear();
+    // first 3 lines are metadata, rest are chat lines
+    bool first=true; int lineNo=0;
+    while (f.available()) {
+      String line = f.readStringUntil('\n'); line.replace("\r","");
+      if (lineNo==0 && line.startsWith("name=")) { lineNo++; continue; }
+      if (lineNo==1 && line.startsWith("type=")) { lineNo++; continue; }
+      if (lineNo==2 && line.startsWith("topic=")) { tab.topic = line.substring(6); lineNo++; continue; }
+      // chat line format: stampLog|stampShort|flags|raw
+      int p1=line.indexOf('|'), p2=line.indexOf('|',p1+1), p3=line.indexOf('|',p2+1);
+      if (p1>0 && p2>p1 && p3>p2) {
+        ChatLine cl;
+        cl.stampLog=line.substring(0,p1);
+        cl.stampShort=line.substring(p1+1,p2);
+        String flags=line.substring(p2+1,p3);
+        cl.highlight=flags.length()>0 && flags[0]=='1';
+        cl.own=flags.length()>1 && flags[1]=='1';
+        cl.notice=flags.length()>2 && flags[2]=='1';
+        cl.raw=line.substring(p3+1);
+        cl.plain=stripIrcFormatting(cl.raw);
+        tab.lines.push_back(cl);
+        if (tab.lines.size() >= MAX_TAB_LINES) break;
+      }
+    }
+    f.close();
+    SD.remove(path);
+    tab.paused = false;
+  }
+  giveSdLock();
+  _servers[idx].paused=false;
+  _servers[idx].lastActiveMs=millis();
+  saveServers();
+  logStatus("Resumed " + sid + " heap " + String(ESP.getFreeHeap()));
+  markAllDirty();
+}
+void IrcClientApp::switchServer(int idx) {
+  if (idx<0 || idx>=(int)_servers.size() || idx==_activeServerIdx) return;
+  // Save current server's tabs if needed (already in RAM) — sync config
+  syncConfigToActiveServer();
+  saveServers();
+  // Pause current if heap low, else keep
+  // Switch
+  _activeServerIdx = idx;
+  ServerProfile &p = _servers[idx];
+  if (p.paused) resumeServer(idx);
+  applyServerProfileToConfig(p);
+  p.lastActiveMs = millis();
+  // Ensure status tab for new server
+  ensureStatusTab();
+  // Find active tab for this server
+  int found = -1;
+  for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].serverId==p.id) { found=i; break; }
+  if (found>=0) _activeTab = found;
+  else { // first tab of server is status, ensure
+    for (int i=0;i<(int)_tabs.size();++i) if (_tabs[i].type==TabType::Status && _tabs[i].serverId==p.id) { found=i; break; }
+    if (found>=0) _activeTab = found;
+  }
+  saveServers();
+  // Reconnect with new profile
+  scheduleReconnect("Switch to " + p.id);
+  markAllDirty();
+  logStatus("Switched to server " + p.id + " " + p.host);
+}
+void IrcClientApp::openServerList() {
+  _serverListOpen = true;
+  _serverListSelected = _activeServerIdx;
+  _serverListScroll = 0;
+  markAllDirty();
+}
+void IrcClientApp::closeServerList() {
+  _serverListOpen = false;
+  markAllDirty();
+}
+void IrcClientApp::drawServerListPage() {
+  auto& gfx = drawTarget();
+  gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
+  gfx.drawFastHLine(0, HEADER_H-1, SCREEN_W, UI_BORDER);
+  gfx.setTextColor(UI_FG, UI_BG);
+  gfx.setCursor(6, 3);
+  gfx.print("SERVERS");
+  String rhs = String(_servers.size()) + "/" + String(MAX_SERVERS) + "  ` close";
+  int rhsW = rhs.length()*CHAR_W+6;
+  gfx.fillRoundRect(SCREEN_W - rhsW -4, 2, rhsW, 10, 4, UI_CARD);
+  gfx.setTextColor(UI_DIM, UI_CARD);
+  gfx.setCursor(SCREEN_W - rhsW -1, 3);
+  gfx.print(rhs);
+  drawBatteryIndicator(gfx, UI_BG);
+  gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+  int visibleRows = bodyVisibleRows();
+  if (_serverListSelected < _serverListScroll) _serverListScroll = _serverListSelected;
+  if (_serverListSelected >= _serverListScroll + visibleRows) _serverListScroll = _serverListSelected - visibleRows + 1;
+  if (_serverListScroll<0) _serverListScroll=0;
+  if (_servers.empty()) {
+    gfx.setTextColor(UI_DIM, UI_BG);
+    gfx.setCursor(8, BODY_Y+10); gfx.print("No servers. Edit /irc/servers.txt");
+    gfx.setCursor(8, BODY_Y+22); gfx.print("or use config preset.");
+  } else {
+    int y = BODY_Y+1;
+    for (int i=_serverListScroll; i<(int)_servers.size() && i<_serverListScroll+visibleRows; ++i) {
+      bool sel = i==_serverListSelected;
+      bool active = i==_activeServerIdx;
+      bool paused = _servers[i].paused;
+      uint16_t bg = sel ? UI_HILITE_BG : UI_CARD;
+      uint16_t bd = sel ? UI_ACCENT : UI_BORDER;
+      gfx.fillRoundRect(2, y, SCREEN_W-4, CHAR_H+2, 3, bg);
+      gfx.drawRoundRect(2, y, SCREEN_W-4, CHAR_H+2, 3, bd);
+      if (active) gfx.fillRect(3, y+1, 2, CHAR_H, UI_ACCENT);
+      if (paused) gfx.fillRect(SCREEN_W-7, y+1, 3, CHAR_H, UI_WARN);
+      // indicator
+      String mark = active ? ">" : (paused ? "z" : " ");
+      gfx.setTextColor(sel?UI_WARN:UI_DIM, bg);
+      gfx.setCursor(6, y); gfx.print(mark);
+      String label = _servers[i].id + " " + _servers[i].host + ":" + String(_servers[i].port) + (paused?" [paused]":"");
+      gfx.setTextColor(sel?UI_ACCENT:UI_FG, bg);
+      gfx.setCursor(14, y);
+      gfx.print(ellipsize(label, 34));
+      y += ROW_H;
+    }
+  }
+  // Input hint area
+  int inputY = INPUT_Y;
+  gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
+  gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
+  gfx.fillRoundRect(4, inputY+2, SCREEN_W-8, INPUT_H-4, 6, UI_CARD);
+  gfx.drawRoundRect(4, inputY+2, SCREEN_W-8, INPUT_H-4, 6, UI_BORDER);
+  gfx.setTextColor(UI_DIM, UI_CARD);
+  gfx.setCursor(8, inputY+6); gfx.print("ENTER switch  DEL pause/resume  ` close");
+  gfx.setCursor(8, inputY+14); gfx.print(String("heap ") + String(ESP.getFreeHeap()/1024) + "k  tabs " + String(_tabs.size()));
+}
+void IrcClientApp::handleServerListKeyboard() {
+  if (!M5Cardputer.Keyboard.isChange()) return;
+  if (!M5Cardputer.Keyboard.isPressed()) return;
+  recordUserActivity();
+  auto ks = M5Cardputer.Keyboard.keysState();
+  if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
+    if (!_servers.empty() && _serverListSelected>=0 && _serverListSelected<(int)_servers.size()) {
+      if (_servers[_serverListSelected].paused) resumeServer(_serverListSelected);
+      switchServer(_serverListSelected);
+      closeServerList();
+    }
+    return;
+  }
+  if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs)) {
+    if (!_servers.empty() && _serverListSelected>=0 && _serverListSelected<(int)_servers.size()) {
+      if (_servers[_serverListSelected].paused) resumeServer(_serverListSelected);
+      else pauseServer(_serverListSelected);
+    }
+    return;
+  }
+  if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
+    _serverListSelected = (_serverListSelected+1)%std::max(1,(int)_servers.size());
+    markBodyDirty(); return;
+  }
+  for (char c : ks.word) {
+    if (c=='`') { if (!shouldHandleDebouncedActionChar(c)) continue; closeServerList(); return; }
+    if (ks.fn && (c==',' || c=='/')) { if (!shouldHandleDebouncedActionChar(c)) continue; cycleSection(c==','?-1:1); closeServerList(); return; }
+    if (!ks.fn && (c==',' || c=='/')) { if (!shouldHandleDebouncedActionChar(c)) continue; cycleSection(c==','?-1:1); closeServerList(); return; }
+    if ((c=='.' || c==';') && !shouldHandleDebouncedActionChar(c)) continue;
+    if (c=='.') { _serverListSelected = std::min((int)_servers.size()-1, _serverListSelected+1); markBodyDirty(); }
+    else if (c==';') { _serverListSelected = std::max(0, _serverListSelected-1); markBodyDirty(); }
+  }
+}
 
 IrcClientApp app;
 
