@@ -1530,7 +1530,7 @@ void run_bouncer_setup_menu(){
           for(char cc : ks2.word){ if(cc=='q' || cc=='Q'){ done=true; menu_needs_redraw = true; break; } }
         }
       }
-      vTaskDelay(pdMS_TO_TICKS(30));
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
     if(step==0) bnc_host = String(buf);
     else if(step==1){ bnc_port = atoi(buf); }
@@ -1570,6 +1570,9 @@ static void serverSkipBackward(){
     }
   }
 }
+
+static void runWifiProvisioning();
+void run_interactive_wifi_manager(){ runWifiProvisioning(); }
 
 void display_network_jump_hud(){
   bool prev = gInScanner;
@@ -1638,7 +1641,7 @@ void display_network_jump_hud(){
       if(changed) menu_needs_redraw = true;
       if(ks.enter) break;
     }
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
   gInScanner = prev;
   ui_needs_redraw = true;
@@ -2152,6 +2155,15 @@ static void runWifiProvisioning(){
       }
       if(selChanged) menu_needs_redraw = true;
       if(ks.enter){ st=PASS; gScanPassLen=0; gScanPass[0]='\0'; menu_needs_redraw = true; }
+      if(ks.alt && ks.del){
+        bnc_host = "";
+        bnc_port = 0;
+        gCfg.host[0]='\0';
+        gCfg.autojoin[0]='\0';
+        gInScanner = false;
+        ui_needs_redraw = true;
+        return;
+      }
       if(ks.del){ gInScanner=false; return; }
     } else {
       bool changed=false;
@@ -2161,6 +2173,18 @@ static void runWifiProvisioning(){
         }
       }
       if(changed) menu_needs_redraw = true;
+      if(ks.alt && ks.del){
+        // DISCARD CORRUPT CREDENTIAL BYPASS: Alt+Backspace emergency escape
+        bnc_host = "";
+        bnc_port = 0;
+        gCfg.host[0]='\0';
+        gCfg.autojoin[0]='\0';
+        safeCopy(gCfg.host, "", sizeof(gCfg.host));
+        safeCopy(gCfg.autojoin, "", sizeof(gCfg.autojoin));
+        gInScanner = false;
+        ui_needs_redraw = true;
+        return;
+      }
       if(ks.del && gScanPassLen>0){ gScanPass[--gScanPassLen]='\0'; menu_needs_redraw = true; }
       else if(ks.del && gScanPassLen==0){ st=PICK; menu_needs_redraw = true; }
       if(ks.enter){
@@ -2204,7 +2228,7 @@ static void runWifiProvisioning(){
       }
       if(ks.tab){ st=PICK; menu_needs_redraw = true; }
     }
-    vTaskDelay(pdMS_TO_TICKS(30));
+    vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
