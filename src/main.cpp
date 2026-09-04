@@ -27,7 +27,7 @@
 static constexpr int SD_SCK  = 40;
 static constexpr int SD_MISO = 39;
 static constexpr int SD_MOSI = 14;
-static constexpr int SD_CS   = 5; // spec mandates SPI compression on CS 5 at 16MHz
+static constexpr int SD_CS   = 12; // Cardputer specific CS hardware line per spec - 12
 
 static constexpr int BATTERY_PIN = 10;
 static constexpr int JACK_DETECT_PIN = 46; // headphone jack detect (active LOW when plugged)
@@ -2054,6 +2054,37 @@ static void handleUserInput(const char* in){
 // ---------------------------------------------------------------------------
 static void runWifiProvisioning(){
   gInScanner=true;
+  // ASYNCHRONOUS ENGINE FORCE & BYPASS GATE: if file system fails to mount, instantly force close
+  if(!gSdReady){
+    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    M5Cardputer.Display.fillScreen(UI_BG);
+    if(irc_mutex) xSemaphoreGive(irc_mutex);
+    bnc_host = "";
+    gCfg.host[0]='\0';
+    gCfg.nick[0]='\0';
+    safeCopy(gCfg.host, "", sizeof(gCfg.host));
+    safeCopy(gCfg.nick, "", sizeof(gCfg.nick));
+    ui_needs_redraw = true;
+    gInScanner = false;
+    return;
+  }
+  // Check Alt+Backspace on entry
+  M5Cardputer.update();
+  auto ks_entry = M5Cardputer.Keyboard.keysState();
+  if(ks_entry.alt && ks_entry.del){
+    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    M5Cardputer.Display.fillScreen(UI_BG);
+    if(irc_mutex) xSemaphoreGive(irc_mutex);
+    bnc_host = "";
+    bnc_port = 0;
+    gCfg.host[0]='\0';
+    gCfg.nick[0]='\0';
+    safeCopy(gCfg.host, "", sizeof(gCfg.host));
+    safeCopy(gCfg.nick, "", sizeof(gCfg.nick));
+    ui_needs_redraw = true;
+    gInScanner = false;
+    return;
+  }
   canvas.fillScreen(UI_BG);
   canvas.setTextSize(1);
   canvas.setTextColor(UI_FG, UI_BG);
@@ -2062,7 +2093,10 @@ static void runWifiProvisioning(){
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(120);
-  int n=WiFi.scanNetworks(false,true);
+  WiFi.scanNetworks(true, true); // Asynchronous per spec
+  // Wait for async scan to complete with yield, not blocking draw
+  while(WiFi.scanComplete() == WIFI_SCAN_RUNNING){ vTaskDelay(pdMS_TO_TICKS(10)); M5Cardputer.update(); }
+  int n=WiFi.scanComplete();
   gScanFound=0;
   struct Ent{ char ssid[33]; int rssi; };
   Ent all[24]; int ac=0;
@@ -2709,7 +2743,7 @@ void setup(){
   // Intermediate init - SPI, SD, config, etc. (all after mutex, before network)
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if(!gSafeBoot){
-    gSdReady = SD.begin(SD_CS, SPI, 16000000);
+    gSdReady = SD.begin(12, SPI, 16000000);
   } else {
     gSdReady = false;
   }
