@@ -19,6 +19,7 @@
 #include <esp_heap_caps.h>
 #include <esp_pm.h>
 #include <driver/adc.h>
+#include <cmath>
 
 // ---------------------------------------------------------------------------
 // Hardware pins and constants
@@ -66,8 +67,8 @@ static constexpr int INPUT_Y = SCREEN_H - INPUT_H;
 
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
-static constexpr int ROW_H  = CHAR_H + 1;
-static constexpr int CHAT_ROWS = CHAT_H / ROW_H; // 12 rows visible
+static constexpr int ROW_H  = 10; // 2-pixel padding window to stop vertical collision bleeding
+static constexpr int CHAT_ROWS = CHAT_H / ROW_H; // 10 rows visible with 10px height
 
 // Input scrolling spec: 38 columns visible before horizontal scroll
 static constexpr int INPUT_VISIBLE_COLS = 38;
@@ -193,6 +194,12 @@ struct Config {
 // Globals - static pre-allocated, no heap in loop pipelines
 // ---------------------------------------------------------------------------
 static Config gCfg;
+// GLOBAL VARIABLE DEFINITIONS for bouncer connection settings per spec - STATIC GLOBAL STORAGE
+static String bnc_host = "";
+static int bnc_port = 0;
+static char bnc_user[32] = {0};
+static char bnc_net[32] = {0};
+static char bnc_pass[64] = {0};
 static Tab gTabs[MAX_TABS];
 static int gTabCount = 0;
 static int gActive = 0;
@@ -291,6 +298,9 @@ static uint32_t gLastBattPoll = 0;
 static float gBattVoltage = 0.0f;
 static bool gQuickOverlay = false; // Quick Settings overlay flag
 static uint32_t gQuickOverlayMs = 0;
+// Dirty flag redraw rule per spec
+bool ui_needs_redraw = true;
+int current_settings_row = 0; // 5-row grid 0-4: 0 Audio,1 Brightness,2 SD Filtering,3 TimeZone,4 Hour Format
 
 // ---------------------------------------------------------------------------
 // C-string helpers - no String in hot paths
@@ -555,6 +565,7 @@ static void ringPush(Tab* tab, const char* txt, uint8_t flags, const char* serve
     tab->unread=true;
     if(flags & 0x01) tab->mention=true;
   }
+  ui_needs_redraw = true; // new background message actively pushed to chat logs
 }
 static bool shouldLog(const Tab* tab, bool isSystemError){
   if(gCfg.logLevel==LOG_NONE) return false;
@@ -681,8 +692,11 @@ static void loadConfig(){
     else if(strcmp(k,"screen_brightness")==0) gCfg.brightness=(uint8_t)constrain(atoi(v),0,10);
     else if(strcmp(k,"current_audio")==0) gCfg.current_audio=atoi(v);
     else if(strcmp(k,"bnc_enabled")==0) gCfg.bncEnabled=strToBoolC(v);
-    else if(strcmp(k,"bnc_user")==0) safeCopy(gCfg.bncUser,v,sizeof(gCfg.bncUser));
-    else if(strcmp(k,"bnc_pass")==0) safeCopy(gCfg.bncPass,v,sizeof(gCfg.bncPass));
+    else if(strcmp(k,"bnc_user")==0) { strncpy(bnc_user, v, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser,v,sizeof(gCfg.bncUser)); }
+    else if(strcmp(k,"bnc_net")==0) { strncpy(bnc_net, v, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
+    else if(strcmp(k,"bnc_pass")==0) { strncpy(bnc_pass, v, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass,v,sizeof(gCfg.bncPass)); }
+    else if(strcmp(k,"bnc_host")==0) bnc_host = String(v);
+    else if(strcmp(k,"bnc_port")==0) bnc_port = atoi(v);
     else if(strcmp(k,"bnc_network")==0) safeCopy(gCfg.bncNetwork,v,sizeof(gCfg.bncNetwork));
     else if(strcmp(k,"bnc_client")==0) safeCopy(gCfg.bncClient,v,sizeof(gCfg.bncClient));
     else if(strcmp(k,"soju_bind_netid")==0) safeCopy(gCfg.sojuNet,v,sizeof(gCfg.sojuNet));
@@ -728,8 +742,11 @@ static void saveConfig(){
   f.printf("screen_brightness=%u\n", gCfg.brightness);
   f.printf("current_audio=%d\n", gCfg.current_audio);
   f.printf("bnc_enabled=%s\n", gCfg.bncEnabled?"true":"false");
-  f.printf("bnc_user=%s\n", gCfg.bncUser);
-  f.printf("bnc_pass=%s\n", gCfg.bncPass);
+  f.printf("bnc_user=%s\n", bnc_user);
+  f.printf("bnc_net=%s\n", bnc_net);
+  f.printf("bnc_pass=%s\n", bnc_pass);
+  f.printf("bnc_host=%s\n", bnc_host.c_str());
+  f.printf("bnc_port=%d\n", bnc_port);
   f.printf("bnc_network=%s\n", gCfg.bncNetwork);
   f.printf("bnc_client=%s\n", gCfg.bncClient);
   f.printf("soju_bind_netid=%s\n", gCfg.sojuNet);
@@ -743,6 +760,30 @@ static void saveConfig(){
   gCfg.timezone_index=gTimezoneIndex; gCfg.use_12_hour_format=gUse12Hour;
   xSemaphoreGive(irc_mutex);
   logStatus("Config saved");
+}
+
+// DYNAMIC BACKUP HOOK: thread-safe backup of active config per spec
+static void trigger_config_backup(){
+  // Enveloped within irc_mutex to safeguard shared SPI bus (SD + ST7789 share same peripheral)
+  if(!irc_mutex || xSemaphoreTake(irc_mutex, portMAX_DELAY)!=pdTRUE) return;
+  // Copy active contents of /irc/config.txt to /irc/config.bak
+  if(SD.exists("/irc/config.bak")) SD.remove("/irc/config.bak");
+  if(!SD.exists("/irc/config.txt")){
+    xSemaphoreGive(irc_mutex);
+    return;
+  }
+  File src = SD.open("/irc/config.txt", FILE_READ);
+  File dst = SD.open("/irc/config.bak", FILE_WRITE);
+  if(src && dst){
+    uint8_t buf[128];
+    while(src.available()){
+      size_t n = src.read(buf, sizeof(buf));
+      if(n>0) dst.write(buf, n);
+    }
+  }
+  if(src) src.close();
+  if(dst) dst.close();
+  xSemaphoreGive(irc_mutex);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +984,12 @@ static void drawBottomInput(){
   int curPos = gInputCursor - gInputScroll;
   int curX = 2 + CHAR_W + curPos*CHAR_W; // 1 char for '>'
   if(curX>=2 && curX < SCREEN_W-2){
-    if((millis()/500)%2==0) d.fillRect(curX, INPUT_Y+2, 2, CHAR_H+2, UI_FG);
+    // SINE-WAVE PULSING CURSOR: smooth green fade via sin(millis()/150.0) no hard flicker
+    float phase = sinf((float)millis() / 150.0f);
+    float alpha = (phase + 1.0f) * 0.5f; // 0..1
+    uint8_t g = (uint8_t)(alpha * 255);
+    uint16_t col = d.color565(0, g, 0); // green cursor fades in/out
+    d.fillRect(curX, INPUT_Y+2, 2, CHAR_H+2, col);
   }
   // hint for history when blank
   if(gInputLen==0 && gHistCount>0){
@@ -959,12 +1005,42 @@ static void ensureTabLayout(Tab* tab){
   if(!shouldLayoutTab(tab)) return; // completely bypass word-wrapping/canvas layout for background tabs
   // layout math would be performed here only on focus switch - deferred until active
 }
-static void drawChatViewport(){
+void draw_chat_view(){
+  if (!ui_needs_redraw) return;
   if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
   gChatCanvas.fillScreen(UI_BG);
   gChatCanvas.setTextSize(1);
   Tab* tab=activeTab();
-  if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); return; }
+  if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); ui_needs_redraw = false; return; }
+  ensureTabLayout(tab);
+  int total=tab->count, vis=CHAT_ROWS, startLogical=total-vis-tab->scroll;
+  if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
+  int y=1;
+  for(int li=startLogical; li<endLogical; ++li){
+    const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
+    gChatCanvas.setTextColor(0x8410,UI_BG); gChatCanvas.setCursor(2,y+1); gChatCanvas.print(cl->stamp);
+    gChatCanvas.drawFastVLine(64,y,ROW_H,0x8410);
+    char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
+    char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt=out; bool hasNick=false;
+    if(txt[0]=='<' ){ const char* end=strchr(txt,'>'); if(end){ size_t nlen=end-txt-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt,sizeof(bodyTmp)); }
+    else if(txt[0]=='*'&&txt[1]==' '){ const char* sp=strchr(txt+2,' '); if(sp){ size_t nlen=sp-(txt+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt,sizeof(bodyTmp));}
+    else safeCopy(bodyTmp,txt,sizeof(bodyTmp));
+    if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; gChatCanvas.setTextColor(col,UI_BG); gChatCanvas.setCursor(xNick,y+1); gChatCanvas.print(nickTmp); }
+    gChatCanvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG),UI_BG);
+    int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
+    gChatCanvas.setCursor(70,y+1); gChatCanvas.print(bodyTmp);
+    y+=ROW_H;
+  }
+  gChatCanvas.pushSprite(0,CHAT_Y);
+  ui_needs_redraw = false;
+}
+static void drawChatViewport(){
+  if (!ui_needs_redraw) return;
+  if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
+  gChatCanvas.fillScreen(UI_BG);
+  gChatCanvas.setTextSize(1);
+  Tab* tab=activeTab();
+  if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); ui_needs_redraw = false; return; }
   ensureTabLayout(tab); // lazy trigger - inactive tabs have bypassed this until now
   int total = tab->count;
   int vis = CHAT_ROWS;
@@ -976,66 +1052,48 @@ static void drawChatViewport(){
   for(int li=startLogical; li<endLogical; ++li){
     const ChatLine* cl=ringAt(tab, li);
     if(!cl) continue;
-    gChatCanvas.setCursor(1, y);
-    gChatCanvas.setTextColor(UI_DIM, UI_BG);
+    // COMPACT COLUMN ARRAYS: dimmed timestamp, divider at 64, nick right-aligned, body at 70, ROW 10 with 2px padding
+    gChatCanvas.setTextColor(0x8410, UI_BG); // muted grey dimmed timestamp
+    gChatCanvas.setCursor(2, y+1);
     gChatCanvas.print(cl->stamp);
-    gChatCanvas.print(" ");
-    // Glyph sanitizer: ensure printable ASCII 32..126 before drawing
+    gChatCanvas.drawFastVLine(64, y, ROW_H, 0x8410); // solid vertical dividing line at X=64
     char out[MAX_LINE_LEN+1];
     safeCopy(out, cl->text, sizeof(out));
     sanitizeGlyphs(out);
-    if((int)strlen(out) > (SCREEN_W - (5*CHAR_W) - 8)/CHAR_W){
-      int maxCols = (SCREEN_W - (5*CHAR_W) - 8)/CHAR_W;
-      if(maxCols>0){ out[maxCols-1]='~'; out[maxCols]='\0'; }
-    }
-    // Nick dynamic color hash: sum ASCII %6 -> one of 6 high-contrast tokens
     char nickTmp[32]={0};
+    char bodyTmp[MAX_LINE_LEN+1]={0};
     const char* txt = out;
-    bool isChat = (txt[0]=='<' );
-    if(isChat){
+    bool hasNick=false;
+    if(txt[0]=='<' ){
       const char* end = strchr(txt, '>');
       if(end){
         size_t nlen = end - txt -1;
-        if(nlen < sizeof(nickTmp)){ memcpy(nickTmp, txt+1, nlen); nickTmp[nlen]='\0'; }
-        uint16_t col = nickHashColor(nickTmp);
-        // draw nick part with hash color
-        gChatCanvas.setTextColor(col, UI_BG);
-        // print "<nick>" segment
-        char prefix[34]; snprintf(prefix,sizeof(prefix),"<%s>", nickTmp);
-        gChatCanvas.print(prefix);
-        gChatCanvas.setTextColor(UI_FG, UI_BG);
-        gChatCanvas.print(end+1);
-      } else {
-        if(cl->flags & 0x01) gChatCanvas.setTextColor(UI_WARN, UI_BG);
-        else if(cl->flags & 0x04) gChatCanvas.setTextColor(UI_DIM, UI_BG);
-        else gChatCanvas.setTextColor(UI_FG, UI_BG);
-        gChatCanvas.print(out);
-      }
+        if(nlen < sizeof(nickTmp)){ memcpy(nickTmp, txt+1, nlen); nickTmp[nlen]='\0'; hasNick=true; }
+        const char* body = end+1; while(*body==' ') body++; safeCopy(bodyTmp, body, sizeof(bodyTmp));
+      } else { safeCopy(bodyTmp, txt, sizeof(bodyTmp)); }
     } else if(txt[0]=='*' && txt[1]==' '){
-      // action: "* nick rest" - color nick
-      char* sp = strchr((char*)txt+2, ' ');
+      const char* sp = strchr(txt+2, ' ');
       if(sp){
         size_t nlen = sp - (txt+2);
-        if(nlen < sizeof(nickTmp)){ memcpy(nickTmp, txt+2, nlen); nickTmp[nlen]='\0'; }
-        uint16_t col = nickHashColor(nickTmp);
-        gChatCanvas.setTextColor(UI_DIM, UI_BG);
-        gChatCanvas.print("* ");
-        gChatCanvas.setTextColor(col, UI_BG);
-        gChatCanvas.print(nickTmp);
-        gChatCanvas.setTextColor(UI_FG, UI_BG);
-        gChatCanvas.print(sp);
-      } else {
-        if(cl->flags & 0x01) gChatCanvas.setTextColor(UI_WARN, UI_BG);
-        else gChatCanvas.setTextColor(UI_FG, UI_BG);
-        gChatCanvas.print(out);
-      }
-    } else {
-      if(cl->flags & 0x01) gChatCanvas.setTextColor(UI_WARN, UI_BG);
-      else if(cl->flags & 0x04) gChatCanvas.setTextColor(UI_DIM, UI_BG);
-      else gChatCanvas.setTextColor(UI_FG, UI_BG);
-      // try nick hash for any embedded nick at start of text after "<"
-      gChatCanvas.print(out);
+        if(nlen < sizeof(nickTmp)){ memcpy(nickTmp, txt+2, nlen); nickTmp[nlen]='\0'; hasNick=true; }
+        const char* body = sp+1; safeCopy(bodyTmp, body, sizeof(bodyTmp));
+      } else { safeCopy(bodyTmp, txt, sizeof(bodyTmp)); }
+    } else { safeCopy(bodyTmp, txt, sizeof(bodyTmp)); }
+    if(hasNick && nickTmp[0]){
+      uint16_t col = nickHashColor(nickTmp);
+      int nickW = strlen(nickTmp)*CHAR_W;
+      int xNick = 64 - nickW - 4;
+      if(xNick < 32) xNick = 32;
+      gChatCanvas.setTextColor(col, UI_BG);
+      gChatCanvas.setCursor(xNick, y+1);
+      gChatCanvas.print(nickTmp);
     }
+    // Message body starting at X=70
+    gChatCanvas.setTextColor((cl->flags & 0x01)?UI_WARN:((cl->flags & 0x04)?0x8410:UI_FG), UI_BG);
+    int maxBodyCols = (SCREEN_W - 70 -2)/CHAR_W;
+    if((int)strlen(bodyTmp) > maxBodyCols){ bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0'; }
+    gChatCanvas.setCursor(70, y+1);
+    gChatCanvas.print(bodyTmp);
     y += ROW_H;
   }
   if(gNickOverlay && tab->type==TAB_CHANNEL){
@@ -1057,10 +1115,9 @@ static void drawChatViewport(){
     if(tab->nickCount>8){ gChatCanvas.setCursor(px+4, ny); gChatCanvas.print("..."); }
   }
   gChatCanvas.pushSprite(0, CHAT_Y);
-  // Quick Settings overlay on top (if active) - shows battery metric and status
+  // Quick Settings overlay - 5-row grid: 0 Audio,1 Brightness,2 SD Filtering,3 TimeZone,4 Hour Format
   if(gQuickOverlay){
-    // centered 200x90 box - appended timezone & clock format rows per spec
-    int ow=200, oh=90;
+    int ow=200, oh=110;
     int ox=(SCREEN_W-ow)/2;
     int oy=CHAT_Y + (CHAT_H-oh)/2;
     M5Cardputer.Display.fillRect(ox,oy,ow,oh, UI_BG);
@@ -1068,31 +1125,44 @@ static void drawChatViewport(){
     M5Cardputer.Display.setTextSize(1);
     M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+6);
-    M5Cardputer.Display.print("Quick Settings");
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    // Row highlight for overlay navigation (gQuickOverlayRow 0=timezone, 1=clock)
-    // Timezone row - cycle via Left/Right
-    if(gQuickOverlayRow==0) M5Cardputer.Display.fillRect(ox+2, oy+16, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
+    M5Cardputer.Display.print("Quick Settings 5-row");
+    // Row 0 Audio Profile
+    if(current_settings_row==0) M5Cardputer.Display.fillRect(ox+2, oy+16, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
     else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+18);
-    M5Cardputer.Display.printf("TZ:%s %+d", TZ_PROFILES[gTimezoneIndex].label, TZ_PROFILES[gTimezoneIndex].offset);
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    if(gQuickOverlayRow==1) M5Cardputer.Display.fillRect(ox+2, oy+26, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
+    M5Cardputer.Display.printf("Audio:%s", gCfg.current_audio?"Stealth":"Normal");
+    // Row 1 Brightness Level
+    if(current_settings_row==1) M5Cardputer.Display.fillRect(ox+2, oy+26, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
     else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+28);
-    M5Cardputer.Display.printf("Clock:%s", gUse12Hour?"12H":"24H");
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
+    M5Cardputer.Display.printf("Bright:%d/10", gCfg.brightness);
+    // Row 2 SD Filtering Level
+    if(current_settings_row==2) M5Cardputer.Display.fillRect(ox+2, oy+36, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
+    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+38);
-    M5Cardputer.Display.printf("Batt: %.2fV (GPIO10)", gBattVoltage);
+    M5Cardputer.Display.printf("SD Filter:%s", logLevelStr(gCfg.logLevel));
+    // Row 3 Local TimeZone
+    if(current_settings_row==3) M5Cardputer.Display.fillRect(ox+2, oy+46, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
+    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+48);
-    M5Cardputer.Display.printf("Bright:%d Log:%s", gCfg.brightness, logLevelStr(gCfg.logLevel));
+    M5Cardputer.Display.printf("TZ:%s %+d", TZ_PROFILES[gTimezoneIndex].label, TZ_PROFILES[gTimezoneIndex].offset);
+    // Row 4 Hour Format
+    if(current_settings_row==4) M5Cardputer.Display.fillRect(ox+2, oy+56, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
+    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+58);
-    M5Cardputer.Display.printf("Jack:%s Amp:%s Aud:%d", gJackPlugged?"PLUG":"OPEN", digitalRead(AMP_SHUTDOWN_PIN)==LOW?"MUTE":"ON", gCfg.current_audio);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
+    M5Cardputer.Display.printf("Hour:%s", gUse12Hour?"12H":"24H");
+    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
     M5Cardputer.Display.setCursor(ox+6, oy+68);
-    M5Cardputer.Display.print("<>TZ  < >Clock UpDnSel");
+    M5Cardputer.Display.printf("Batt:%.2fV", gBattVoltage);
     M5Cardputer.Display.setCursor(ox+6, oy+78);
-    M5Cardputer.Display.print("G0=close Fn+Q toggle");
+    M5Cardputer.Display.printf("Jack:%s", gJackPlugged?"PLUG":"OPEN");
+    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
+    M5Cardputer.Display.setCursor(ox+6, oy+88);
+    M5Cardputer.Display.print("Up/Dn Row  <>Value");
+    M5Cardputer.Display.setCursor(ox+6, oy+98);
+    M5Cardputer.Display.print("G0=save Fn+Q toggle");
+    // keep legacy alias in sync
+    gQuickOverlayRow = current_settings_row;
   }
 }
 
@@ -1101,20 +1171,133 @@ static void toggleQuickOverlay(){
   gQuickOverlay = !gQuickOverlay;
   gQuickOverlayMs = millis();
   gQuickOverlayRow = 0;
+  current_settings_row = 0;
+  ui_needs_redraw = true;
   if(gQuickOverlay) gBattVoltage = readBatteryVoltage();
+}
+// Fix Quick Settings menu index boundaries to 5-row grid 0-4
+void handle_settings_navigation(bool isDown){
+  if(isDown){
+    current_settings_row = (current_settings_row + 1) % 5;
+    ui_needs_redraw = true;
+  } else {
+    current_settings_row = (current_settings_row == 0) ? 4 : current_settings_row - 1;
+    ui_needs_redraw = true;
+  }
+  gQuickOverlayRow = current_settings_row;
+}
+void run_bouncer_setup_menu();
+void handle_keyboard_inputs(){
+  // LIVE INJECTION: Fn+B/T hotkeys per spec - check status.fn modifier
+  auto st = M5Cardputer.Keyboard.keysState();
+  if(st.fn){
+    for(char c : st.word){
+      if(c=='b' || c=='B'){
+        // pause chat loops, call bouncer setup menu
+        run_bouncer_setup_menu();
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c=='t' || c=='T'){
+        logStatus("LED Diagnostic: Purple test Pin21");
+        neopixelWrite(LED_PIN, 60, 0, 60);
+        uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+        (void)purp;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        neopixelWrite(LED_PIN, 0, 0, 0);
+        ui_needs_redraw = true;
+        return;
+      }
+    }
+  }
+  // spec wrapper - dirty flag only on active keystroke/char/tab/message
+  ui_needs_redraw = true;
 }
 // Overlay navigation helpers for timezone/format
 static void cycleTimezone(int delta){
   gTimezoneIndex = (gTimezoneIndex + delta) % TZ_COUNT;
   if(gTimezoneIndex<0) gTimezoneIndex+=TZ_COUNT;
   gCfg.timezone_index=gTimezoneIndex;
-  // persist numeric values immediately per spec? also keep globals synced
-  // save will be done on explicit save or overlay close - also auto-save here for persistence
-  // lightweight auto-save: write config if SD ready
+  ui_needs_redraw = true;
 }
 static void toggleClockFormat(){
   gUse12Hour = !gUse12Hour;
   gCfg.use_12_hour_format=gUse12Hour;
+  ui_needs_redraw = true;
+}
+static void cycleAudio(){ gCfg.current_audio = gCfg.current_audio ? 0 : 1; ui_needs_redraw = true; }
+static void cycleBrightness(int d){ int v=(int)gCfg.brightness+d; if(v<0) v=0; if(v>10) v=10; gCfg.brightness=v; applyBrightness(v); ui_needs_redraw = true; }
+static void cycleFilter(int d){ int v=(int)gCfg.logLevel+d; if(v<0) v=2; if(v>2) v=0; gCfg.logLevel=(LogLevel)v; ui_needs_redraw = true; }
+
+void run_bouncer_setup_menu(){
+  // Pause chat loops
+  bool prevScanner = gInScanner;
+  gInScanner = true;
+  ui_needs_redraw = true;
+  const char* prompts[4] = {"bnc_host", "bnc_user", "bnc_net", "bnc_pass"};
+  for(int step=0; step<4; ++step){
+    char buf[64];
+    if(step==0) safeCopy(buf, bnc_host.c_str(), sizeof(buf));
+    else if(step==1) safeCopy(buf, bnc_user, sizeof(buf));
+    else if(step==2) safeCopy(buf, bnc_net, sizeof(buf));
+    else safeCopy(buf, bnc_pass, sizeof(buf));
+    int len = strlen(buf);
+    int cursor = len;
+    bool done=false;
+    while(!done){
+      if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+      M5Cardputer.Display.fillScreen(UI_BG);
+      M5Cardputer.Display.setTextSize(1);
+      M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
+      M5Cardputer.Display.setCursor(4,4);
+      M5Cardputer.Display.printf("Bouncer Setup %d/4", step+1);
+      M5Cardputer.Display.setCursor(4,18);
+      M5Cardputer.Display.printf("%s:", prompts[step]);
+      M5Cardputer.Display.setCursor(4,32);
+      if(step==3){
+        for(int i=0;i<len;++i) M5Cardputer.Display.print("*");
+        M5Cardputer.Display.print("_");
+      } else {
+        M5Cardputer.Display.print(buf);
+        M5Cardputer.Display.print("_");
+      }
+      M5Cardputer.Display.setCursor(4,110);
+      M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
+      M5Cardputer.Display.print("Enter=next Del=back");
+      if(irc_mutex) xSemaphoreGive(irc_mutex);
+      M5Cardputer.update();
+      if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
+        auto ks2 = M5Cardputer.Keyboard.keysState();
+        for(char c : ks2.word){
+          if(c>=32 && c<127 && len < (int)sizeof(buf)-1){
+            memmove(buf+cursor+1, buf+cursor, len - cursor + 1);
+            buf[cursor++]=c; len++; buf[len]='\0';
+            ui_needs_redraw = true;
+          }
+        }
+        if(ks2.del && len>0 && cursor>0){
+          memmove(buf+cursor-1, buf+cursor, len - cursor + 1);
+          cursor--; len--;
+          ui_needs_redraw = true;
+        }
+        if(ks2.enter){
+          done=true;
+          ui_needs_redraw = true;
+        }
+        if(ks2.fn){
+          for(char cc : ks2.word){ if(cc=='q' || cc=='Q'){ done=true; break; } }
+        }
+      }
+      vTaskDelay(pdMS_TO_TICKS(30));
+    }
+    if(step==0) bnc_host = String(buf);
+    else if(step==1){ strncpy(bnc_user, buf, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser, buf, sizeof(gCfg.bncUser)); }
+    else if(step==2){ strncpy(bnc_net, buf, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
+    else if(step==3){ strncpy(bnc_pass, buf, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass, buf, sizeof(gCfg.bncPass)); }
+  }
+  saveConfig();
+  gInScanner = prevScanner;
+  ui_needs_redraw = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1463,8 @@ static void handleRawIrc(char* line){
   if(strcmp(cmd,"001")==0){
     gIrcRegistered=true;
     logStatus("Registered on IRC");
+    // DYNAMIC BACKUP HOOK: safely copy config to .bak the moment bouncer login succeeds
+    trigger_config_backup();
     if(gCfg.autojoin[0]){
       char copy[128]; safeCopy(copy,gCfg.autojoin,sizeof(copy));
       char* tok=strtok(copy,",");
@@ -1677,14 +1862,25 @@ static void netTask(void* arg){
       static uint32_t lastTry=0;
       if(millis()-lastTry < 3000){ vTaskDelay(pdMS_TO_TICKS(100)); continue; }
       lastTry=millis();
-      if(gCfg.host[0]=='\0'){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+      // SOCKET DRIVER ROUTING: use dynamic bouncer globals instead of hardcoded server strings
+      String _bncHost = bnc_host.length()>0 ? bnc_host : String(gCfg.host);
+      int _bncPort = bnc_port>0 ? bnc_port : gCfg.port;
+      if(_bncHost.length()==0){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
       bool ok=false;
-      if(gCfg.useTLS){ gSecure.setInsecure(); ok = gSecure.connect(gCfg.host, gCfg.port); }
-      else ok = gPlain.connect(gCfg.host, gCfg.port);
+      if(gCfg.useTLS){ gSecure.setInsecure(); ok = gSecure.connect(_bncHost.c_str(), _bncPort); }
+      else ok = gPlain.connect(_bncHost.c_str(), _bncPort);
       if(ok){
         gIrcConnected=true; gIrcRegistered=false; gLastRxMs=millis(); gAwaitPong=false;
+        // AUTHENTICATION STRING ASSEMBLY: allocate temporary stack buffer and combine bouncer creds per spec
+        char auth_buffer[160];
+        snprintf(auth_buffer, sizeof(auth_buffer), "PASS %s/%s:%s\r\n", bnc_user, bnc_net, bnc_pass);
+        // Transmit assembled bouncer line immediately following successful client.connect()
+        if(bnc_user[0]!='\0' || bnc_pass[0]!='\0'){
+          cl->print(auth_buffer);
+        } else if(gCfg.pass[0]){
+          char line[128]; snprintf(line,sizeof(line),"PASS %s\r\n", gCfg.pass); cl->print(line);
+        }
         char line[128];
-        if(gCfg.pass[0]){ snprintf(line,sizeof(line),"PASS %s", gCfg.pass); cl->print(line); cl->print("\r\n"); }
         // MANDATORY IRCv3 CAP FILE HANDLER: precise capability string per spec
         cl->print("CAP LS 302\r\n");
         cl->print("CAP REQ :server-time chghost account-notify cap-notify batch labeled-response sasl\r\n");
@@ -1709,12 +1905,12 @@ static void netTask(void* arg){
         if(c=='\r') continue;
         if(c=='\n'){
           gRxAccum[gRxLen]='\0';
-          if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); }
+          if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); ui_needs_redraw = true; }
           gRxLen=0;
           if(gRxQueue.size() >= 8) break;
         } else {
           if(gRxLen < RX_ACCUM_SZ-1) gRxAccum[gRxLen++]=c;
-          else { gRxAccum[gRxLen]='\0'; gRxQueue.push(gRxAccum); gRxLen=0; }
+          else { gRxAccum[gRxLen]='\0'; gRxQueue.push(gRxAccum); ui_needs_redraw = true; gRxLen=0; }
         }
       }
       if(gRxQueue.size() >= 8) break;
@@ -1790,38 +1986,47 @@ static void serviceKeyboard(){
   wakeFromSleep();
   gLastInputMs=millis();
   auto ks = M5Cardputer.Keyboard.keysState();
-  // Quick Settings overlay active - handle Left/Right cycle and Up/Down row select
+  // Quick Settings overlay active - 5-row grid handling per spec
   if(gQuickOverlay){
-    // Up/Down ( ';' '.' ) selects row 0=timezone / 1=clock format (also Fn+ ;/. )
+    // LIVE INJECTION: Fn+B/T hotkeys even inside overlay per spec
     for(char c: ks.word){
-      if(c==';'){ gQuickOverlayRow = (gQuickOverlayRow-1+2)%2; return; }
-      if(c=='.'){ gQuickOverlayRow = (gQuickOverlayRow+1)%2; return; }
+      if(ks.fn && (c=='b' || c=='B')){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
+      if(ks.fn && (c=='t' || c=='T')){ logStatus("LED Diagnostic: Purple test on Pin 21"); neopixelWrite(LED_PIN, 60,0,60); vTaskDelay(pdMS_TO_TICKS(1000)); neopixelWrite(LED_PIN,0,0,0); ui_needs_redraw = true; return; }
+    }
+    // Up/Down selects row 0-4 via handle_settings_navigation
+    for(char c: ks.word){
+      if(c==';'){ handle_settings_navigation(false); gQuickOverlayMs=millis(); return; }
+      if(c=='.'){ handle_settings_navigation(true); gQuickOverlayMs=millis(); return; }
     }
     if(ks.fn){
       for(char c: ks.word){
-        if(c==';'){ gQuickOverlayRow = (gQuickOverlayRow-1+2)%2; return; }
-        if(c=='.'){ gQuickOverlayRow = (gQuickOverlayRow+1)%2; return; }
+        if(c==';'){ handle_settings_navigation(false); gQuickOverlayMs=millis(); return; }
+        if(c=='.'){ handle_settings_navigation(true); gQuickOverlayMs=millis(); return; }
       }
     }
-    // Left/Right ( ',' '/' ) cycles value of selected row
+    // Left/Right cycles value of selected row 0 Audio,1 Brightness,2 Filter,3 TZ,4 Hour
     for(char c: ks.word){
       if(c==',' ){ // Left
-        if(gQuickOverlayRow==0) cycleTimezone(-1);
-        else toggleClockFormat();
-        gQuickOverlayMs=millis();
-        return;
+        if(current_settings_row==0) cycleAudio();
+        else if(current_settings_row==1) cycleBrightness(-1);
+        else if(current_settings_row==2) cycleFilter(-1);
+        else if(current_settings_row==3) cycleTimezone(-1);
+        else if(current_settings_row==4) toggleClockFormat();
+        gQuickOverlayMs=millis(); ui_needs_redraw = true; return;
       }
       if(c=='/' ){ // Right
-        if(gQuickOverlayRow==0) cycleTimezone(1);
-        else toggleClockFormat();
-        gQuickOverlayMs=millis();
-        return;
+        if(current_settings_row==0) cycleAudio();
+        else if(current_settings_row==1) cycleBrightness(1);
+        else if(current_settings_row==2) cycleFilter(1);
+        else if(current_settings_row==3) cycleTimezone(1);
+        else if(current_settings_row==4) toggleClockFormat();
+        gQuickOverlayMs=millis(); ui_needs_redraw = true; return;
       }
     }
     if(ks.fn){
       for(char c: ks.word){
-        if(c==','){ if(gQuickOverlayRow==0) cycleTimezone(-1); else toggleClockFormat(); gQuickOverlayMs=millis(); return; }
-        if(c=='/'){ if(gQuickOverlayRow==0) cycleTimezone(1); else toggleClockFormat(); gQuickOverlayMs=millis(); return; }
+        if(c==','){ if(current_settings_row==0) cycleAudio(); else if(current_settings_row==1) cycleBrightness(-1); else if(current_settings_row==2) cycleFilter(-1); else if(current_settings_row==3) cycleTimezone(-1); else if(current_settings_row==4) toggleClockFormat(); gQuickOverlayMs=millis(); ui_needs_redraw = true; return; }
+        if(c=='/'){ if(current_settings_row==0) cycleAudio(); else if(current_settings_row==1) cycleBrightness(1); else if(current_settings_row==2) cycleFilter(1); else if(current_settings_row==3) cycleTimezone(1); else if(current_settings_row==4) toggleClockFormat(); gQuickOverlayMs=millis(); ui_needs_redraw = true; return; }
       }
     }
     // Enter saves and closes, Del closes without save? per spec save on changes
@@ -1865,6 +2070,7 @@ static void serviceKeyboard(){
       safeCopy(gInput, gHistory[idx], sizeof(gInput));
       gInputLen = strlen(gInput);
       gInputCursor = gInputLen;
+      ui_needs_redraw = true; // buffer tab swapped via history
       return;
     }
   } else if(hasWord){
@@ -1880,24 +2086,44 @@ static void serviceKeyboard(){
       gInput[gInputCursor++]=c;
       gInputLen++;
       gHistNav=-1;
+      ui_needs_redraw = true; // character typed
     }
   }
   if(ks.del && gInputLen>0 && gInputCursor>0){
     memmove(gInput+gInputCursor-1, gInput+gInputCursor, gInputLen - gInputCursor +1);
     gInputCursor--; gInputLen--;
     gHistNav=-1;
+    ui_needs_redraw = true; // active keystroke
   }
   if(ks.fn){
+    // LIVE INJECTION: Fn+B and Fn+T hotkeys per spec inside status.fn check
     for(char c: ks.word){
-      if(c==',' && gInputCursor>0) gInputCursor--;
-      if(c=='/' && gInputCursor<gInputLen) gInputCursor++;
-      if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count) t->scroll++; }
-      if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0) t->scroll--; }
+      if(c=='b' || c=='B'){
+        run_bouncer_setup_menu();
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c=='t' || c=='T'){
+        logStatus("LED Diagnostic: Purple test on Pin 21");
+        neopixelWrite(LED_PIN, 60, 0, 60);
+        uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+        (void)purp;
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        neopixelWrite(LED_PIN, 0, 0, 0);
+        ui_needs_redraw = true;
+        return;
+      }
+    }
+    for(char c: ks.word){
+      if(c==',' && gInputCursor>0){ gInputCursor--; ui_needs_redraw = true; }
+      if(c=='/' && gInputCursor<gInputLen){ gInputCursor++; ui_needs_redraw = true; }
+      if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count){ t->scroll++; ui_needs_redraw = true; } }
+      if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0){ t->scroll--; ui_needs_redraw = true; } }
     }
   } else {
     for(char c: ks.word){
-      if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count) t->scroll++; }
-      if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0) t->scroll--; }
+      if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count){ t->scroll++; ui_needs_redraw = true; } }
+      if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0){ t->scroll--; ui_needs_redraw = true; } }
     }
   }
   if(ks.enter){
@@ -1906,6 +2132,7 @@ static void serviceKeyboard(){
       char copy[INPUT_BUF_SZ]; safeCopy(copy,gInput,sizeof(copy));
       gInputLen=0; gInputCursor=0; gInput[0]='\0'; gInputScroll=0; gHistNav=-1;
       handleUserInput(copy);
+      ui_needs_redraw = true; // character typed / command sent
     } else {
       gHistNav=-1;
     }
@@ -1914,6 +2141,7 @@ static void serviceKeyboard(){
     if(gTabCount>0){
       gActive=(gActive+1)%gTabCount;
       activeTab()->unread=false; activeTab()->mention=false;
+      ui_needs_redraw = true; // buffer tab swapped
     }
   }
 }
