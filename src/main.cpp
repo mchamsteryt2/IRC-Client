@@ -2706,11 +2706,16 @@ void setup(){
   gTabsMutex = irc_mutex;
     gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
 
-  // Safe Mode single-pass check - BAN INFINITE PIN-WAIT LOOPS
+  // Safe Mode single-pass check - BAN INFINITE PIN-WAIT LOOPS - debounced G0/BtnA to prevent spurious trigger on floating GPIO0 strapping pin
   Serial.println("[BOOSTER-LOG] Safe Mode initialization check...");
   pinMode(0, INPUT_PULLUP); // Enforce pullup on G0 button pin
-  // Sample the G0 button state instantly on this boot pass
-  if (digitalRead(0) == LOW) { 
+  vTaskDelay(pdMS_TO_TICKS(10)); yield(); // let pullup stabilize, feed WDT
+  M5Cardputer.update(); // TCA8418 matrix settle
+  // Robust debounced check: Cardputer Adv G0 is BtnA via TCA8418, not raw GPIO0 strapping - require 3 consecutive reads over 30ms
+  int g0Confirm = 0;
+  for(int i=0;i<3;i++){ vTaskDelay(pdMS_TO_TICKS(10)); yield(); M5Cardputer.update(); bool rawLow = (digitalRead(0)==LOW); bool btnAPressed = M5Cardputer.BtnA.isPressed(); if(rawLow || btnAPressed) g0Confirm++; }
+  bool safeModeRequested = (g0Confirm >= 2); // require 2/3 reads to confirm intentional hold, not floating
+  if (safeModeRequested) { 
       Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
       safe_mode_active = true;
       gSafeBoot = true;
