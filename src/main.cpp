@@ -4674,7 +4674,7 @@ class SimpleTransport {
     }
 
     if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
-      if (!tryAutocompleteInput()) cycleTab(1);
+      if (!tryAutocompleteInput()) cycleTabSmart(1);
     }
 
     // Input typing already marked _inputDirty; other changes need full/body
@@ -5188,6 +5188,79 @@ class SimpleTransport {
     markStateDirty();
   }
 
+  void cycleTabSmart(int delta) {
+    if (_tabs.empty()) return;
+    // If server list is open, TAB cycles server selection (existing behavior)
+    if (_serverListOpen) {
+      _serverListSelected = (_serverListSelected + delta) % std::max(1, (int)_servers.size());
+      if (_serverListSelected < 0) _serverListSelected = (int)_servers.size() - 1;
+      markBodyDirty();
+      return;
+    }
+    // Prefer tab-local cycle; if at edge of section, jump to next section's first tab
+    // This lets TAB alone reach Home (Servers/Status) without ,/ arrow keys
+    int curSec = currentSection();
+    // Collect indices of current section
+    std::vector<int> curIndices;
+    for (int i=0;i<(int)_tabs.size();++i) if (sectionForTab(i)==curSec) curIndices.push_back(i);
+    int pos = -1;
+    for (int i=0;i<(int)curIndices.size();++i) if (curIndices[i]==_activeTab) pos=i;
+    if (pos >= 0) {
+      int nextPos = pos + delta;
+      if (nextPos >=0 && nextPos < (int)curIndices.size()) {
+        _activeTab = curIndices[nextPos];
+        _tabs[_activeTab].unread=false; _tabs[_activeTab].mention=false; _tabs[_activeTab].scroll=0;
+        markAllDirty(); markStateDirty();
+        return;
+      }
+      // At edge of section -> go to next section that has tabs (or Home/Setup)
+      int nextSec = curSec + delta;
+      // Wrap and skip empty channel/chat sections like switchToSection does, but allow TAB to land on Home/Setup
+      for (int tries=0; tries<SEC_COUNT; ++tries) {
+        if (nextSec < 0) nextSec = SEC_COUNT-1;
+        if (nextSec >= SEC_COUNT) nextSec = 0;
+        if (nextSec == SEC_SETTINGS) break;
+        if (firstTabInSection(nextSec) >= 0) break;
+        if (nextSec == curSec) break;
+        nextSec += delta;
+      }
+      if (nextSec == SEC_SERVERS) {
+        // TAB to Home should open server list (like arrow keys) — one press to servers
+        if (!_serverListOpen) openServerList();
+        else {
+          // Already in server list — cycle selection via TAB is handled at top, but fallback
+          _serverListSelected = (_serverListSelected + delta) % std::max(1,(int)_servers.size());
+          if (_serverListSelected < 0) _serverListSelected = (int)_servers.size()-1;
+        }
+        if (_configOpen) closeConfigPage();
+        if (_channelListOpen) closeChannelListPage();
+        markAllDirty();
+        return;
+      }
+      int first = firstTabInSection(nextSec);
+      if (first >= 0) {
+        _activeTab = first;
+        _tabs[_activeTab].unread=false; _tabs[_activeTab].mention=false; _tabs[_activeTab].scroll=0;
+        if (_serverListOpen) closeServerList();
+        if (_configOpen) closeConfigPage();
+        if (_channelListOpen) closeChannelListPage();
+        markAllDirty(); markStateDirty();
+        return;
+      }
+      if (nextSec == SEC_SETTINGS) {
+        if (!_configOpen) { openConfigPage(); markAllDirty(); }
+        return;
+      }
+      if (nextSec == SEC_SERVERS) {
+        // No Status tab found (should not happen) — open server list as fallback
+        openServerList();
+        return;
+      }
+    }
+    // Fallback: global cycle
+    cycleTab(delta);
+  }
+
   void drawSplash(const String& a, const String& b, const String& c) {
     auto& gfx = drawTarget();
     gfx.fillScreen(UI_BG);
@@ -5611,6 +5684,11 @@ class SimpleTransport {
     // Only the leftover bottom strip (if new tab has fewer rows than old) is cleared
     int bodyEndY = by + BODY_H;
     int y = by + 1;
+    // Bottom-align recent messages when at bottom (scroll==0) — so 3 lines sit at bottom, not top with 5 empty below
+    if (!tab.lines.empty() && tab.scroll == 0) {
+      int visibleCount = end - start;
+      if (visibleCount < maxLines) y = by + 1 + (maxLines - visibleCount) * ROW_H;
+    }
     // Empty-state card — ratspeak modern
     if (tab.lines.empty()) {
       gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
@@ -5631,19 +5709,23 @@ class SimpleTransport {
         drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
         y += ROW_H;
       }
-      // Clean up any stale wrapped bottom rows from previous channel (only bottom strip)
-      if (y < bodyEndY) gfx.fillRect(0, y, SCREEN_W, bodyEndY - y, UI_BG);
+      // Clean up only most recent line's possible wrapped rows (not full 5-line bottom)
+      // Previous full bottom clear looked like 5 lines cleared for 3-line view
+      if (y < bodyEndY) {
+        int clearH = std::min(bodyEndY - y, ROW_H * 2); // marquee = 1 row max
+        gfx.fillRect(0, y, SCREEN_W, clearH, UI_BG);
+      }
     }
 
-    // Scrollbar — 2px modern indicator on body right edge
+    // Scrollbar — 2px single cyan, clamped to body
     if ((int)tab.lines.size() > maxLines) {
       int total = (int)tab.lines.size();
-      int h = std::max(6, BODY_H * maxLines / total);
+      int h = std::max(8, std::min(BODY_H - 2, BODY_H * maxLines / total));
       int maxStart = std::max(1, total - maxLines);
       int sy = by + 1 + (start * (BODY_H - h - 2) / maxStart);
+      sy = std::max(by+1, std::min(sy, by+BODY_H - h -1));
       int sx = textWidth - 2;
-      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
-      gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
+      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_ACCENT);
     }
 
     if (showPane) drawNickPane(tab);
@@ -5674,9 +5756,9 @@ class SimpleTransport {
     }
     int by = BODY_Y;
 
-    // Efficient: no full clear — trailing bottom strip cleared only if needed
     int bodyEndY = by + BODY_H;
     int y = by + 1;
+    if (!tab.lines.empty() && tab.scroll == 0 && totalRows < effectiveVisible) y = by + 1 + (effectiveVisible - totalRows) * ROW_H;
 
     if (tab.lines.empty()) {
       String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
@@ -5714,17 +5796,20 @@ class SimpleTransport {
         currentRow += lineRows;
         if (drawnRows >= effectiveVisible || y + ROW_H > by + BODY_H) break;
       }
-      // Clean up stale bottom rows from previous channel's wrapped message
-      if (y < bodyEndY) gfx.fillRect(0, y, SCREEN_W, bodyEndY - y, UI_BG);
+      // Clean up only most recent wrapped line's rows (not full 5-line bottom)
+      if (y < bodyEndY) {
+        int clearH = std::min(bodyEndY - y, ROW_H * 3); // wrapped max ~3 rows
+        gfx.fillRect(0, y, SCREEN_W, clearH, UI_BG);
+      }
     }
-    // Scrollbar for wrapped
+    // Scrollbar for wrapped — single cyan, not split
     if (totalRows > visibleRows) {
-      int h = std::max(6, BODY_H * visibleRows / totalRows);
+      int h = std::max(8, std::min(BODY_H - 2, BODY_H * visibleRows / totalRows));
       int maxStart = std::max(1, totalRows - visibleRows);
       int sy = by + 1 + (startRow * (BODY_H - h - 2) / maxStart);
+      sy = std::max(by+1, std::min(sy, by+BODY_H - h -1));
       int sx = textWidth - 2;
-      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
-      gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
+      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_ACCENT);
     }
 
     if (showPane) drawNickPane(tab);
@@ -5855,29 +5940,27 @@ class SimpleTransport {
       else hint = "/join #chan or /help";
       hint = ellipsize(hint, (SCREEN_W - 12) / CHAR_W);
       target.setTextColor(UI_ACCENT, UI_BG);
-      target.setCursor(2, baseY + 2);
+      target.setCursor(2, baseY + 4);
       target.print(">");
       target.setTextColor(UI_DIM, UI_BG);
-      target.setCursor(10, baseY + 2);
+      target.setCursor(10, baseY + 4);
       target.print(hint);
       if (showCursor) {
         target.setTextColor(UI_ACCENT, UI_BG);
-        target.setCursor(10 + hint.length() * CHAR_W, baseY + 2);
+        target.setCursor(10 + hint.length() * CHAR_W, baseY + 4);
         target.print("_");
       }
     } else {
+      // Single-row centered (16-8)/2=4px — fixes bumped down (was 2/10, second row overflowed 16)
       int charsPerRow = (SCREEN_W - 10) / CHAR_W;
-      std::vector<String> rows = buildInputRows(charsPerRow, 2);
-      if (showCursor) {
-        if (rows.size() >= 2 && !rows[1].isEmpty()) rows[1] += "_";
-        else if (!rows[0].isEmpty()) rows[0] += "_";
-        else rows[1] += "_";
-      }
+      String visible = _input;
+      if ((int)visible.length() > charsPerRow) visible = visible.substring(visible.length() - charsPerRow);
+      if (showCursor) visible += "_";
+      while ((int)visible.length() < charsPerRow) visible += ' ';
+      visible = ellipsize(visible, charsPerRow);
       target.setTextColor(UI_FG, UI_BG);
-      target.setCursor(2, baseY + 2);
-      target.print(ellipsize(rows[0], charsPerRow));
-      target.setCursor(2, baseY + 10);
-      target.print(ellipsize(rows[1], charsPerRow));
+      target.setCursor(2, baseY + 4);
+      target.print(visible);
     }
   }
 
