@@ -1072,9 +1072,11 @@ class SimpleTransport {
   TaskHandle_t _bgTaskHandle = nullptr;
   volatile bool _bgTaskRunning = false;
 
-  // Framebuffer sprite for flicker-free rendering (PSRAM if available, else SRAM if heap allows)
+  // Framebuffer sprites for flicker-free rendering
+  // Full 240x135x2=64.8KB needs PSRAM; body-only 240x85x2=40.8KB fits in internal SRAM on ADV (no PSRAM)
   lgfx::LGFX_Sprite _fb;
   bool _fbReady = false;
+  int _fbHeight = 0; // SCREEN_H for full, BODY_H for body-only
 
   bool _configOpen = false;
   bool _configEditing = false;
@@ -1767,37 +1769,44 @@ class SimpleTransport {
 
   void initFrameBuffer() {
     if (_fbReady) return;
-    // ADV has no PSRAM (S3FN8) but 240x135x2=64.8KB still fits in 320KB SRAM if heap allows.
-    // Prefer PSRAM when present, otherwise try SRAM with heap guard to avoid OOM reboot.
     bool hasPsram = false;
 #if defined(CONFIG_SPIRAM_SUPPORT)
     hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
 #else
     hasPsram = ESP.getPsramSize() >= 70000;
 #endif
-    auto tryCreate = [&](bool usePsram) -> bool {
-      if (usePsram) _fb.setPsram(true);
-      else {
-        // Need ~75KB free beyond MIN_HEAP to avoid starving WiFi/SD
-        if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 75000)) return false;
-        _fb.setPsram(false);
-      }
+    // Full PSRAM path (64.8KB)
+    if (hasPsram) {
+      _fb.setPsram(true);
       _fb.setColorDepth(16);
       if (_fb.createSprite(SCREEN_W, SCREEN_H)) {
         _fbReady = true;
+        _fbHeight = SCREEN_H;
         _fb.fillScreen(UI_BG);
         _fb.setTextSize(1);
         _fb.setTextWrap(false);
-        return true;
+        return;
       }
       _fbReady = false;
-      return false;
-    };
-    if (hasPsram) {
-      if (tryCreate(true)) return;
     }
-    // No PSRAM or PSRAM alloc failed — try SRAM
-    tryCreate(false);
+    // No PSRAM (ADV) — try body-only 40.8KB in internal SRAM with stricter heap guard
+    // This still fixes body flicker (main chat area) without risking OOM reboot.
+    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 50000)) {
+      _fbReady = false;
+      return;
+    }
+    _fb.setPsram(false);
+    _fb.setColorDepth(16);
+    if (_fb.createSprite(SCREEN_W, BODY_H)) {
+      _fbReady = true;
+      _fbHeight = BODY_H;
+      _fb.fillScreen(UI_BG);
+      _fb.setTextSize(1);
+      _fb.setTextWrap(false);
+    } else {
+      _fbReady = false;
+      _fbHeight = 0;
+    }
   }
 
   void showBootTitle() {
@@ -1864,11 +1873,15 @@ class SimpleTransport {
   }
 
   void presentFrame() {
-    if (_fbReady) {
-      M5Cardputer.Display.startWrite();
+    if (!_fbReady) return;
+    M5Cardputer.Display.startWrite();
+    if (_fbHeight == SCREEN_H) {
       _fb.pushSprite(0, 0);
-      M5Cardputer.Display.endWrite();
+    } else {
+      // Body-only sprite (40KB) — push at BODY_Y to avoid full allocation
+      _fb.pushSprite(0, BODY_Y);
     }
+    M5Cardputer.Display.endWrite();
   }
 
   void serviceTextScroll() {
@@ -5120,24 +5133,54 @@ class SimpleTransport {
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
     auto& gfx = drawTarget();
     if (_fbReady) {
-      // Sprite mode: composite off-screen then single push — no tearing
-      if (_configOpen) {
-        drawConfigPage();
-        drawNavBar();
-      } else if (_serverListOpen) {
-        drawServerListPage();
-        drawNavBar();
-      } else if (_channelListOpen) {
-        drawChannelListPage();
-        drawNavBar();
+      if (_fbHeight == SCREEN_H) {
+        // Full-screen sprite (PSRAM or large SRAM) — composite off-screen then single push
+        if (_configOpen) {
+          drawConfigPage();
+          drawNavBar();
+        } else if (_serverListOpen) {
+          drawServerListPage();
+          drawNavBar();
+        } else if (_channelListOpen) {
+          drawChannelListPage();
+          drawNavBar();
+        } else {
+          drawHeader();
+          drawBody();
+          drawNavBar();
+          drawInput();
+        }
+        presentFrame();
       } else {
-        // Full composite to sprite avoids stale pixels when dirty flags are partial
-        drawHeader();
-        drawBody();
-        drawNavBar();
-        drawInput();
+        // Body-only sprite (40KB, ADV no PSRAM) — flicker-free body, direct rest
+        if (_configOpen || _serverListOpen || _channelListOpen) {
+          // Full-screen pages don't fit body sprite — draw directly
+          bool saved = _fbReady;
+          _fbReady = false;
+          auto& disp = static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
+          disp.startWrite();
+          if (_configOpen) { drawConfigPage(); drawNavBar(); }
+          else if (_serverListOpen) { drawServerListPage(); drawNavBar(); }
+          else if (_channelListOpen) { drawChannelListPage(); drawNavBar(); }
+          disp.endWrite();
+          _fbReady = saved;
+        } else {
+          // Normal chat: body via sprite, header/nav/input direct
+          if (_bodyDirty || full) {
+            drawBody();
+            presentFrame();
+          }
+          bool saved = _fbReady;
+          _fbReady = false;
+          auto& disp = static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
+          disp.startWrite();
+          if (_headerDirty || full) drawHeader();
+          if (_navDirty || full) drawNavBar();
+          if (_inputDirty || full) drawInput();
+          disp.endWrite();
+          _fbReady = saved;
+        }
       }
-      presentFrame();
     } else {
       // Direct mode (no sprite): batch SPI and redraw only dirty regions to minimize flicker
       gfx.startWrite();
@@ -5506,8 +5549,10 @@ class SimpleTransport {
     int end = 0;
     int maxLines = 0;
     getVisibleBodyRange(tab, start, end, maxLines);
+    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
+    int by = isBodySprite ? 0 : BODY_Y;
 
-    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+    gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
 
     // Empty-state card — ratspeak modern
     if (tab.lines.empty()) {
@@ -5517,15 +5562,15 @@ class SimpleTransport {
       else hint = "No messages — /join #chan";
       int cardW = (int)hint.length() * CHAR_W + 16;
       int cardX = (textWidth - cardW) / 2;
-      int cardY = BODY_Y + (BODY_H - 12) / 2;
+      int cardY = by + (BODY_H - 12) / 2;
       gfx.fillRoundRect(cardX, cardY, cardW, 12, 4, UI_CARD);
       gfx.drawRoundRect(cardX, cardY, cardW, 12, 4, UI_BORDER);
       gfx.setTextColor(UI_DIM, UI_CARD);
       gfx.setCursor(cardX + 8, cardY + 2);
       gfx.print(hint);
     } else {
-      int y = BODY_Y + 1;
-      for (int i = start; i < end && y + ROW_H <= BODY_Y + BODY_H; ++i) {
+      int y = by + 1;
+      for (int i = start; i < end && y + ROW_H <= by + BODY_H; ++i) {
         drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
         y += ROW_H;
       }
@@ -5536,7 +5581,7 @@ class SimpleTransport {
       int total = (int)tab.lines.size();
       int h = std::max(6, BODY_H * maxLines / total);
       int maxStart = std::max(1, total - maxLines);
-      int sy = BODY_Y + 1 + (start * (BODY_H - h - 2) / maxStart);
+      int sy = by + 1 + (start * (BODY_H - h - 2) / maxStart);
       int sx = textWidth - 2;
       gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
       gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
@@ -5554,21 +5599,23 @@ class SimpleTransport {
     int visibleRows = bodyVisibleRows();
     int totalRows = totalWrappedRows(tab, textWidth);
     int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
+    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
+    int by = isBodySprite ? 0 : BODY_Y;
 
-    gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
+    gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
 
     if (tab.lines.empty()) {
       String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
       int cardW = (int)hint.length() * CHAR_W + 16;
       int cardX = (textWidth - cardW) / 2;
-      int cardY = BODY_Y + (BODY_H - 12) / 2;
+      int cardY = by + (BODY_H - 12) / 2;
       gfx.fillRoundRect(cardX, cardY, cardW, 12, 4, UI_CARD);
       gfx.drawRoundRect(cardX, cardY, cardW, 12, 4, UI_BORDER);
       gfx.setTextColor(UI_DIM, UI_CARD);
       gfx.setCursor(cardX + 8, cardY + 2);
       gfx.print(hint);
     } else {
-      int y = BODY_Y + 1;
+      int y = by + 1;
       int drawnRows = 0;
       int currentRow = 0;
       for (const ChatLine& line : tab.lines) {
@@ -5580,22 +5627,22 @@ class SimpleTransport {
         int skipRows = std::max(0, startRow - currentRow);
         int rowsLeft = visibleRows - drawnRows;
         if (rowsLeft <= 0) break;
-        if (y + ROW_H > BODY_Y + BODY_H) break;
-        int maxDrawableRows = (BODY_Y + BODY_H - y) / ROW_H;
+        if (y + ROW_H > by + BODY_H) break;
+        int maxDrawableRows = (by + BODY_H - y) / ROW_H;
         if (maxDrawableRows <=0) break;
         rowsLeft = std::min(rowsLeft, maxDrawableRows);
         int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
         drawnRows += usedRows;
         y += usedRows * ROW_H;
         currentRow += lineRows;
-        if (drawnRows >= visibleRows || y + ROW_H > BODY_Y + BODY_H) break;
+        if (drawnRows >= visibleRows || y + ROW_H > by + BODY_H) break;
       }
     }
     // Scrollbar for wrapped
     if (totalRows > visibleRows) {
       int h = std::max(6, BODY_H * visibleRows / totalRows);
       int maxStart = std::max(1, totalRows - visibleRows);
-      int sy = BODY_Y + 1 + (startRow * (BODY_H - h - 2) / maxStart);
+      int sy = by + 1 + (startRow * (BODY_H - h - 2) / maxStart);
       int sx = textWidth - 2;
       gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
       gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
@@ -5661,16 +5708,18 @@ class SimpleTransport {
 
   void drawNickPane(const Tab& tab) {
     auto& gfx = drawTarget();
+    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
+    int by = isBodySprite ? 0 : BODY_Y;
     int x = SCREEN_W - NICK_PANE_W;
     // Terminal flat pane — no rounded, just vertical separator
-    gfx.fillRect(x, BODY_Y, NICK_PANE_W, BODY_H, UI_BG);
-    gfx.drawFastVLine(x, BODY_Y, BODY_H, UI_DIM);
+    gfx.fillRect(x, by, NICK_PANE_W, BODY_H, UI_BG);
+    gfx.drawFastVLine(x, by, BODY_H, UI_DIM);
     gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(x + 2, BODY_Y + 1);
+    gfx.setCursor(x + 2, by + 1);
     String hdr = String(tab.users.size()) + " users";
     gfx.print(ellipsize(hdr, 10));
 
-    int y = BODY_Y + 11;
+    int y = by + 11;
     int maxRows = (BODY_H - 12) / ROW_H;
     for (int i = 0; i < maxRows && i < static_cast<int>(tab.users.size()); ++i) {
       String row;
