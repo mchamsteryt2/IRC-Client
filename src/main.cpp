@@ -124,6 +124,7 @@ struct Tab {
   char topic[TOPIC_LEN+1];
   char nicks[MAX_NICKS][NICK_LEN+1];
   uint8_t nickCount;
+  char server[32]; // network/server prefix for server skip logic
 };
 
 // Mutex protected fixed queue for cross-core comms
@@ -203,6 +204,9 @@ static char bnc_pass[64] = {0};
 static Tab gTabs[MAX_TABS];
 static int gTabCount = 0;
 static int gActive = 0;
+#define current_tab_index gActive // spec server skip index - alias to gActive
+static char active_networks[4][32] = {0};
+static int active_networks_count = 0;
 static bool gSdReady = false;
 static bool gSafeBoot = false;
 static bool gNickOverlay = false;
@@ -532,6 +536,13 @@ static Tab* getOrCreateTab(const char* name, TabType t){
   memset(nb,0,sizeof(Tab));
   safeCopy(nb->name,name,sizeof(nb->name));
   nb->type=t;
+  {
+    const char* srv = bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host;
+    safeCopy(nb->server, srv, sizeof(nb->server));
+    // also update active_networks cache
+    bool found=false; for(int i=0;i<active_networks_count;++i) if(eqI(active_networks[i], nb->server)) found=true;
+    if(!found && active_networks_count<4){ safeCopy(active_networks[active_networks_count++], nb->server, sizeof(active_networks[0])); }
+  }
   return nb;
 }
 static void ensureStatus(){
@@ -540,6 +551,9 @@ static void ensureStatus(){
     memset(t,0,sizeof(Tab));
     safeCopy(t->name,"status",sizeof(t->name));
     t->type=TAB_STATUS;
+    const char* srv = bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host;
+    safeCopy(t->server, srv, sizeof(t->server));
+    if(active_networks_count<4){ safeCopy(active_networks[active_networks_count++], t->server, sizeof(active_networks[0])); }
     gActive=0;
   }
 }
@@ -944,6 +958,24 @@ static void drawTopBar(){
   int bw = strlen(bstr)*CHAR_W;
   d.setCursor(SCREEN_W - bw -2, 2);
   d.print(bstr);
+  // Audio status bracket tags - clean text-based per spec, no emojis
+  char audioTag[4];
+  uint16_t audioCol;
+  if(gCfg.current_audio == 1){
+    // Stealth/LED mode - muted
+    strncpy(audioTag, "[M]", sizeof(audioTag)); // alternative [X]
+    audioCol = 0xF800; // bright red (or 0xFFE0 yellow)
+  } else {
+    // Loud/Audio mode - live
+    strncpy(audioTag, "[S]", sizeof(audioTag)); // alternative [+]
+    audioCol = 0x07E0; // solid bright green
+  }
+  d.setTextColor(audioCol, UI_BG);
+  int audioW = strlen(audioTag)*CHAR_W;
+  int audioX = SCREEN_W - bw - audioW - 10;
+  if(audioX < x+2) audioX = x+2;
+  d.setCursor(audioX, 2);
+  d.print(audioTag);
 }
 
 static void drawBottomInput(){
@@ -1007,6 +1039,18 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
+  // Top status bar layout - audio bracket tags per spec (clean text, no emojis)
+  if(gCfg.current_audio == 1){
+    // Stealth/LED mode - print [M] or [X] in bright red or yellow
+    const char* audioTag = "[M]"; // alternative [X]
+    uint16_t audioCol = 0xF800; // bright red (yellow 0xFFE0 alternative)
+    (void)audioTag; (void)audioCol;
+  } else {
+    // Loud/Audio mode - print [S] or [+] in solid bright green
+    const char* audioTag = "[S]"; // alternative [+]
+    uint16_t audioCol = 0x07E0; // solid bright green
+    (void)audioTag; (void)audioCol;
+  }
   if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
   gChatCanvas.fillScreen(UI_BG);
   gChatCanvas.setTextSize(1);
@@ -1187,9 +1231,33 @@ void handle_settings_navigation(bool isDown){
   gQuickOverlayRow = current_settings_row;
 }
 void run_bouncer_setup_menu();
+void display_network_jump_hud();
+static void serverSkipForward();
+static void serverSkipBackward();
 void handle_keyboard_inputs(){
-  // LIVE INJECTION: Fn+B/T hotkeys per spec - check status.fn modifier
   auto st = M5Cardputer.Keyboard.keysState();
+  // CHANNEL STEPPING (Alt + Arrows) per spec
+  if(st.alt){
+    for(char c : st.word){
+      if(c=='/' || c==']' || c=='l' || c=='L'){
+        int total_tabs = gTabCount;
+        current_tab_index = (current_tab_index + 1) % total_tabs;
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c==',' || c=='[' || c=='h' || c=='H'){
+        int total_tabs = gTabCount;
+        current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1;
+        ui_needs_redraw = true;
+        return;
+      }
+    }
+    for(uint8_t k : st.hid_keys){
+      if(k==0x4F){ int total_tabs=gTabCount; current_tab_index = (current_tab_index + 1) % total_tabs; ui_needs_redraw = true; return; }
+      if(k==0x50){ int total_tabs=gTabCount; current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1; ui_needs_redraw = true; return; }
+    }
+  }
+  // LIVE INJECTION: Fn+B/T/N and Server Skip hotkeys per spec - check status.fn modifier
   if(st.fn){
     for(char c : st.word){
       if(c=='b' || c=='B'){
@@ -1199,13 +1267,78 @@ void handle_keyboard_inputs(){
         return;
       }
       if(c=='t' || c=='T'){
-        logStatus("LED Diagnostic: Purple test Pin21");
-        neopixelWrite(LED_PIN, 60, 0, 60);
-        uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
-        (void)purp;
+        // TEST MODE 1 - THE MENTION ALERT (Purple Double-Pulse)
+        logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
+        for(int r=0; r<2; ++r){
+          neopixelWrite(LED_PIN, 60, 0, 60);
+          uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+          (void)purp;
+          vTaskDelay(pdMS_TO_TICKS(100));
+          neopixelWrite(LED_PIN, 0, 0, 0);
+          vTaskDelay(pdMS_TO_TICKS(100));
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
+        // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
+        logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
+        for(int b=0; b<=40; b+=4){
+          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          neopixelWrite(LED_PIN, 0, b, 60);
+          (void)col2;
+          vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        for(int b=40; b>=0; b-=4){
+          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          neopixelWrite(LED_PIN, 0, b, 60);
+          (void)col2;
+          vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
+        logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
+        {
+          uint16_t col3 = M5Cardputer.Display.color565(40, 15, 0);
+          (void)col3;
+          neopixelWrite(LED_PIN, 40, 15, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1500));
         neopixelWrite(LED_PIN, 0, 0, 0);
         ui_needs_redraw = true;
+        logStatus("LED Diagnostic Cycle Complete.");
+        return;
+      }
+      if(c=='n' || c=='N'){
+        display_network_jump_hud();
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c=='/' || c==']' || c=='l' || c=='L'){
+        // Fn + Right Arrow - DYNAMIC SERVER SKIP LOGIC forward: loop until server changes
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index + i) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){
+            current_tab_index = idx;
+            ui_needs_redraw = true;
+            return;
+          }
+        }
+        return;
+      }
+      if(c==',' || c=='[' || c=='h' || c=='H'){
+        // Fn + Left Arrow - server skip backward
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index - i + total_tabs) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){
+            current_tab_index = idx;
+            ui_needs_redraw = true;
+            return;
+          }
+        }
         return;
       }
     }
@@ -1297,6 +1430,102 @@ void run_bouncer_setup_menu(){
   }
   saveConfig();
   gInScanner = prevScanner;
+  ui_needs_redraw = true;
+}
+
+// DYNAMIC SERVER SKIP LOGIC: jump across server networks
+static void serverSkipForward(){
+  if(gTabCount==0) return;
+  const char* curSrv = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+  for(int i=1; i<gTabCount; ++i){
+    int idx = (current_tab_index + i) % gTabCount;
+    const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+    if(!eqI(srv, curSrv)){
+      current_tab_index = idx;
+      ui_needs_redraw = true;
+      return;
+    }
+  }
+}
+static void serverSkipBackward(){
+  if(gTabCount==0) return;
+  const char* curSrv = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+  for(int i=1; i<gTabCount; ++i){
+    int idx = (current_tab_index - i + gTabCount) % gTabCount;
+    const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+    if(!eqI(srv, curSrv)){
+      current_tab_index = idx;
+      ui_needs_redraw = true;
+      return;
+    }
+  }
+}
+
+void display_network_jump_hud(){
+  // Suspend regular chat rendering
+  bool prev = gInScanner;
+  gInScanner = true;
+  // Count distinct server names into active_networks
+  active_networks_count = 0;
+  for(int i=0;i<gTabCount && active_networks_count<4; ++i){
+    const char* srv = gTabs[i].server[0] ? gTabs[i].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+    bool exists=false;
+    for(int j=0;j<active_networks_count;++j) if(eqI(active_networks[j], srv)) exists=true;
+    if(!exists){ safeCopy(active_networks[active_networks_count++], srv, sizeof(active_networks[0])); }
+  }
+  // Fallback if no tabs, use current bouncer/host
+  if(active_networks_count==0 && bnc_host.length()>0){ safeCopy(active_networks[0], bnc_host.c_str(), sizeof(active_networks[0])); active_networks_count=1; }
+  else if(active_networks_count==0){ safeCopy(active_networks[0], gCfg.host, sizeof(active_networks[0])); active_networks_count=1; }
+  while(true){
+    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    M5Cardputer.Display.fillScreen(UI_BG);
+    M5Cardputer.Display.drawRect(0,0,SCREEN_W,SCREEN_H, 0xFFFF);
+    M5Cardputer.Display.fillRect(10,10,SCREEN_W-20,SCREEN_H-20, UI_BG);
+    M5Cardputer.Display.drawRect(10,10,SCREEN_W-20,SCREEN_H-20, 0xFFFF);
+    M5Cardputer.Display.setTextSize(1);
+    M5Cardputer.Display.setTextColor(0xFFFF, UI_BG);
+    M5Cardputer.Display.setCursor(20,20);
+    M5Cardputer.Display.print("Network Jump HUD");
+    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
+    M5Cardputer.Display.setCursor(20,35);
+    M5Cardputer.Display.printf("Found %d networks", active_networks_count);
+    for(int i=0;i<active_networks_count;++i){
+      M5Cardputer.Display.setCursor(20, 50 + i*15);
+      M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
+      M5Cardputer.Display.printf("%d: %s", i+1, active_networks[i]);
+    }
+    M5Cardputer.Display.setCursor(20, SCREEN_H-15);
+    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
+    M5Cardputer.Display.print("1-4=Jump  Del=Close");
+    if(irc_mutex) xSemaphoreGive(irc_mutex);
+    M5Cardputer.update();
+    if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
+      auto ks = M5Cardputer.Keyboard.keysState();
+      if(ks.del){ break; }
+      for(char c: ks.word){
+        if(c>='1' && c<='4'){
+          int idx = c - '1';
+          if(idx < active_networks_count){
+            for(int t=0; t<gTabCount; ++t){
+              const char* srv = gTabs[t].server[0] ? gTabs[t].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+              if(eqI(srv, active_networks[idx])){
+                current_tab_index = t;
+                gTabs[t].unread=false; gTabs[t].mention=false;
+                ui_needs_redraw = true;
+                break;
+              }
+            }
+            gInScanner = prev;
+            ui_needs_redraw = true;
+            return;
+          }
+        }
+      }
+      if(ks.enter) break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(30));
+  }
+  gInScanner = prev;
   ui_needs_redraw = true;
 }
 
@@ -1988,10 +2217,13 @@ static void serviceKeyboard(){
   auto ks = M5Cardputer.Keyboard.keysState();
   // Quick Settings overlay active - 5-row grid handling per spec
   if(gQuickOverlay){
-    // LIVE INJECTION: Fn+B/T hotkeys even inside overlay per spec
+    // LIVE INJECTION: Fn+B/T/N and Server Skip hotkeys even inside overlay per spec
     for(char c: ks.word){
       if(ks.fn && (c=='b' || c=='B')){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
       if(ks.fn && (c=='t' || c=='T')){ logStatus("LED Diagnostic: Purple test on Pin 21"); neopixelWrite(LED_PIN, 60,0,60); vTaskDelay(pdMS_TO_TICKS(1000)); neopixelWrite(LED_PIN,0,0,0); ui_needs_redraw = true; return; }
+      if(ks.fn && (c=='n' || c=='N')){ display_network_jump_hud(); ui_needs_redraw = true; return; }
+      if(ks.fn && (c==']' || c=='/' )){ serverSkipForward(); return; } // Fn+Right Arrow
+      if(ks.fn && (c=='[' || c==',' )){ serverSkipBackward(); return; } // Fn+Left Arrow
     }
     // Up/Down selects row 0-4 via handle_settings_navigation
     for(char c: ks.word){
@@ -2095,8 +2327,29 @@ static void serviceKeyboard(){
     gHistNav=-1;
     ui_needs_redraw = true; // active keystroke
   }
+  // CHANNEL STEPPING (Alt+Arrows) per spec
+  if(ks.alt){
+    for(char c: ks.word){
+      if(c=='/' || c==']' || c=='l' || c=='L'){
+        int total_tabs = gTabCount;
+        current_tab_index = (current_tab_index + 1) % total_tabs;
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c==',' || c=='[' || c=='h' || c=='H'){
+        int total_tabs = gTabCount;
+        current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1;
+        ui_needs_redraw = true;
+        return;
+      }
+    }
+    for(uint8_t k : ks.hid_keys){
+      if(k==0x4F){ int total_tabs=gTabCount; current_tab_index = (current_tab_index + 1) % total_tabs; ui_needs_redraw = true; return; }
+      if(k==0x50){ int total_tabs=gTabCount; current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1; ui_needs_redraw = true; return; }
+    }
+  }
   if(ks.fn){
-    // LIVE INJECTION: Fn+B and Fn+T hotkeys per spec inside status.fn check
+    // LIVE INJECTION: Fn+B/N/T and Server Skip hotkeys per spec inside status.fn check
     for(char c: ks.word){
       if(c=='b' || c=='B'){
         run_bouncer_setup_menu();
@@ -2104,13 +2357,68 @@ static void serviceKeyboard(){
         return;
       }
       if(c=='t' || c=='T'){
-        logStatus("LED Diagnostic: Purple test on Pin 21");
-        neopixelWrite(LED_PIN, 60, 0, 60);
-        uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
-        (void)purp;
+        // TEST MODE 1 - THE MENTION ALERT (Purple Double-Pulse)
+        logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
+        for(int r=0; r<2; ++r){
+          neopixelWrite(LED_PIN, 60, 0, 60);
+          uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+          (void)purp;
+          vTaskDelay(pdMS_TO_TICKS(100));
+          neopixelWrite(LED_PIN, 0, 0, 0);
+          vTaskDelay(pdMS_TO_TICKS(100));
+        }
         vTaskDelay(pdMS_TO_TICKS(1000));
+        // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
+        logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
+        for(int b=0; b<=40; b+=4){
+          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          neopixelWrite(LED_PIN, 0, b, 60);
+          (void)col2;
+          vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        for(int b=40; b>=0; b-=4){
+          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          neopixelWrite(LED_PIN, 0, b, 60);
+          (void)col2;
+          vTaskDelay(pdMS_TO_TICKS(25));
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
+        logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
+        {
+          uint16_t col3 = M5Cardputer.Display.color565(40, 15, 0);
+          (void)col3;
+          neopixelWrite(LED_PIN, 40, 15, 0);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1500));
         neopixelWrite(LED_PIN, 0, 0, 0);
         ui_needs_redraw = true;
+        logStatus("LED Diagnostic Cycle Complete.");
+        return;
+      }
+      if(c=='n' || c=='N'){
+        display_network_jump_hud();
+        ui_needs_redraw = true;
+        return;
+      }
+      if(c==']' || c=='/' ){
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index + i) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
+        }
+        return;
+      }
+      if(c=='[' || c==','){
+        int total_tabs = gTabCount;
+        const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        for(int i=1; i<total_tabs; ++i){
+          int idx = (current_tab_index - i + total_tabs) % total_tabs;
+          const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+          if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
+        }
         return;
       }
     }
