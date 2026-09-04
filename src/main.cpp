@@ -2706,39 +2706,31 @@ void setup(){
   gTabsMutex = irc_mutex;
     gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
 
-  // Safe Mode single-pass check - BAN INFINITE PIN-WAIT LOOPS - debounced G0/BtnA to prevent spurious trigger on floating GPIO0 strapping pin
+  // Safe Mode single-pass check - robust BtnA via TCA8418 (ignore floating GPIO0 strapping) - require intentional hold
   Serial.println("[BOOSTER-LOG] Safe Mode initialization check...");
-  pinMode(0, INPUT_PULLUP); // Enforce pullup on G0 button pin
-  vTaskDelay(pdMS_TO_TICKS(10)); yield(); // let pullup stabilize, feed WDT
-  M5Cardputer.update(); // TCA8418 matrix settle
-  // Robust debounced check: Cardputer Adv G0 is BtnA via TCA8418, not raw GPIO0 strapping - require 3 consecutive reads over 30ms
-  int g0Confirm = 0;
-  for(int i=0;i<3;i++){ vTaskDelay(pdMS_TO_TICKS(10)); yield(); M5Cardputer.update(); bool rawLow = (digitalRead(0)==LOW); bool btnAPressed = M5Cardputer.BtnA.isPressed(); if(rawLow || btnAPressed) g0Confirm++; }
-  bool safeModeRequested = (g0Confirm >= 2); // require 2/3 reads to confirm intentional hold, not floating
-  if (safeModeRequested) { 
+  pinMode(0, INPUT_PULLUP);
+  vTaskDelay(pdMS_TO_TICKS(10)); yield();
+  M5Cardputer.update();
+  // Only BtnA via TCA8418 counts - raw GPIO0 floats low on Cardputer Adv and causes spurious safe mode
+  int btnConfirm = 0;
+  for(int i=0;i<5;i++){ vTaskDelay(pdMS_TO_TICKS(10)); yield(); M5Cardputer.update(); if(M5Cardputer.BtnA.isPressed()) btnConfirm++; }
+  bool safeModeRequested = (btnConfirm >= 4); // 4/5 BtnA reads over 50ms, ignore floating GPIO0 strapping - require intentional hold
+  if (safeModeRequested) {
       Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
       safe_mode_active = true;
       gSafeBoot = true;
       gTabCount = 1;
       current_tab_index = 0;
+      memset(&gTabs[0], 0, sizeof(gTabs[0]));
       strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
-      gTabs[0].name[sizeof(gTabs[0].name)-1]='\0';
       strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
-      gTabs[0].server[sizeof(gTabs[0].server)-1]='\0';
+      gTabs[0].type = TAB_STATUS;
       add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
-      xSemaphoreGive(irc_mutex);
+      xSemaphoreGive(irc_mutex); // Force release the initialization lock per spec (safe even if already freed, ensures SPI bus unlocked)
   } else {
       Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
       safe_mode_active = false;
       gSafeBoot = false;
-  }
-  if (safe_mode_active) {
-      gTabCount = 1;
-      current_tab_index = 0;
-      strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
-      strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
-      add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
-      xSemaphoreGive(irc_mutex); // Force release the initialization lock
   }
   // Execution MUST flow through cleanly past this block immediately!
 
