@@ -219,7 +219,7 @@ struct Config {
   ColorMode colorMode = ColorMode::Full;
   bool showControlGlyphs = true;
   bool persistTabs = true;
-  TextOverflowMode textOverflowMode = TextOverflowMode::Marquee;
+  TextOverflowMode textOverflowMode = TextOverflowMode::Wrap;
   bool serialLogEnabled = true;
   bool channelLogEnabled = false;
   bool awayLogEnabled = false; // disable others' away for RAM
@@ -5585,7 +5585,21 @@ class SimpleTransport {
     clampTabScroll(tab);
     int visibleRows = bodyVisibleRows();
     int totalRows = totalWrappedRows(tab, textWidth);
-    int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
+    // Wrap optimized for navbar: reserve 1 row clearance above navbar when at bottom,
+    // and align top to full line to avoid partial-line clutter (limits top messages).
+    int effectiveVisible = visibleRows;
+    if (tab.scroll == 0 && totalRows > visibleRows) effectiveVisible = std::max(1, visibleRows - 1);
+    int startRow = std::max(0, totalRows - effectiveVisible - tab.scroll);
+    // Align startRow to line boundary
+    {
+      int cur = 0;
+      for (auto &l : tab.lines) {
+        int lr = wrappedRowsForLine(l, textWidth);
+        if (cur + lr <= startRow) cur += lr;
+        else if (cur < startRow && startRow < cur + lr) { startRow = cur + lr; break; }
+        else break;
+      }
+    }
     bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
     int by = isBodySprite ? 0 : BODY_Y;
 
@@ -5612,17 +5626,20 @@ class SimpleTransport {
           continue;
         }
         int skipRows = std::max(0, startRow - currentRow);
-        int rowsLeft = visibleRows - drawnRows;
+        // In wrap mode we already aligned startRow to line boundary, so skipRows should be 0 for top
+        // If still partial (should not happen after alignment), skip whole line to keep line integrity
+        if (skipRows > 0 && skipRows < lineRows) { currentRow += lineRows; continue; }
+        int rowsLeft = effectiveVisible - drawnRows;
         if (rowsLeft <= 0) break;
         if (y + ROW_H > by + BODY_H) break;
         int maxDrawableRows = (by + BODY_H - y) / ROW_H;
         if (maxDrawableRows <=0) break;
         rowsLeft = std::min(rowsLeft, maxDrawableRows);
-        int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
+        int usedRows = drawWrappedChatLine(0, y, line, textWidth, 0, rowsLeft);
         drawnRows += usedRows;
         y += usedRows * ROW_H;
         currentRow += lineRows;
-        if (drawnRows >= visibleRows || y + ROW_H > by + BODY_H) break;
+        if (drawnRows >= effectiveVisible || y + ROW_H > by + BODY_H) break;
       }
     }
     // Scrollbar for wrapped
