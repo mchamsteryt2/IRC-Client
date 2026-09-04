@@ -29,6 +29,8 @@ static constexpr uint16_t UI_ACCENT = 0x07E0;
 static constexpr uint16_t UI_WARN = 0xFD20;
 static constexpr uint16_t UI_PANE = 0x0841;
 static constexpr uint16_t UI_HILITE_BG = 0x2104;
+static constexpr uint16_t UI_CARD = 0x10A2;
+static constexpr uint16_t UI_BORDER = 0x2945;
 
 static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
@@ -4744,14 +4746,20 @@ class IrcClientApp {
 
   void drawConfigPage() {
     auto& gfx = drawTarget();
-    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
-    gfx.setTextColor(UI_FG, UI_HEADER);
-    gfx.setCursor(2, 3);
-    gfx.print(_configEditing ? "CONFIG EDIT" : "CONFIG PAGE");
+    // Modern flat header — ratspeak style
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
+    gfx.setTextColor(UI_FG, UI_BG);
+    gfx.setCursor(6, 3);
+    gfx.print(_configEditing ? "CONFIG EDIT" : "CONFIG");
+    // Right hint pill
     String rhs = "hold G0";
-    gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
+    int rhsW = rhs.length() * CHAR_W + 6;
+    gfx.fillRoundRect(SCREEN_W - rhsW - 4, 2, rhsW, 10, 4, UI_CARD);
+    gfx.setTextColor(UI_DIM, UI_CARD);
+    gfx.setCursor(SCREEN_W - rhsW - 1, 3);
     gfx.print(rhs);
-    drawBatteryIndicator(gfx, UI_HEADER);
+    drawBatteryIndicator(gfx, UI_BG);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -4761,48 +4769,58 @@ class IrcClientApp {
     if (_configScroll < 0) _configScroll = 0;
 
     int y = BODY_Y + 1;
-    int labelChars = 13;
-    int valueChars = 24;
+    int labelChars = 12;
+    int valueChars = 22;
 
     for (int idx = _configScroll; idx < CFG_COUNT && idx < _configScroll + visibleRows; ++idx) {
       bool selected = idx == _configSelected;
       bool catStart = isConfigCategoryStart(idx);
 
-      uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
-      gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
-
+      uint16_t cardBg = selected ? UI_HILITE_BG : UI_CARD;
+      uint16_t border = selected ? UI_ACCENT : UI_BORDER;
+      gfx.fillRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, cardBg);
+      gfx.drawRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, border);
+      if (selected) gfx.fillRect(3, y + 1, 2, CHAR_H, UI_ACCENT);
+      // Category pill — modern badge at left of card
       if (catStart) {
-        gfx.fillRect(0, y, SCREEN_W, 2, UI_ACCENT);
+        String cat = getConfigCategoryName(idx);
+        int pillW = cat.length() * CHAR_W + 8;
+        gfx.fillRoundRect(6, y + 1, pillW, 7, 3, UI_ACCENT);
+        gfx.setTextColor(UI_BG, UI_ACCENT);
+        gfx.setCursor(9, y + 1);
+        gfx.print(cat);
       }
 
-      gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
-      gfx.setCursor(2, y);
+      gfx.setTextColor(selected ? UI_WARN : UI_DIM, cardBg);
+      gfx.setCursor(6, y);
       gfx.print(selected ? (_configEditing ? "*" : ">") : " " );
 
-      String label;
-      if (catStart) {
-        label = ellipsize(getConfigCategoryName(idx), labelChars);
-        gfx.setTextColor(UI_ACCENT, bg);
-      } else {
-        label = ellipsize(getConfigFieldLabel(idx), labelChars);
-        gfx.setTextColor(UI_FG, bg);
-      }
-      gfx.setCursor(10, y);
+      // Offset label to make room for category pill when present
+      int labelX = catStart ? 12 + 28 : 12;
+      int availLabelChars = catStart ? labelChars - 4 : labelChars;
+      String label = ellipsize(getConfigFieldLabel(idx), availLabelChars);
+      gfx.setTextColor(catStart ? UI_DIM : UI_FG, cardBg);
+      gfx.setCursor(labelX, y);
       gfx.print(label);
 
       if (!configFieldIsAction(idx)) {
-        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
-        gfx.setCursor(10 + labelChars * CHAR_W, y);
-        gfx.print(ellipsize(getConfigFieldValue(idx, true), valueChars));
+        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, cardBg);
+        // Shift value right if pill present
+        int valX = catStart ? 12 + labelChars * CHAR_W + 8 : 12 + labelChars * CHAR_W;
+        gfx.setCursor(valX, y);
+        gfx.print(ellipsize(getConfigFieldValue(idx, true), valueChars - (catStart ? 4 : 0)));
       }
 
       y += ROW_H;
     }
 
-    int inputY = SCREEN_H - INPUT_H;
-    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_INPUT);
-    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
-    gfx.setTextColor(UI_FG, UI_INPUT);
+    int inputY = INPUT_Y;
+    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
+    // Rounded input hint area
+    gfx.fillRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_CARD);
+    gfx.drawRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_BORDER);
+    gfx.setTextColor(UI_FG, UI_CARD);
 
     if (_configEditing) {
       String hdr = ellipsize(getConfigFieldLabel(_configSelected), 16) + ":";
@@ -4831,16 +4849,28 @@ class IrcClientApp {
 
   void drawChannelListPage() {
     auto& gfx = drawTarget();
-    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
-    gfx.setTextColor(UI_FG, UI_HEADER);
-    gfx.setCursor(2, 3);
-    if (_channelListFilterPrompt) gfx.print("CHANNEL FILTER");
-    else gfx.print(_channelListLoading ? "CHANNELS LOAD" : "CHANNEL LIST");
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
+    gfx.setTextColor(UI_FG, UI_BG);
+    gfx.setCursor(6, 3);
+    if (_channelListFilterPrompt) gfx.print("FILTER");
+    else gfx.print(_channelListLoading ? "LOADING" : "CHANNELS");
+    // Count pill
+    String cnt = String(_channelList.size());
+    if (!_channelListFilter.isEmpty()) cnt += " filt";
+    int cntW = cnt.length() * CHAR_W + 8;
+    gfx.fillRoundRect(80, 2, cntW, 10, 4, UI_CARD);
+    gfx.setTextColor(UI_DIM, UI_CARD);
+    gfx.setCursor(84, 3);
+    gfx.print(cnt);
 
     String rhs = "` close";
-    gfx.setCursor(SCREEN_W - static_cast<int>(rhs.length()) * CHAR_W - 2, 3);
+    int rhsW = rhs.length() * CHAR_W + 6;
+    gfx.fillRoundRect(SCREEN_W - rhsW - 4, 2, rhsW, 10, 4, UI_CARD);
+    gfx.setTextColor(UI_DIM, UI_CARD);
+    gfx.setCursor(SCREEN_W - rhsW - 1, 3);
     gfx.print(rhs);
-    drawBatteryIndicator(gfx, UI_HEADER);
+    drawBatteryIndicator(gfx, UI_BG);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -4882,25 +4912,41 @@ class IrcClientApp {
         for (int idx = _channelListScroll; idx < static_cast<int>(visible.size()) && idx < _channelListScroll + visibleRows; ++idx) {
           const ChannelListEntry& entry = _channelList[visible[idx]];
           bool selected = idx == _channelListSelected;
-          uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
-          gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
-          gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
-          gfx.setCursor(2, y);
-          gfx.print(selected ? ">" : " ");
-
-          String row = entry.name + " [" + String(entry.users) + "]";
-          gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
-          gfx.setCursor(10, y);
-          gfx.print(ellipsize(row, 37));
+          uint16_t cardBg = selected ? UI_HILITE_BG : UI_CARD;
+          uint16_t border = selected ? UI_ACCENT : UI_BORDER;
+          gfx.fillRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, cardBg);
+          gfx.drawRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, border);
+          if (selected) gfx.fillRect(3, y + 1, 2, CHAR_H, UI_ACCENT);
+          // Icon: # for channel
+          gfx.setTextColor(selected ? UI_WARN : UI_DIM, cardBg);
+          gfx.setCursor(6, y);
+          gfx.print(selected ? ">" : "#");
+          String row = entry.name + "  " + String(entry.users);
+          // users count pill at right
+          String usersStr = String(entry.users);
+          int usersW = usersStr.length() * CHAR_W + 8;
+          int usersX = SCREEN_W - 6 - usersW;
+          // Avoid overlap with row text
+          String rowEll = ellipsize(row, 32);
+          gfx.setTextColor(selected ? UI_ACCENT : UI_FG, cardBg);
+          gfx.setCursor(14, y);
+          gfx.print(rowEll);
+          // Users badge
+          gfx.fillRoundRect(usersX, y + 1, usersW, 7, 3, selected ? UI_ACCENT : UI_BG);
+          gfx.setTextColor(selected ? UI_BG : UI_DIM, selected ? UI_ACCENT : UI_BG);
+          gfx.setCursor(usersX + 4, y + 1);
+          gfx.print(usersStr);
           y += ROW_H;
         }
       }
     }
 
-    int inputY = SCREEN_H - INPUT_H;
-    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_INPUT);
-    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
-    gfx.setTextColor(UI_FG, UI_INPUT);
+    int inputY = INPUT_Y;
+    gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
+    gfx.fillRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_CARD);
+    gfx.drawRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_BORDER);
+    gfx.setTextColor(UI_FG, UI_CARD);
 
     if (_channelListFilterPrompt) {
       gfx.setCursor(2, inputY + 4);
@@ -4936,36 +4982,58 @@ class IrcClientApp {
 
   void drawHeader() {
     auto& gfx = drawTarget();
-    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_HEADER);
-    gfx.setTextColor(UI_FG, UI_HEADER);
+    // Modern flat header — ratspeak inspired: BG + subtle bottom border
+    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
+
+    // Connection dot (left)
+    bool conn = _transport.connected();
+    uint16_t dotCol = !_wifiReady ? UI_DIM : (!conn ? UI_WARN : (_ircRegistered ? UI_ACCENT : UI_WARN));
+    gfx.fillCircle(6, HEADER_H / 2, 3, dotCol);
+    gfx.drawCircle(6, HEADER_H / 2, 3, UI_FG);
 
     String title = _tabs[_activeTab].name;
-    if (_tabs[_activeTab].mention) title = "!" + title;
-    else if (_tabs[_activeTab].unread) title = "*" + title;
+    bool hasMention = _tabs[_activeTab].mention;
+    bool hasUnread = _tabs[_activeTab].unread;
+    // Section glyph prefix — modern hint
+    String glyph;
+    if (_tabs[_activeTab].type == TabType::Channel) glyph = "#";
+    else if (_tabs[_activeTab].type == TabType::Query) glyph = "@";
+    else glyph = "o";
+    // Build title with glyph
+    String dispTitle = glyph + " " + title;
+    if (hasMention) dispTitle = "!" + dispTitle;
+    else if (hasUnread) dispTitle = "*" + dispTitle;
 
     String net = _wifiReady ? WiFi.localIP().toString() : "offline";
-    if (_transport.connected()) net += " IRC";
-    if (!_ircRegistered && _transport.connected()) net += "*";
+    if (conn) net += " IRC";
+    if (!_ircRegistered && conn) net += "*";
 
     static constexpr int batteryBodyW = 18;
     static constexpr int batteryTipW = 2;
     static constexpr int batteryGapW = 1;
     static constexpr int batteryTotalW = batteryBodyW + batteryTipW + batteryGapW;
     int batteryX = (SCREEN_W - batteryTotalW) / 2;
-    int leftChars = std::max(0, (batteryX - 4) / CHAR_W);
+    // Leave room for dot + glyph
+    int leftChars = std::max(0, (batteryX - 16) / CHAR_W);
     int rightChars = std::max(0, (SCREEN_W - (batteryX + batteryTotalW) - 4) / CHAR_W);
-    title = ellipsize(title, leftChars);
+    dispTitle = ellipsize(dispTitle, leftChars);
     net = ellipsize(net, rightChars);
 
-    gfx.setCursor(2, 3);
-    gfx.print(title);
+    // Title left of battery, with subtle highlight if mention
+    uint16_t titleBg = UI_BG;
+    uint16_t titleFg = hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG);
+    gfx.setTextColor(titleFg, titleBg);
+    gfx.setCursor(14, 3);
+    gfx.print(dispTitle);
 
     int rx = SCREEN_W - (net.length() * CHAR_W) - 2;
     int minRx = batteryX + batteryTotalW + 4;
     if (rx < minRx) rx = minRx;
+    gfx.setTextColor(UI_DIM, UI_BG);
     gfx.setCursor(rx, 3);
     gfx.print(net);
-    drawBatteryIndicator(gfx, UI_HEADER);
+    drawBatteryIndicator(gfx, UI_BG);
   }
 
   void drawBatteryIndicator(lgfx::LovyanGFX& gfx, uint16_t bg) {
@@ -5005,48 +5073,50 @@ class IrcClientApp {
 
   void drawNavBar() {
     auto& gfx = drawTarget();
-    // Nav bar spans full width at NAV_Y, height NAV_H
-    gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_HEADER);
-    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_DIM);
-    gfx.drawFastHLine(0, NAV_Y + NAV_H, SCREEN_W, UI_DIM);
-    const char* labels[SEC_COUNT] = {"SERVERS", "CHANNELS", "CHATS", "SETTINGS"};
+    // Modern floating pill — ratspeak style
+    gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_BG);
+    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_BORDER);
+    // Pill container
+    const int pillX = 4;
+    const int pillY = NAV_Y + 1;
+    const int pillW = SCREEN_W - 8;
+    const int pillH = NAV_H - 2;
+    gfx.fillRoundRect(pillX, pillY, pillW, pillH, 4, UI_CARD);
+    gfx.drawRoundRect(pillX, pillY, pillW, pillH, 4, UI_BORDER);
+    const char* labels[SEC_COUNT] = {"SERVERS", "CHANS", "CHATS", "SET"};
+    const char* icons[SEC_COUNT] = {"o", "#", "@", "*"};
     int cur = currentSection();
-    int segW = SCREEN_W / SEC_COUNT;
+    int segW = pillW / SEC_COUNT;
     for (int i = 0; i < SEC_COUNT; ++i) {
-      int x = i * segW;
-      int w = (i == SEC_COUNT - 1) ? SCREEN_W - x : segW;
+      int x = pillX + i * segW;
+      int w = (i == SEC_COUNT - 1) ? pillX + pillW - x : segW;
       bool active = (i == cur);
-      uint16_t bg = active ? UI_HILITE_BG : UI_HEADER;
-      uint16_t fg = active ? UI_ACCENT : UI_DIM;
-      // active accent top bar
-      if (active) gfx.fillRect(x, NAV_Y, w, 2, UI_ACCENT);
-      else gfx.fillRect(x, NAV_Y, w, NAV_H, bg);
-      if (active) gfx.fillRect(x, NAV_Y + 2, w, NAV_H - 2, bg);
-      // vertical separators
-      if (i > 0) gfx.drawFastVLine(x, NAV_Y, NAV_H, UI_DIM);
-      // label centered
-      String lbl = labels[i];
-      // Shorten CHANNELS->CHAN if needed but we have 10 chars
-      int lblW = (int)lbl.length() * CHAR_W;
-      int cx = x + (w - lblW) / 2;
-      // unread/mention dot
       bool mention = sectionHasMention(i);
       bool unread = sectionHasUnread(i);
-      if (mention) fg = UI_WARN;
-      else if (active) fg = UI_FG;
-      gfx.setTextColor(fg, bg);
-      gfx.setCursor(cx, NAV_Y + 2);
+      // Active pill
+      if (active) {
+        gfx.fillRoundRect(x + 1, pillY + 1, w - 2, pillH - 2, 3, UI_ACCENT);
+        gfx.setTextColor(UI_BG, UI_ACCENT);
+      } else {
+        uint16_t fg = mention ? UI_WARN : (unread ? UI_FG : UI_DIM);
+        gfx.setTextColor(fg, UI_CARD);
+      }
+      // Build label: icon + short name + count badge
+      String lbl = String(icons[i]) + " " + labels[i];
+      int cnt = countInSection(i);
+      if (i != SEC_SETTINGS && cnt > 0) {
+        // keep short: show count only if space, else omit
+        String withCnt = lbl + " " + String(cnt);
+        if ((int)withCnt.length() * CHAR_W + 6 <= w) lbl = withCnt;
+      }
+      int lblW = (int)lbl.length() * CHAR_W;
+      int cx = x + (w - lblW) / 2;
+      int cy = pillY + 1;
+      gfx.setCursor(cx, cy);
       gfx.print(lbl);
-      // indicator dot top-right of segment
-      if ((mention || unread) && !active) {
-        int dotX = x + w - 5;
-        int dotY = NAV_Y + 2;
-        gfx.fillCircle(dotX, dotY, 2, mention ? UI_WARN : UI_ACCENT);
-      } else if ((mention || unread) && active) {
-        // dot inside active bg but accent already
-        int dotX = x + w - 5;
-        int dotY = NAV_Y + 2;
-        gfx.fillCircle(dotX, dotY, 2, mention ? UI_WARN : UI_ACCENT);
+      // Unread dot for inactive with mention/unread (already colored) — small corner dot if not active
+      if (!active && (mention || unread)) {
+        gfx.fillCircle(x + w - 4, pillY + 2, 2, mention ? UI_WARN : UI_ACCENT);
       }
     }
   }
@@ -5121,75 +5191,111 @@ class IrcClientApp {
 
   void drawMarqueeChatLine(int x, int y, const ChatLine& line, int maxWidth) {
     auto& gfx = drawTarget();
-    uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
-    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, lineBg);
-    if (line.highlight) {
-      gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+    // Modern bubble — ratspeak inspired: rounded, subtle
+    uint16_t bubbleBg = line.highlight ? UI_HILITE_BG : (line.own ? UI_CARD : UI_BG);
+    if (line.notice) bubbleBg = UI_CARD;
+    bool hasBubble = bubbleBg != UI_BG;
+    // Bubble background with 1px inset and 3px radius for softness
+    if (hasBubble) {
+      gfx.fillRoundRect(x + 1, y, maxWidth - 2, CHAR_H + 1, 3, bubbleBg);
+      gfx.drawRoundRect(x + 1, y, maxWidth - 2, CHAR_H + 1, 3, UI_BORDER);
+      if (line.highlight) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_WARN);
+      else if (line.own) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_ACCENT);
+      else if (line.notice) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_DIM);
+    } else {
+      gfx.fillRect(x, y, maxWidth, CHAR_H + 1, UI_BG);
+      if (line.highlight) gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
     }
 
-    int stampX = x + 2;
-    gfx.setTextColor(UI_DIM, lineBg);
+    int stampX = x + 3;
+    uint16_t stampBg = hasBubble ? bubbleBg : UI_BG;
+    gfx.setTextColor(UI_DIM, stampBg);
     gfx.setCursor(stampX, y);
     String stamp = line.stampShort;
     if (stamp.length() > 5) stamp = stamp.substring(0, 5);
     gfx.print(stamp);
 
-    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
-    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    drawStyledText(textX, y, line.raw, textW, lineBg, currentTextScrollOffsetCols(line, textW));
+    int textX = x + 3 + TIMESTAMP_W_CHARS * CHAR_W;
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 6;
+    drawStyledText(textX, y, line.raw, textW, stampBg, currentTextScrollOffsetCols(line, textW));
   }
 
   int drawWrappedChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
     auto& gfx = drawTarget();
-    uint16_t lineBg = line.highlight ? UI_HILITE_BG : UI_BG;
+    uint16_t bubbleBg = line.highlight ? UI_HILITE_BG : (line.own ? UI_CARD : UI_BG);
+    if (line.notice) bubbleBg = UI_CARD;
+    bool hasBubble = bubbleBg != UI_BG;
     int totalRows = wrappedRowsForLine(line, maxWidth);
     int rowsToDraw = std::max(0, std::min(maxRows, totalRows - skipRows));
-    for (int row = 0; row < rowsToDraw; ++row) {
-      int rowY = y + row * ROW_H;
-      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, lineBg);
-    }
-    if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
-      gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+    // Single bubble spanning all rows of this message for modern grouped look
+    if (hasBubble && rowsToDraw > 0) {
+      int bubbleH = rowsToDraw * ROW_H;
+      // Slight vertical padding inside bubble
+      gfx.fillRoundRect(x + 1, y, maxWidth - 2, bubbleH, 4, bubbleBg);
+      gfx.drawRoundRect(x + 1, y, maxWidth - 2, bubbleH, 4, UI_BORDER);
+      if (line.highlight) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_WARN);
+      else if (line.own) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_ACCENT);
+      else if (line.notice) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_DIM);
+    } else {
+      for (int row = 0; row < rowsToDraw; ++row) {
+        int rowY = y + row * ROW_H;
+        gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, UI_BG);
+      }
+      if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
+        gfx.fillRect(x, y, 2, rowsToDraw * ROW_H, UI_WARN);
+      }
     }
 
     if (skipRows == 0 && rowsToDraw > 0) {
-      int stampX = x + 2;
-      gfx.setTextColor(UI_DIM, lineBg);
+      int stampX = x + 3;
+      uint16_t stampBg = hasBubble ? bubbleBg : UI_BG;
+      gfx.setTextColor(UI_DIM, stampBg);
       gfx.setCursor(stampX, y);
       String stamp = line.stampShort;
       if (stamp.length() > 5) stamp = stamp.substring(0, 5);
       gfx.print(stamp);
     }
 
-    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
-    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    drawWrappedStyledText(textX, y, line.raw, textW, lineBg, skipRows, rowsToDraw);
+    int textX = x + 3 + TIMESTAMP_W_CHARS * CHAR_W;
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 6;
+    drawWrappedStyledText(textX, y, line.raw, textW, bubbleBg == UI_BG ? UI_BG : bubbleBg, skipRows, rowsToDraw);
     return rowsToDraw;
   }
 
   void drawNickPane(const Tab& tab) {
     auto& gfx = drawTarget();
     int x = SCREEN_W - NICK_PANE_W;
-    gfx.fillRect(x, BODY_Y, NICK_PANE_W, BODY_H, UI_PANE);
-    gfx.drawFastVLine(x, BODY_Y, BODY_H, UI_DIM);
-    gfx.setTextColor(UI_FG, UI_PANE);
-    gfx.setCursor(x + 3, BODY_Y + 2);
-    String hdr = "Users " + String(tab.users.size());
-    if (hdr.length() > 11) hdr = hdr.substring(0, 11);
-    gfx.print(hdr);
+    // Modern card pane — rounded left edge, subtle border
+    gfx.fillRoundRect(x, BODY_Y, NICK_PANE_W, BODY_H, 6, UI_CARD);
+    gfx.drawRoundRect(x, BODY_Y, NICK_PANE_W, BODY_H, 6, UI_BORDER);
+    gfx.fillRect(x + 6, BODY_Y, NICK_PANE_W - 6, BODY_H, UI_CARD); // square right edge
+    gfx.drawFastVLine(x + 6, BODY_Y, BODY_H, UI_BORDER);
+    // Header pill
+    gfx.fillRoundRect(x + 4, BODY_Y + 2, NICK_PANE_W - 8, 10, 4, UI_BG);
+    gfx.setTextColor(UI_DIM, UI_BG);
+    gfx.setCursor(x + 8, BODY_Y + 3);
+    String hdr = String(tab.users.size()) + " users";
+    gfx.print(ellipsize(hdr, 9));
+    // Top accent dot for count
+    gfx.fillCircle(x + NICK_PANE_W - 10, BODY_Y + 7, 2, UI_ACCENT);
 
-    int y = BODY_Y + 12;
-    int maxRows = (BODY_H - 14) / (CHAR_H + 1);
+    int y = BODY_Y + 14;
+    int maxRows = (BODY_H - 16) / (CHAR_H + 1);
     for (int i = 0; i < maxRows && i < static_cast<int>(tab.users.size()); ++i) {
       String row;
       if (tab.users[i].prefix) row += tab.users[i].prefix;
       row += tab.users[i].nick;
-      int maxChars = (NICK_PANE_W - 6) / CHAR_W;
+      int maxChars = (NICK_PANE_W - 10) / CHAR_W;
       if (row.length() > static_cast<size_t>(maxChars)) row = row.substring(0, maxChars);
-      uint16_t color = equalsIgnoreCase(tab.users[i].nick, _selfNick) ? UI_ACCENT : UI_FG;
-      gfx.setTextColor(color, UI_PANE);
-      gfx.setCursor(x + 3, y);
+      bool isSelf = equalsIgnoreCase(tab.users[i].nick, _selfNick);
+      uint16_t bg = isSelf ? UI_HILITE_BG : UI_CARD;
+      uint16_t fg = isSelf ? UI_ACCENT : UI_FG;
+      if (isSelf) gfx.fillRoundRect(x + 3, y - 1, NICK_PANE_W - 6, CHAR_H + 2, 3, bg);
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(x + 6, y);
       gfx.print(row);
+      // prefix dot
+      if (tab.users[i].prefix == '@' || tab.users[i].prefix == '~') gfx.fillCircle(x + 4, y + 4, 1, UI_WARN);
       y += CHAR_H + 1;
     }
   }
@@ -5215,17 +5321,63 @@ class IrcClientApp {
 
   void drawInput() {
     auto& gfx = drawTarget();
-    int y = SCREEN_H - INPUT_H;
-    gfx.fillRect(0, y, SCREEN_W, INPUT_H, UI_INPUT);
-    gfx.drawFastHLine(0, y, SCREEN_W, UI_DIM);
-    gfx.setTextColor(UI_FG, UI_INPUT);
-
-    int charsPerRow = (SCREEN_W - 4) / CHAR_W;
-    std::vector<String> rows = buildInputRows(charsPerRow, 2);
-    gfx.setCursor(2, y + 4);
-    gfx.print(rows[0]);
-    gfx.setCursor(2, y + 13);
-    gfx.print(rows[1]);
+    int y = INPUT_Y;
+    // Modern floating input — ratspeak style
+    gfx.fillRect(0, y, SCREEN_W, INPUT_H, UI_BG);
+    gfx.drawFastHLine(0, y, SCREEN_W, UI_BORDER);
+    // Rounded field
+    const int fx = 4;
+    const int fy = y + 2;
+    const int fw = SCREEN_W - 8;
+    const int fh = INPUT_H - 4;
+    gfx.fillRoundRect(fx, fy, fw, fh, 6, UI_CARD);
+    gfx.drawRoundRect(fx, fy, fw, fh, 6, UI_BORDER);
+    // Cursor blink (only when not sleeping)
+    bool showCursor = !_screenSleeping && (millis() % 1000 < 500);
+    String display = _input;
+    if (display.isEmpty()) {
+      // Placeholder hint — dim
+      String hint;
+      if (_tabs[_activeTab].type == TabType::Channel) hint = "Message " + _tabs[_activeTab].name + "...";
+      else if (_tabs[_activeTab].type == TabType::Query) hint = "Message " + _tabs[_activeTab].name + "...";
+      else hint = "Type / for commands...";
+      hint = ellipsize(hint, (fw - 12) / CHAR_W);
+      gfx.setTextColor(UI_DIM, UI_CARD);
+      gfx.setCursor(fx + 8, fy + 4);
+      gfx.print(hint);
+      // subtle dim prompt char
+      gfx.setCursor(fx + 6, fy + 13);
+      gfx.print("> ");
+      gfx.setTextColor(UI_DIM, UI_CARD);
+      gfx.print("|");
+    } else {
+      int charsPerRow = (fw - 12) / CHAR_W;
+      std::vector<String> rows = buildInputRows(charsPerRow, 2);
+      // Add blinking cursor to last row
+      if (showCursor) {
+        if (rows.size() >= 2 && !rows[1].isEmpty()) rows[1] += "_";
+        else if (!rows[0].isEmpty()) rows[0] += "_";
+        else rows[1] += "_";
+      }
+      gfx.setTextColor(UI_FG, UI_CARD);
+      gfx.setCursor(fx + 6, fy + 4);
+      gfx.print(ellipsize(rows[0], charsPerRow));
+      gfx.setCursor(fx + 6, fy + 13);
+      gfx.print(ellipsize(rows[1], charsPerRow));
+    }
+    // Hint for section nav at right edge of field (tiny)
+    gfx.setTextColor(UI_DIM, UI_CARD);
+    // Draw subtle ,/ hint if space
+    if (fw > 80) {
+      String navHint = ",/ sec";
+      int hx = fx + fw - (int)navHint.length() * CHAR_W - 4;
+      // Only if input short enough not to overlap
+      if (_input.length() < (size_t)((fw - 30) / CHAR_W)) {
+        gfx.setCursor(hx, fy + 13);
+        gfx.setTextColor(UI_DIM, UI_CARD);
+        gfx.print(navHint);
+      }
+    }
   }
 
   void drawStyledText(int x, int y, const String& raw, int maxWidth, uint16_t baseBg, int skipCols = 0) {
