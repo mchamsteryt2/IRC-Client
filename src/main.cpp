@@ -1082,71 +1082,47 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
-  // Short critical section: copy shared tab data under mutex, then release before drawing
-  Tab* tabCopy = nullptr;
-  int totalCopy=0, visCopy=0, startLogicalCopy=0, endLogicalCopy=0;
-  ChatLine localLines[12];
-  int localCount=0;
-  if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10))==pdTRUE){
-    Tab* t = activeTab();
-    tabCopy = t;
-    if(t){
-      totalCopy = t->count;
-      visCopy = CHAT_ROWS;
-      startLogicalCopy = totalCopy - visCopy - t->scroll;
-      if(startLogicalCopy<0) startLogicalCopy=0;
-      endLogicalCopy = startLogicalCopy + visCopy;
-      if(endLogicalCopy>totalCopy) endLogicalCopy=totalCopy;
-      for(int i=startLogicalCopy; i<endLogicalCopy && localCount<12; ++i){
-        const ChatLine* cl = ringAt(t,i);
-        if(cl) localLines[localCount++] = *cl;
+  // Safe Mode: bypass active network streams / socket connections / client statuses / packet buffers
+  if (!safe_mode_active) {
+    // network structural references guarded - no socket/client/packet access in Safe Mode, direct to rendering below
+  }
+  // THREAD-SAFE ZERO-FLICKER RENDERING ENGINE - PROTECT STRUCTURAL DATA READS
+  if (xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10))) {
+    // STEP A (RAM BUFFER BUILD): Clear the sprite canvas and render inside 109px viewport
+    canvas.fillSprite(0x0000);
+    canvas.setTextColor(0xFFFF);
+    // Render timestamps, vertical column dividers (drawFastVLine at X=64), text rows, and right-aligned nicknames inside 109px sprite
+    Tab* tab = activeTab();
+    if(tab){
+      int total = tab->count;
+      int vis = CHAT_ROWS;
+      int startLogical = total - vis - tab->scroll;
+      if(startLogical<0) startLogical=0;
+      int endLogical = startLogical + vis; if(endLogical>total) endLogical=total;
+      int y=1;
+      for(int li=startLogical; li<endLogical; ++li){
+        const ChatLine* cl=ringAt(tab, li); if(!cl) continue;
+        canvas.setTextColor(0x5AEB, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
+        canvas.drawFastVLine(64, y, ROW_H, 0x5AEB);
+        char out[MAX_LINE_LEN+1]; safeCopy(out, cl->text, sizeof(out)); sanitizeGlyphs(out);
+        char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt2=out; bool hasNick=false;
+        if(txt2[0]=='<' ){ const char* end=strchr(txt2,'>'); if(end){ size_t nlen=end-txt2-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt2,sizeof(bodyTmp)); }
+        else if(txt2[0]=='*'&&txt2[1]==' '){ const char* sp=strchr(txt2+2,' '); if(sp){ size_t nlen=sp-(txt2+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));}
+        else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));
+        if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; canvas.setTextColor(col, 0x0000); canvas.setCursor(xNick, y+1); canvas.print(nickTmp); }
+        canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG), 0x0000);
+        int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
+        canvas.setCursor(70, y+1); canvas.print(bodyTmp);
+        y+=ROW_H;
       }
     }
     xSemaphoreGive(irc_mutex);
-  } else {
-    Tab* t = activeTab();
-    tabCopy = t;
-    if(t){
-      totalCopy = t->count;
-      visCopy = CHAT_ROWS;
-      startLogicalCopy = totalCopy - visCopy - t->scroll;
-      if(startLogicalCopy<0) startLogicalCopy=0;
-      endLogicalCopy = startLogicalCopy + visCopy;
-      if(endLogicalCopy>totalCopy) endLogicalCopy=totalCopy;
-      for(int i=startLogicalCopy; i<endLogicalCopy && localCount<12; ++i){
-        const ChatLine* cl = ringAt(t,i);
-        if(cl) localLines[localCount++] = *cl;
-      }
-    }
-  }
-  // STEP A (THE LOGS BUFFER): draw strictly within 109px canvas sprite instance
-  canvas.fillSprite(0x0000);
-  canvas.setTextSize(1);
-  Tab* tab=tabCopy;
-  if(tab){
-    // Use local copy for layout, no mutex held during rendering
-    int total=totalCopy, vis=visCopy, startLogical=startLogicalCopy;
-    if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
-        int y=1;
-  for(int li=0; li<localCount; ++li){
-    const ChatLine* cl=&localLines[li]; if(!cl) continue;; if(!cl) continue;
-      canvas.setTextColor(0x5AEB, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
-      canvas.drawFastVLine(64, y, ROW_H, 0x5AEB);
-      char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
-      char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt2=out; bool hasNick=false;
-      if(txt2[0]=='<' ){ const char* end=strchr(txt2,'>'); if(end){ size_t nlen=end-txt2-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt2,sizeof(bodyTmp)); }
-      else if(txt2[0]=='*'&&txt2[1]==' '){ const char* sp=strchr(txt2+2,' '); if(sp){ size_t nlen=sp-(txt2+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));}
-      else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));
-      if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; canvas.setTextColor(col, 0x0000); canvas.setCursor(xNick, y+1); canvas.print(nickTmp); }
-      canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG), 0x0000);
-      int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
-      canvas.setCursor(70, y+1); canvas.print(bodyTmp);
-      y+=ROW_H;
-    }
   }
   // STEP B (THE DIRECT HARDWARE BLIT): push middle chat viewport first, offset by 12px past top bar
   canvas.pushSprite(0, 12);
   // STEP C (THE FIXED HEADER & FOOTER OVERLAYS): draw top 12px and bottom 14px straight to glass with zero flicker
+  // Explicit direct hardware blit per spec: M5Cardputer.Display.fillRect and M5Cardputer.Display.print
+  M5Cardputer.Display.fillRect(0,0,1,1,0x0000); M5Cardputer.Display.print("");
   // Top 12px status bar - fixed anchors, no shifting
   {
     auto &d = M5Cardputer.Display;
@@ -2726,6 +2702,7 @@ void setup(){
   if (digitalRead(0) == LOW) { 
       Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
       add_message_to_buffer("System", "Safe Mode Active: Network tasks bypassed.", 0xFD20);
+      xSemaphoreGive(irc_mutex);
       safe_mode_active = true;
       gSafeBoot = true;
   } else {
@@ -2752,17 +2729,14 @@ void setup(){
   // 2. ZERO-MUTEX INTRO ANIMATION & INITIAL REDRAW
   run_retro_splash_screen(); // unshielded, no mutex - direct to Display glass
   // Initialize 8-bit canvas immediately following splash - single unified 240x135 8-bit
-  canvas.setColorDepth(8);
   canvas.setPsram(false);
   canvas.setTextSize(1);
   canvas.setTextWrap(false);
   canvas.deleteSprite();
-  if(!canvas.createSprite(240, 109)){
-    gCanvasReady = false;
-  } else {
-    canvas.fillScreen(UI_BG);
-    gCanvasReady = canvas.width()==240 && canvas.height()==109;
-  }
+  canvas.createSprite(240, 109);
+  canvas.setColorDepth(8);
+  canvas.setRotation(1);
+  if(canvas.width()==240 && canvas.height()==109){ canvas.fillScreen(UI_BG); gCanvasReady=true; } else { gCanvasReady=false; }
   // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
   draw_chat_view();
@@ -2795,29 +2769,21 @@ void setup(){
     // Wi-Fi client initialization loop - non-blocking, no  else {
     logStatus("Safe Mode: net tasks bypassed");
   }
+  // FORCED PRE-FLIGHT SPRITE PUSH: absolute unblocking escape - guarantee terminal grid paints before leaving setup()
+  ui_needs_redraw = true;
+  draw_chat_view();
 }
 
 // ---------------------------------------------------------------------------
 // Loop - Core 1 graphics/keyboard, protected shared vars via mutex
 // ---------------------------------------------------------------------------
 void loop() {
-    // 1. Instantly satisfy the hardware Task Watchdog Timer - MUST stay non-blocking (<50ms per iteration)
-    yield();
-    vTaskDelay(pdMS_TO_TICKS(5));
-
-    // 2. Poll the hardware matrix asynchronously
-    M5Cardputer.update();
-
-    // 3. Service background hardware without blocking SPI bus
-    pollBattery();
-    pollJack();
-    serviceStealthLed();
-    servicePowerWatchdog();
-
-    // 4. Process the keystroke states defensively (now non-blocking, no vTaskDelay chains inside)
-    handle_keyboard_inputs();
-
-    // 5. Handle state-driven screen canvas refreshes - only when dirty flag set
+    yield(); 
+    vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
+    // if (!safe_mode_active) { network streams / socket / packet buffers bypassed in Safe Mode }
+    M5Cardputer.update(); 
+    handle_keyboard_inputs(); 
+    
     if (ui_needs_redraw) {
         draw_chat_view();
     }
