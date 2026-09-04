@@ -219,6 +219,7 @@ struct Config {
   TextOverflowMode textOverflowMode = TextOverflowMode::Marquee;
   bool serialLogEnabled = true;
   bool channelLogEnabled = false;
+  bool awayLogEnabled = false; // disable others' away for RAM
   uint16_t screenTimeoutSec = DEFAULT_SCREEN_TIMEOUT_SEC;
   uint8_t screenBrightness = DEFAULT_SCREEN_BRIGHTNESS;
 
@@ -2577,6 +2578,7 @@ class SimpleTransport {
     f.println("reconnect_initial_ms=" + String(cfg.reconnectInitialMs));
     f.println("reconnect_max_ms=" + String(cfg.reconnectMaxMs));
     f.println("channel_log_enabled=" + String(cfg.channelLogEnabled ? "true" : "false"));
+    f.println("away_log_enabled=" + String(cfg.awayLogEnabled ? "true" : "false"));
     f.println("log_root=" + cfg.logRoot);
     f.println("color_mode=" + colorModeToString(cfg.colorMode));
     f.println("show_control_glyphs=" + String(cfg.showControlGlyphs ? "true" : "false"));
@@ -2806,6 +2808,7 @@ class SimpleTransport {
       else if (key == "reconnect_initial_ms") _cfg.reconnectInitialMs = static_cast<uint32_t>(value.toInt());
       else if (key == "reconnect_max_ms") _cfg.reconnectMaxMs = static_cast<uint32_t>(value.toInt());
       else if (key == "channel_log_enabled" || key == "chat_log_enabled") _cfg.channelLogEnabled = strToBool(value);
+      else if (key == "away_log_enabled") _cfg.awayLogEnabled = strToBool(value);
       else if (key == "log_root") _cfg.logRoot = value;
       else if (key == "color_mode") _cfg.colorMode = parseColorMode(value);
       else if (key == "show_control_glyphs") _cfg.showControlGlyphs = strToBool(value);
@@ -3402,6 +3405,23 @@ class SimpleTransport {
     if (msg.command == "005") {
       handleISupport(msg);
       return;
+    }
+
+    // RAM saver: drop other users' away messages when disabled (default)
+    if (!_cfg.awayLogEnabled) {
+      if (msg.command == "AWAY") {
+        String nick = nickFromPrefix(msg.prefix);
+        if (!nick.isEmpty() && !equalsIgnoreCase(nick, _selfNick)) return;
+      }
+      if (msg.command == "301" && msg.params.size() >= 2) {
+        // 301 <me> <away-nick> :<msg> — away-nick is the other user
+        String awayNick = msg.params[1];
+        if (!equalsIgnoreCase(awayNick, _selfNick)) return;
+      }
+      // Also suppress RPL_NOWAWAY/UNAWAY for others (should be self-only anyway)
+      if ((msg.command == "305" || msg.command == "306") && msg.params.size() >= 1) {
+        // 305/306 <me> :<text> — always for self, keep
+      }
     }
 
     noteBncObservedChannelFromMessage(msg);
