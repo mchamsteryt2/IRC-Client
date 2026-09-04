@@ -927,6 +927,37 @@ static void initCanvas(){
   }
   gCanvasReady = canvas.width()==240 && canvas.height()==135;
 }
+// ZERO-MUTEX INTRO ANIMATION - unshielded direct drawing to physical display glass
+void run_retro_splash_screen(){
+  // No irc_mutex usage here - direct to Display before background tasks exist
+  M5Cardputer.Display.fillScreen(UI_BG);
+  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
+  M5Cardputer.Display.setCursor(8,10);
+  M5Cardputer.Display.print("Cardputer IRC 0.4");
+  M5Cardputer.Display.setCursor(8,22);
+  M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
+  M5Cardputer.Display.print("Adv ST7789 240x135 NO PSRAM");
+  M5Cardputer.Display.setCursor(8,34);
+  M5Cardputer.Display.print("8-bit canvas 20-ring");
+  M5Cardputer.Display.setCursor(8,46);
+  M5Cardputer.Display.print("Hold G0 for safe WiFi setup");
+  // Brief G0 check window without mutex
+  uint32_t splashStart = millis();
+  while(millis() - splashStart < 800){
+    if(digitalRead(G0_PIN)==LOW){
+      M5Cardputer.Display.setCursor(8,70);
+      M5Cardputer.Display.setTextColor(UI_WARN, UI_BG);
+      M5Cardputer.Display.print("[G0 SAFE BOOT]");
+      gSafeBoot = true;
+      break;
+    }
+    delay(10);
+    M5Cardputer.update();
+  }
+  delay(200);
+}
+
 
 static void drawTopBar(){
   auto &d = canvas;
@@ -2558,120 +2589,83 @@ static void serviceWifi(){
 // Setup - includes safe-boot check, 16MHz SPI, splash, purge, canvas, tasks
 // ---------------------------------------------------------------------------
 void setup(){
-  // Safe boot escape hatch: poll G0 (BtnA) at very top of setup before anything else
+  // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top
+  M5Cardputer.begin();
+  M5Cardputer.Display.begin();
+  M5Cardputer.Display.setRotation(1);
+  // Create global mutex IMMEDIATELY after hardware init - do not touch irc_mutex before this
+  irc_mutex = xSemaphoreCreateMutex();
+  gTabsMutex = irc_mutex;
+  gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
+
+  // Hardware pin setup after mutex creation (does not touch irc_mutex)
   pinMode(G0_PIN, INPUT_PULLUP);
-  // Battery accuracy correction: explicit GPIO10 11dB attenuation per spec
   analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
   pinMode(BATTERY_PIN, INPUT);
   pinMode(JACK_DETECT_PIN, INPUT_PULLUP);
   pinMode(AMP_SHUTDOWN_PIN, OUTPUT);
-  digitalWrite(AMP_SHUTDOWN_PIN, HIGH); // amplifier enabled by default
+  digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
   pinMode(LED_PIN, OUTPUT);
   neopixelWrite(LED_PIN,0,0,0);
-
-  auto cfg = M5.config();
-  M5Cardputer.begin(cfg, true);
-  M5Cardputer.Display.setRotation(1);
-  canvas.setTextSize(1);
-  canvas.fillScreen(UI_BG);
-
-  // Splash with G0 check window
-  uint32_t splashStart = millis();
-  while(millis() - splashStart < 800){
-    canvas.fillScreen(UI_BG);
-    canvas.setTextColor(UI_FG, UI_BG);
-    canvas.setCursor(8,10);
-    canvas.print("Cardputer IRC 0.4");
-    canvas.setCursor(8,22);
-    canvas.setTextColor(UI_DIM, UI_BG);
-    canvas.print("Adv ST7789 240x135 NO PSRAM");
-    canvas.setCursor(8,34);
-    canvas.print("8-bit 109px canvas 20-ring");
-    canvas.setCursor(8,46);
-    canvas.print("Hold G0 for safe WiFi setup");
-    canvas.setCursor(8,70);
-    canvas.setTextColor(UI_WARN, UI_BG);
-    if(digitalRead(G0_PIN)==LOW) canvas.print("[G0 SAFE BOOT]");
-    delay(50);
-    M5Cardputer.update();
-    if(digitalRead(G0_PIN)==LOW) gSafeBoot = true;
-    if(millis() - splashStart > 400 && gSafeBoot) break;
-  }
-  if(gSafeBoot){
-    canvas.fillScreen(UI_BG);
-    canvas.setCursor(8,20);
-    canvas.print("SAFE BOOT - bypass SD");
-    delay(400);
-  }
-
   gLastInputMs=millis();
   gSavedBrightness=gCfg.brightness;
-  applyBrightness(gSavedBrightness);
 
-  // SPI bus compression: derated 16MHz max to protect screen/I2S from noise/flicker per spec
+  // 2. ZERO-MUTEX INTRO ANIMATION & INITIAL REDRAW
+  run_retro_splash_screen(); // unshielded, no mutex
+  // Initialize 8-bit canvas immediately following splash
+  canvas.createSprite(240, 135); canvas.setColorDepth(8);
+  canvas.setPsram(false);
+  canvas.setTextSize(1);
+  canvas.setTextWrap(false);
+  canvas.fillScreen(UI_BG);
+  gCanvasReady = canvas.width()==240 && canvas.height()==135;
+  // Also init legacy alias for compatibility
+  gChatCanvas.setColorDepth(8); gChatCanvas.setPsram(false);
+  if(!gChatCanvas.createSprite(SCREEN_W, CHAT_H)){ gChatCanvas.deleteSprite(); gChatCanvas.setColorDepth(8); gChatCanvas.createSprite(SCREEN_W, CHAT_H); }
+  // Force initial draw before background tasks
+  ui_needs_redraw = true;
+  draw_chat_view();
+
+  // Intermediate init - SPI, SD, config, etc. (all after mutex, before network)
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if(!gSafeBoot){
     gSdReady = SD.begin(SD_CS, SPI, 16000000);
   } else {
     gSdReady = false;
   }
-
-  // MUTEX GAUNTLET: Single SPI bus shared by SD and ST7789 - create global irc_mutex
-  irc_mutex = xSemaphoreCreateMutex();
-  gTabsMutex = irc_mutex; // alias - tab data and SPI share same gauntlet to prevent collision panic loops
-  gTxQueue.init(); gRxQueue.init();
-  gLogQueue.init();
-  // Core 0 dedicated SD logging task - will halt and wait for Core 1 canvas flushes via irc_mutex
-  if(!gSafeBoot){
-    xTaskCreatePinnedToCore(logTask, "irc_log", 4096, nullptr, 1, &gLogTaskHandle, 0);
-  }
-
   loadConfig();
   ensureStatus();
   setCpuFrequencyMhz(240);
-  initCanvas();
-
   if(!gSafeBoot && gSdReady) sweepOldLogs();
-
   gLastBattPoll = millis();
   gBattVoltage = readBatteryVoltage();
-
-  // Audio init and jack state (NS4150B amp initially enabled)
   M5Cardputer.Speaker.setVolume(128);
   digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
   pollJack();
+  applyBrightness(gSavedBrightness);
 
-  // Thread isolation: network on Core 0, keyboard/graphics remain on Core 1 (loop)
-  // Safe Mode override: completely bypass auto-connect background threads when G0 held
+  // 3. DE-COUPLE NETWORK SELECTION & BOOT BLOCKS - move to absolute END
+  // Wi-Fi client initialization loop and background network worker thread creation
+  // Ensure UI engine is fully running before Core 0 starts network operations
   if(!gSafeBoot){
+    // Background SD logging task (Core 0)
+    xTaskCreatePinnedToCore(logTask, "irc_log", 4096, nullptr, 1, &gLogTaskHandle, 0);
+    // Background network worker (Core 0)
     xTaskCreatePinnedToCore(netTask, "irc_net", 8192, nullptr, 2, &gNetTaskHandle, 0);
   } else {
-    logStatus("Safe Mode: net task bypassed");
+    logStatus("Safe Mode: net tasks bypassed");
   }
-
   if(gSafeBoot){
-    // Drop straight into Wi-Fi Scanner Provisioning Interface per spec
     logStatus("Safe Mode -> provisioning");
-    runWifiProvisioning();
+    // provisioning will be handled in loop
   } else if(isWifiDummy(gCfg)){
     logStatus("Provisioning mode");
-    // provisioning will be entered in loop's serviceWifi
   } else {
-    serviceWifi();
-  }
-
-  // Short final splash
-  if(!gSafeBoot && !isWifiDummy(gCfg)){
-    canvas.fillScreen(UI_BG);
-    canvas.setTextColor(UI_FG, UI_BG);
-    canvas.setCursor(8,18);
-    canvas.print("IRC Ready");
-    canvas.setCursor(8,30);
-    canvas.setTextColor(UI_DIM, UI_BG);
-    canvas.printf("SSD %s", gSdReady?"OK":"NO SD");
-    canvas.setCursor(8,42);
-    canvas.printf("Batt %.2fV", gBattVoltage);
-    delay(700);
+    // Wi-Fi client initialization loop - non-blocking start at end
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(gCfg.wifiSSID, gCfg.wifiPass);
+    gWifiConnecting=true; gWifiStartMs=millis();
   }
 }
 
