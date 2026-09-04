@@ -21,23 +21,23 @@ static constexpr int SD_MISO = 39;
 static constexpr int SD_MOSI = 14;
 static constexpr int SD_CS = 12;
 
-static constexpr uint16_t UI_BG = 0x0000;
+static constexpr uint16_t UI_BG = 0x000C; // Ratspeak terminal navy
 static constexpr uint16_t UI_FG = 0xFFFF;
-static constexpr uint16_t UI_DIM = 0x8410;
-static constexpr uint16_t UI_HEADER = 0x18C3;
-static constexpr uint16_t UI_INPUT = 0x1082;
-static constexpr uint16_t UI_ACCENT = 0x07E0;
-static constexpr uint16_t UI_WARN = 0xFD20;
-static constexpr uint16_t UI_PANE = 0x0841;
-static constexpr uint16_t UI_HILITE_BG = 0x2104;
-static constexpr uint16_t UI_CARD = 0x10A2;
-static constexpr uint16_t UI_BORDER = 0x2945;
+static constexpr uint16_t UI_DIM = 0xAD55;
+static constexpr uint16_t UI_HEADER = 0x000C;
+static constexpr uint16_t UI_INPUT = 0x000C;
+static constexpr uint16_t UI_ACCENT = 0xFFE0; // yellow for selection
+static constexpr uint16_t UI_WARN = 0xF800; // red for mention
+static constexpr uint16_t UI_PANE = 0x000C;
+static constexpr uint16_t UI_HILITE_BG = 0xFFFF; // inverted
+static constexpr uint16_t UI_CARD = 0x000C;
+static constexpr uint16_t UI_BORDER = 0xAD55;
 
 static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
 static constexpr int HEADER_H = 12;
 static constexpr int INPUT_H = 24;
-static constexpr int NAV_H = 9;
+static constexpr int NAV_H = 12;
 static constexpr int NAV_Y = SCREEN_H - INPUT_H - NAV_H;
 static constexpr int BODY_Y = HEADER_H + 1;
 static constexpr int BODY_H = NAV_Y - BODY_Y - 1;
@@ -820,6 +820,46 @@ class SimpleTransport {
   }
   void cycleSection(int delta) { switchToSection(currentSection()+delta); }
 
+  void importSojuNetworkAsServer(const SojuNetwork& net) {
+    if (!_cfg.bncEnabled || _cfg.bncMode != BouncerMode::Soju) return;
+    if (_servers.size() >= MAX_SERVERS) return;
+    if (net.netId.isEmpty()) return;
+    for (auto &s : _servers) if (s.id == net.netId) return;
+    // Also avoid duplicate by host if Soju network host already direct
+    ServerProfile p;
+    p.id = net.netId;
+    // Bouncer endpoint is the actual transport host
+    p.host = _cfg.endpointHost;
+    p.port = _cfg.endpointPort;
+    p.useTLS = _cfg.useTLS;
+    p.tlsInsecure = _cfg.tlsInsecure;
+    p.nick = net.nickname.isEmpty() ? _cfg.nick : net.nickname;
+    p.user = net.username.isEmpty() ? _cfg.username : net.username;
+    p.realname = net.realname.isEmpty() ? _cfg.realname : net.realname;
+    p.pass = net.pass.isEmpty() ? _cfg.bncPass : net.pass;
+    p.bncEnabled = true;
+    p.bncMode = BouncerMode::Soju;
+    p.bncUser = _cfg.bncUser;
+    p.bncNetwork = net.netId;
+    p.bncClient = _cfg.bncClient;
+    p.sojuBindNetId = net.netId;
+    p.bncPass = _cfg.bncPass;
+    p.saslEnabled = _cfg.saslEnabled;
+    p.saslUser = _cfg.saslUser;
+    p.saslPass = _cfg.saslPass;
+    p.saslMechanism = _cfg.saslMechanism;
+    p.paused = false;
+    p.lastActiveMs = millis();
+    _servers.push_back(p);
+    saveServers();
+    logStatus("Auto-imported bouncer network as server: " + p.id + " (" + net.host + ")");
+    markNavDirty();
+  }
+  void importAllSojuNetworks() {
+    for (auto &n : _sojuNetworks) importSojuNetworkAsServer(n);
+    for (auto &n : _sojuBatchNetworks) importSojuNetworkAsServer(n);
+  }
+
   // Multi-server helpers
   String currentServerId() const {
     if (_servers.empty()) return _cfg.serverPreset;
@@ -1238,6 +1278,7 @@ class SimpleTransport {
 
   std::vector<String> collectKnownBncChannels() const {
     std::vector<String> channels;
+    String curSid = currentServerId();
     auto addUnique = [&](const String& rawChannel) {
       String channel = trimCopy(rawChannel);
       if (channel.isEmpty() || !isChannelName(channel)) return;
@@ -1249,7 +1290,7 @@ class SimpleTransport {
 
     for (const String& channel : _cfg.autoJoin) addUnique(channel);
     for (const Tab& tab : _tabs) {
-      if (tab.type == TabType::Channel) addUnique(tab.name);
+      if (tab.type == TabType::Channel && (tab.serverId == curSid || (tab.serverId.isEmpty() && curSid.isEmpty()))) addUnique(tab.name);
     }
     return channels;
   }
@@ -1686,93 +1727,41 @@ class SimpleTransport {
   void showBootTitle() {
     auto& gfx = drawTarget();
     uint32_t start = millis();
-    // Procedural splash - no embedded JPG, saves flash and draws crisp at any rotation.
+    // Terminal splash — flat, no rounded rects, matches Ratspeak blue
     while (millis() - start < TITLE_SCREEN_MS) {
       float progress = static_cast<float>(millis() - start) / static_cast<float>(TITLE_SCREEN_MS);
       if (progress > 1.0f) progress = 1.0f;
 
       gfx.fillScreen(UI_BG);
-      // Top accent bar
-      gfx.fillRect(0, 0, SCREEN_W, 3, UI_ACCENT);
-      // Outer hairline border
       gfx.drawRect(0, 0, SCREEN_W, SCREEN_H, UI_DIM);
-
-      // Center card background
-      gfx.fillRoundRect(10, 10, SCREEN_W - 20, SCREEN_H - 20, 6, UI_HEADER);
-      gfx.drawRoundRect(10, 10, SCREEN_W - 20, SCREEN_H - 20, 6, UI_DIM);
-      gfx.fillRect(11, 10, SCREEN_W - 22, 3, UI_ACCENT);
-
-      // Chat bubble icon (two overlapping bubbles for IRC vibe)
-      const int bubbleX = 22;
-      const int bubbleY = 22;
-      // Shadow
-      gfx.fillRoundRect(bubbleX + 1, bubbleY + 1, 40, 26, 4, UI_BG);
-      // Back bubble
-      gfx.fillRoundRect(bubbleX + 10, bubbleY + 6, 36, 22, 4, UI_DIM);
-      gfx.fillTriangle(bubbleX + 16, bubbleY + 26, bubbleX + 22, bubbleY + 26, bubbleX + 16, bubbleY + 32, UI_DIM);
-      // Front bubble
-      gfx.fillRoundRect(bubbleX, bubbleY, 36, 22, 4, UI_BG);
-      gfx.drawRoundRect(bubbleX, bubbleY, 36, 22, 4, UI_ACCENT);
-      gfx.fillTriangle(bubbleX + 8, bubbleY + 20, bubbleX + 14, bubbleY + 20, bubbleX + 8, bubbleY + 26, UI_BG);
-      gfx.drawLine(bubbleX + 8, bubbleY + 20, bubbleX + 8, bubbleY + 26, UI_ACCENT);
-      // Hash inside bubble
+      // Terminal title — flat, like Ratspeak header
       gfx.setTextSize(1);
-      gfx.setTextColor(UI_ACCENT, UI_BG);
-      gfx.setCursor(bubbleX + 12, bubbleY + 7);
-      gfx.print("#");
+      gfx.setTextColor(UI_FG, UI_BG);
+      gfx.setCursor(8, 10);
+      gfx.print(String(APP_NAME) + " v" + APP_VERSION);
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(8, 20);
+      gfx.print("M5STACK CARDPUTER  -  IRC CLIENT");
+      gfx.setCursor(8, 30);
+      gfx.print("terminal  reliable  multi-server");
+      gfx.setCursor(8, 42);
+      gfx.print("TLS  Soju  Socks5  IRCv3");
 
-      // Title - Cardputer (small) + IRC (large accent)
-      gfx.setTextSize(1);
-      gfx.setTextColor(UI_DIM, UI_HEADER);
-      gfx.setCursor(72, 22);
-      gfx.print("M5STACK  CARDPUTER");
+      gfx.drawFastHLine(8, 52, SCREEN_W - 16, UI_DIM);
 
-      gfx.setTextSize(2);
-      gfx.setTextColor(UI_FG, UI_HEADER);
-      gfx.setCursor(72, 34);
-      gfx.print("Cardputer");
-
-      gfx.setTextColor(UI_ACCENT, UI_HEADER);
-      // Bold trick: draw twice with 1px offset
-      gfx.setCursor(72 + 9 * 12, 34);
-      gfx.print("IRC");
-      gfx.setCursor(72 + 9 * 12 + 1, 34);
-      gfx.print("IRC");
-
-      gfx.setTextSize(1);
-      gfx.setTextColor(UI_DIM, UI_HEADER);
-      gfx.setCursor(72, 54);
-      gfx.print(String("v") + APP_VERSION + "  compact  secure  portable");
-
-      // Divider
-      gfx.drawFastHLine(22, 70, SCREEN_W - 44, UI_DIM);
-      // Feature chips
-      gfx.setTextColor(UI_FG, UI_HEADER);
-      gfx.setCursor(22, 78);
-      gfx.print("TLS");
-      gfx.fillCircle(44, 81, 1, UI_DIM);
-      gfx.setCursor(50, 78);
-      gfx.print("Soju");
-      gfx.fillCircle(78, 81, 1, UI_DIM);
-      gfx.setCursor(84, 78);
-      gfx.print("Socks5");
-      gfx.fillCircle(122, 81, 1, UI_DIM);
-      gfx.setCursor(128, 78);
-      gfx.print("IRCv3");
-
-      // Progress bar
-      const int barX = 22;
-      const int barY = 96;
-      const int barW = SCREEN_W - 44;
-      const int barH = 6;
-      gfx.drawRoundRect(barX, barY, barW, barH, 3, UI_DIM);
-      int fillW = static_cast<int>((barW - 4) * progress);
+      // Progress bar — flat terminal
+      const int barX = 8;
+      const int barY = 62;
+      const int barW = SCREEN_W - 16;
+      const int barH = 8;
+      gfx.drawRect(barX, barY, barW, barH, UI_DIM);
+      int fillW = static_cast<int>((barW - 2) * progress);
       if (fillW > 0) {
-        gfx.fillRoundRect(barX + 2, barY + 2, fillW, barH - 4, 2, UI_ACCENT);
+        gfx.fillRect(barX + 1, barY + 1, fillW, barH - 2, UI_FG);
       }
-      // Progress label
-      gfx.setTextColor(UI_DIM, UI_HEADER);
-      gfx.setCursor(22, 106);
+      // Progress label — simple
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(8, 76);
       if (progress < 0.33f) gfx.print("initializing display...");
       else if (progress < 0.66f) gfx.print("checking SD  /irc/config.txt...");
       else if (progress < 0.92f) gfx.print("starting IRC session...");
@@ -1782,7 +1771,7 @@ class SimpleTransport {
       int dots = (millis() / 250) % 4;
       String dotStr;
       for (int i = 0; i < dots; ++i) dotStr += ".";
-      gfx.setCursor(SCREEN_W - 44, 106);
+      gfx.setCursor(SCREEN_W - 32, 76);
       gfx.print(dotStr + "   ");
 
       presentFrame();
@@ -3556,6 +3545,8 @@ class SimpleTransport {
       } else {
         appendLine(statusTab(), "*** soju networks synced: " + String(_sojuNetworks.size()));
       }
+      // Auto-import bouncer networks as servers (multi-server)
+      importAllSojuNetworks();
     }
   }
 
@@ -3575,7 +3566,11 @@ class SimpleTransport {
     String attrs = msg.params.size() >= 3 ? msg.params[2] : "";
     SojuNetwork& network = ensureSojuNetwork(list, netId);
     applySojuNetworkAttributes(network, attrs);
-    if (!inBatch) appendLine(statusTab(), "*** soju network: " + summarizeSojuNetwork(network));
+    if (!inBatch) {
+      appendLine(statusTab(), "*** soju network: " + summarizeSojuNetwork(network));
+      // Auto-import single network outside batch
+      importSojuNetworkAsServer(network);
+    }
     if (!inBatch && _cfg.bncEnabled && _cfg.bncMode == BouncerMode::Soju &&
         equalsIgnoreCase(network.state, "connected")) {
       beginBncChannelAttachMetric("soju-network-connected");
@@ -3629,11 +3624,12 @@ class SimpleTransport {
 
   void autoJoinRestoredChannels() {
     std::vector<String> joined;
+    String curSid = currentServerId();
     for (const String& c : _cfg.autoJoin) {
       if (!c.isEmpty()) joined.push_back(c);
     }
-    for (size_t i = 1; i < _tabs.size(); ++i) {
-      if (_tabs[i].type == TabType::Channel) {
+    for (size_t i = 0; i < _tabs.size(); ++i) {
+      if (_tabs[i].type == TabType::Channel && (_tabs[i].serverId == curSid || (_tabs[i].serverId.isEmpty() && curSid.isEmpty()))) {
         bool exists = false;
         for (const String& c : joined) {
           if (equalsIgnoreCase(c, _tabs[i].name)) {
@@ -3644,7 +3640,9 @@ class SimpleTransport {
         if (!exists) joined.push_back(_tabs[i].name);
       }
     }
-    beginChannelJoinMetric(joined, "autojoin");
+    // Only join if we have something and not already joining via bouncer attach
+    if (joined.empty()) return;
+    beginChannelJoinMetric(joined, "autojoin:" + curSid);
     for (const String& c : joined) {
       sendRaw("JOIN " + c);
     }
@@ -4407,6 +4405,34 @@ class SimpleTransport {
     return false;
   }
 
+  bool tryAutocompleteInput() {
+    if (_input.isEmpty() || _tabs.empty() || _activeTab <0 || _activeTab >= (int)_tabs.size()) return false;
+    // Don't autocomplete commands — keep TAB for tab cycling in that case
+    if (_input.startsWith("/")) {
+      // For /msg etc., autocomplete last word still useful, but keep simple: only if contains space
+      if (_input.indexOf(' ') < 0) return false;
+    }
+    int lastSpace = _input.lastIndexOf(' ');
+    String prefix = (lastSpace < 0) ? _input : _input.substring(lastSpace + 1);
+    if (prefix.isEmpty()) return false;
+    String lowerPrefix = lowerCopy(prefix);
+    Tab &tab = _tabs[_activeTab];
+    String best;
+    for (auto &u : tab.users) {
+      String nickLower = lowerCopy(u.nick);
+      if (nickLower.startsWith(lowerPrefix)) {
+        if (best.isEmpty() || compareNickIgnoreCase(u.nick, best) < 0) best = u.nick;
+      }
+    }
+    if (best.isEmpty()) return false;
+    String newInput = (lastSpace < 0 ? "" : _input.substring(0, lastSpace + 1)) + best + " ";
+    if (newInput.length() > MAX_INPUT_CHARS) return false;
+    _input = newInput;
+    markInputDirty();
+    // Show hint briefly in status? keep subtle
+    return true;
+  }
+
   void handleKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
@@ -4446,7 +4472,7 @@ class SimpleTransport {
     }
 
     if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
-      cycleTab(1);
+      if (!tryAutocompleteInput()) cycleTab(1);
     }
 
     // Input typing already marked _inputDirty; other changes need full/body
@@ -5006,20 +5032,16 @@ class SimpleTransport {
 
   void drawConfigPage() {
     auto& gfx = drawTarget();
-    // Modern flat header — ratspeak style
+    // Terminal header — simple
     gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
-    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_DIM);
     gfx.setTextColor(UI_FG, UI_BG);
-    gfx.setCursor(6, 3);
+    gfx.setCursor(2, 2);
     gfx.print(_configEditing ? "CONFIG EDIT" : "CONFIG");
-    // Right hint pill
+    gfx.setTextColor(UI_DIM, UI_BG);
     String rhs = "hold G0";
-    int rhsW = rhs.length() * CHAR_W + 6;
-    gfx.fillRoundRect(SCREEN_W - rhsW - 4, 2, rhsW, 10, 4, UI_CARD);
-    gfx.setTextColor(UI_DIM, UI_CARD);
-    gfx.setCursor(SCREEN_W - rhsW - 1, 3);
+    gfx.setCursor(SCREEN_W - rhs.length() * CHAR_W - 2, 2);
     gfx.print(rhs);
-    drawBatteryIndicator(gfx, UI_BG);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -5029,46 +5051,45 @@ class SimpleTransport {
     if (_configScroll < 0) _configScroll = 0;
 
     int y = BODY_Y + 1;
-    int labelChars = 12;
-    int valueChars = 22;
+    int labelChars = 13;
+    int valueChars = 24;
 
     for (int idx = _configScroll; idx < CFG_COUNT && idx < _configScroll + visibleRows; ++idx) {
       bool selected = idx == _configSelected;
       bool catStart = isConfigCategoryStart(idx);
 
-      uint16_t cardBg = selected ? UI_HILITE_BG : UI_CARD;
-      uint16_t border = selected ? UI_ACCENT : UI_BORDER;
-      gfx.fillRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, cardBg);
-      gfx.drawRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, border);
-      if (selected) gfx.fillRect(3, y + 1, 2, CHAR_H, UI_ACCENT);
-      // Category pill — modern badge at left of card
+      // Terminal section header — dim centered
       if (catStart) {
         String cat = getConfigCategoryName(idx);
-        int pillW = cat.length() * CHAR_W + 8;
-        gfx.fillRoundRect(6, y + 1, pillW, 7, 3, UI_ACCENT);
-        gfx.setTextColor(UI_BG, UI_ACCENT);
-        gfx.setCursor(9, y + 1);
-        gfx.print(cat);
+        String hdr = "-- " + cat + " --";
+        int hdrW = hdr.length() * CHAR_W;
+        int hx = (SCREEN_W - hdrW) / 2;
+        gfx.setTextColor(UI_DIM, UI_BG);
+        gfx.setCursor(hx, y);
+        gfx.print(hdr);
+        y += ROW_H;
+        if (y >= BODY_Y + BODY_H) break;
       }
 
-      gfx.setTextColor(selected ? UI_WARN : UI_DIM, cardBg);
-      gfx.setCursor(6, y);
-      gfx.print(selected ? (_configEditing ? "*" : ">") : " " );
+      uint16_t bg = selected ? UI_FG : UI_BG;
+      uint16_t fg = selected ? UI_BG : UI_FG;
+      gfx.fillRect(0, y, SCREEN_W, CHAR_H + 1, bg);
+      gfx.setTextColor(selected ? UI_BG : UI_DIM, bg);
+      gfx.setCursor(2, y);
+      gfx.print(selected ? (_configEditing ? "*" : ">") : " ");
 
-      // Offset label to make room for category pill when present
-      int labelX = catStart ? 12 + 28 : 12;
-      int availLabelChars = catStart ? labelChars - 4 : labelChars;
-      String label = ellipsize(getConfigFieldLabel(idx), availLabelChars);
-      gfx.setTextColor(catStart ? UI_DIM : UI_FG, cardBg);
-      gfx.setCursor(labelX, y);
+      String label = ellipsize(getConfigFieldLabel(idx), labelChars);
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(10, y);
       gfx.print(label);
 
       if (!configFieldIsAction(idx)) {
-        gfx.setTextColor(selected ? UI_ACCENT : UI_FG, cardBg);
-        // Shift value right if pill present
-        int valX = catStart ? 12 + labelChars * CHAR_W + 8 : 12 + labelChars * CHAR_W;
-        gfx.setCursor(valX, y);
-        gfx.print(ellipsize(getConfigFieldValue(idx, true), valueChars - (catStart ? 4 : 0)));
+        String val = ellipsize(getConfigFieldValue(idx, true), valueChars);
+        gfx.setTextColor(selected ? UI_BG : UI_DIM, bg);
+        if (val.length() * CHAR_W + 10 + labelChars * CHAR_W < SCREEN_W) {
+          gfx.setCursor(10 + labelChars * CHAR_W, y);
+          gfx.print(val);
+        }
       }
 
       y += ROW_H;
@@ -5076,11 +5097,8 @@ class SimpleTransport {
 
     int inputY = INPUT_Y;
     gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
-    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
-    // Rounded input hint area
-    gfx.fillRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_CARD);
-    gfx.drawRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_BORDER);
-    gfx.setTextColor(UI_FG, UI_CARD);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_BG);
 
     if (_configEditing) {
       String hdr = ellipsize(getConfigFieldLabel(_configSelected), 16) + ":";
@@ -5110,27 +5128,20 @@ class SimpleTransport {
   void drawChannelListPage() {
     auto& gfx = drawTarget();
     gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
-    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_DIM);
     gfx.setTextColor(UI_FG, UI_BG);
-    gfx.setCursor(6, 3);
+    gfx.setCursor(2, 2);
     if (_channelListFilterPrompt) gfx.print("FILTER");
     else gfx.print(_channelListLoading ? "LOADING" : "CHANNELS");
-    // Count pill
     String cnt = String(_channelList.size());
-    if (!_channelListFilter.isEmpty()) cnt += " filt";
-    int cntW = cnt.length() * CHAR_W + 8;
-    gfx.fillRoundRect(80, 2, cntW, 10, 4, UI_CARD);
-    gfx.setTextColor(UI_DIM, UI_CARD);
-    gfx.setCursor(84, 3);
+    gfx.setTextColor(UI_DIM, UI_BG);
+    gfx.setCursor(70, 2);
     gfx.print(cnt);
 
     String rhs = "` close";
-    int rhsW = rhs.length() * CHAR_W + 6;
-    gfx.fillRoundRect(SCREEN_W - rhsW - 4, 2, rhsW, 10, 4, UI_CARD);
-    gfx.setTextColor(UI_DIM, UI_CARD);
-    gfx.setCursor(SCREEN_W - rhsW - 1, 3);
+    gfx.setTextColor(UI_DIM, UI_BG);
+    gfx.setCursor(SCREEN_W - rhs.length() * CHAR_W - 2, 2);
     gfx.print(rhs);
-    drawBatteryIndicator(gfx, UI_BG);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
@@ -5172,30 +5183,16 @@ class SimpleTransport {
         for (int idx = _channelListScroll; idx < static_cast<int>(visible.size()) && idx < _channelListScroll + visibleRows; ++idx) {
           const ChannelListEntry& entry = _channelList[visible[idx]];
           bool selected = idx == _channelListSelected;
-          uint16_t cardBg = selected ? UI_HILITE_BG : UI_CARD;
-          uint16_t border = selected ? UI_ACCENT : UI_BORDER;
-          gfx.fillRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, cardBg);
-          gfx.drawRoundRect(2, y, SCREEN_W - 4, CHAR_H + 2, 3, border);
-          if (selected) gfx.fillRect(3, y + 1, 2, CHAR_H, UI_ACCENT);
-          // Icon: # for channel
-          gfx.setTextColor(selected ? UI_WARN : UI_DIM, cardBg);
-          gfx.setCursor(6, y);
-          gfx.print(selected ? ">" : "#");
-          String row = entry.name + "  " + String(entry.users);
-          // users count pill at right
-          String usersStr = String(entry.users);
-          int usersW = usersStr.length() * CHAR_W + 8;
-          int usersX = SCREEN_W - 6 - usersW;
-          // Avoid overlap with row text
-          String rowEll = ellipsize(row, 32);
-          gfx.setTextColor(selected ? UI_ACCENT : UI_FG, cardBg);
-          gfx.setCursor(14, y);
-          gfx.print(rowEll);
-          // Users badge
-          gfx.fillRoundRect(usersX, y + 1, usersW, 7, 3, selected ? UI_ACCENT : UI_BG);
-          gfx.setTextColor(selected ? UI_BG : UI_DIM, selected ? UI_ACCENT : UI_BG);
-          gfx.setCursor(usersX + 4, y + 1);
-          gfx.print(usersStr);
+          uint16_t bg = selected ? UI_FG : UI_BG;
+          uint16_t fg = selected ? UI_BG : UI_FG;
+          gfx.fillRect(0, y, SCREEN_W, CHAR_H + 1, bg);
+          gfx.setTextColor(selected ? UI_BG : UI_DIM, bg);
+          gfx.setCursor(2, y);
+          gfx.print(selected ? ">" : " ");
+          String row = entry.name + " (" + String(entry.users) + ")";
+          gfx.setTextColor(fg, bg);
+          gfx.setCursor(10, y);
+          gfx.print(ellipsize(row, 36));
           y += ROW_H;
         }
       }
@@ -5203,15 +5200,14 @@ class SimpleTransport {
 
     int inputY = INPUT_Y;
     gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
-    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
-    gfx.fillRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_CARD);
-    gfx.drawRoundRect(4, inputY + 2, SCREEN_W - 8, INPUT_H - 4, 6, UI_BORDER);
-    gfx.setTextColor(UI_FG, UI_CARD);
+    gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
+    gfx.setTextColor(UI_FG, UI_BG);
 
     if (_channelListFilterPrompt) {
+      gfx.setTextColor(UI_DIM, UI_BG);
       gfx.setCursor(2, inputY + 4);
       gfx.print("Filter:");
-
+      gfx.setTextColor(UI_FG, UI_BG);
       int charsPerRow = std::max(1, (SCREEN_W - 4) / CHAR_W);
       String src = _channelListFilterBuffer;
       if (static_cast<int>(src.length()) > charsPerRow) src = src.substring(src.length() - charsPerRow);
@@ -5242,58 +5238,46 @@ class SimpleTransport {
 
   void drawHeader() {
     auto& gfx = drawTarget();
-    // Modern flat header — ratspeak inspired: BG + subtle bottom border
+    // Terminal flat header — simple, reliable, no circles
     gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
-    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_BORDER);
-
-    // Connection dot (left)
-    bool conn = _transport.connected();
-    uint16_t dotCol = !_wifiReady ? UI_DIM : (!conn ? UI_WARN : (_ircRegistered ? UI_ACCENT : UI_WARN));
-    gfx.fillCircle(6, HEADER_H / 2, 3, dotCol);
-    gfx.drawCircle(6, HEADER_H / 2, 3, UI_FG);
+    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_DIM);
 
     String title = _tabs[_activeTab].name;
     bool hasMention = _tabs[_activeTab].mention;
     bool hasUnread = _tabs[_activeTab].unread;
-    // Section glyph prefix — modern hint
-    String glyph;
-    if (_tabs[_activeTab].type == TabType::Channel) glyph = "#";
-    else if (_tabs[_activeTab].type == TabType::Query) glyph = "@";
-    else glyph = "o";
-    // Build title with glyph
-    String dispTitle = glyph + " " + title;
-    if (hasMention) dispTitle = "!" + dispTitle;
-    else if (hasUnread) dispTitle = "*" + dispTitle;
+    if (hasMention) title = "!" + title;
+    else if (hasUnread) title = "*" + title;
+    // Keep channel glyph for scan, but plain
+    if (_tabs[_activeTab].type == TabType::Channel) title = "#" + title;
+    else if (_tabs[_activeTab].type == TabType::Query) title = "@" + title;
 
-    String net = _wifiReady ? WiFi.localIP().toString() : "offline";
-    if (conn) net += " IRC";
-    if (!_ircRegistered && conn) net += "*";
+    String net = _wifiReady ? ( _transport.connected() ? (_ircRegistered ? "IRC" : "IRC*") : "online") : "offline";
+    // Battery as text percent, centered
+    String batt;
+    if (_batteryLevel >= 0) batt = String(_batteryLevel) + "%" + (_batteryChargeState == m5::Power_Class::is_charging ? "+" : "");
+    else batt = "";
 
-    static constexpr int batteryBodyW = 18;
-    static constexpr int batteryTipW = 2;
-    static constexpr int batteryGapW = 1;
-    static constexpr int batteryTotalW = batteryBodyW + batteryTipW + batteryGapW;
-    int batteryX = (SCREEN_W - batteryTotalW) / 2;
-    // Leave room for dot + glyph
-    int leftChars = std::max(0, (batteryX - 16) / CHAR_W);
-    int rightChars = std::max(0, (SCREEN_W - (batteryX + batteryTotalW) - 4) / CHAR_W);
-    dispTitle = ellipsize(dispTitle, leftChars);
-    net = ellipsize(net, rightChars);
+    // Layout: title left, batt center, net right — all 6x8 mono, truncate to fit
+    int battW = batt.length() * CHAR_W;
+    int battX = (SCREEN_W - battW) / 2;
+    int leftW = battX - 4;
+    int rightW = SCREEN_W - (battX + battW) - 4;
+    String left = ellipsize(title, std::max(0, leftW / CHAR_W));
+    String right = ellipsize(net, std::max(0, rightW / CHAR_W));
 
-    // Title left of battery, with subtle highlight if mention
-    uint16_t titleBg = UI_BG;
-    uint16_t titleFg = hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG);
-    gfx.setTextColor(titleFg, titleBg);
-    gfx.setCursor(14, 2);
-    gfx.print(dispTitle);
+    gfx.setTextColor(hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG), UI_BG);
+    gfx.setCursor(2, 2);
+    gfx.print(left);
 
-    int rx = SCREEN_W - (net.length() * CHAR_W) - 2;
-    int minRx = batteryX + batteryTotalW + 4;
-    if (rx < minRx) rx = minRx;
+    if (!batt.isEmpty()) {
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(battX, 2);
+      gfx.print(batt);
+    }
+
     gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(rx, 2);
-    gfx.print(net);
-    drawBatteryIndicator(gfx, UI_BG);
+    gfx.setCursor(SCREEN_W - right.length() * CHAR_W - 2, 2);
+    gfx.print(right);
   }
 
   void drawBatteryIndicator(lgfx::LovyanGFX& gfx, uint16_t bg) {
@@ -5335,51 +5319,35 @@ class SimpleTransport {
 
   void drawNavBar() {
     auto& gfx = drawTarget();
-    // Modern floating pill — ratspeak style
+    // Terminal footer — simple, reliable, no rounded rects
     gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_BG);
-    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_BORDER);
-    // Pill container — subtle, fits 135px height
-    const int pillX = 4;
-    const int pillY = NAV_Y + 1;
-    const int pillW = SCREEN_W - 8;
-    const int pillH = NAV_H - 2;
-    gfx.fillRoundRect(pillX, pillY, pillW, pillH, 3, UI_CARD);
-    gfx.drawRoundRect(pillX, pillY, pillW, pillH, 3, UI_BORDER);
-    const char* labels[SEC_COUNT] = {"SERVERS", "CHANS", "CHATS", "SET"};
-    const char* icons[SEC_COUNT] = {"o", "#", "@", "*"};
+    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_DIM);
+    const char* labels[SEC_COUNT] = {"Home", "Chans", "Msgs", "Setup"};
     int cur = currentSection();
-    int segW = pillW / SEC_COUNT;
+    int segW = SCREEN_W / SEC_COUNT;
     for (int i = 0; i < SEC_COUNT; ++i) {
-      int x = pillX + i * segW;
-      int w = (i == SEC_COUNT - 1) ? pillX + pillW - x : segW;
+      int x = i * segW;
+      int w = (i == SEC_COUNT - 1) ? SCREEN_W - x : segW;
       bool active = (i == cur);
       bool mention = sectionHasMention(i);
       bool unread = sectionHasUnread(i);
-      // Active pill — radius = half height for perfect capsule, inset 1px for border gap
-      if (active) {
-        gfx.fillRoundRect(x + 1, pillY + 1, w - 2, pillH - 2, 2, UI_ACCENT);
-        gfx.setTextColor(UI_BG, UI_ACCENT);
-      } else {
-        uint16_t fg = mention ? UI_WARN : (unread ? UI_FG : UI_DIM);
-        gfx.setTextColor(fg, UI_CARD);
-      }
-      // Build label: icon + short name + count badge
-      String lbl = String(icons[i]) + " " + labels[i];
+      String lbl = labels[i];
       int cnt = countInSection(i);
       if (i != SEC_SETTINGS && cnt > 0) {
-        // keep short: show count only if space, else omit
-        String withCnt = lbl + " " + String(cnt);
-        if ((int)withCnt.length() * CHAR_W + 6 <= w) lbl = withCnt;
+        String withCnt = lbl + "(" + String(cnt) + ")";
+        if ((int)withCnt.length() * CHAR_W + 4 <= w) lbl = withCnt;
       }
+      if (mention) lbl = "!" + lbl;
+      else if (unread) lbl = "*" + lbl;
       int lblW = (int)lbl.length() * CHAR_W;
       int cx = x + (w - lblW) / 2;
-      int cy = pillY + 1;
-      gfx.setCursor(cx, cy);
+      uint16_t bg = active ? UI_FG : UI_BG;
+      uint16_t fg = active ? UI_BG : (mention ? UI_WARN : (unread ? UI_FG : UI_DIM));
+      gfx.fillRect(x, NAV_Y + 1, w, NAV_H - 1, bg);
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(cx, NAV_Y + 2);
       gfx.print(lbl);
-      // Unread dot for inactive with mention/unread (already colored) — small corner dot if not active
-      if (!active && (mention || unread)) {
-        gfx.fillCircle(x + w - 4, pillY + 2, 2, mention ? UI_WARN : UI_ACCENT);
-      }
+      if (i > 0) gfx.drawFastVLine(x, NAV_Y, NAV_H, UI_DIM);
     }
   }
 
@@ -5408,10 +5376,37 @@ class SimpleTransport {
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
-    int y = BODY_Y + 1;
-    for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
-      drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
-      y += ROW_H;
+    // Empty-state card — ratspeak modern
+    if (tab.lines.empty()) {
+      String hint;
+      if (tab.type == TabType::Channel) hint = "No messages — say hi!";
+      else if (tab.type == TabType::Query) hint = "No DMs — /query nick";
+      else hint = "No messages — /join #chan";
+      int cardW = (int)hint.length() * CHAR_W + 16;
+      int cardX = (textWidth - cardW) / 2;
+      int cardY = BODY_Y + (BODY_H - 12) / 2;
+      gfx.fillRoundRect(cardX, cardY, cardW, 12, 4, UI_CARD);
+      gfx.drawRoundRect(cardX, cardY, cardW, 12, 4, UI_BORDER);
+      gfx.setTextColor(UI_DIM, UI_CARD);
+      gfx.setCursor(cardX + 8, cardY + 2);
+      gfx.print(hint);
+    } else {
+      int y = BODY_Y + 1;
+      for (int i = start; i < end && y < BODY_Y + BODY_H - CHAR_H; ++i) {
+        drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
+        y += ROW_H;
+      }
+    }
+
+    // Scrollbar — 2px modern indicator on body right edge
+    if ((int)tab.lines.size() > maxLines) {
+      int total = (int)tab.lines.size();
+      int h = std::max(6, BODY_H * maxLines / total);
+      int maxStart = std::max(1, total - maxLines);
+      int sy = BODY_Y + 1 + (start * (BODY_H - h - 2) / maxStart);
+      int sx = textWidth - 2;
+      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
+      gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
     }
 
     if (showPane) drawNickPane(tab);
@@ -5429,23 +5424,44 @@ class SimpleTransport {
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
 
-    int y = BODY_Y + 1;
-    int drawnRows = 0;
-    int currentRow = 0;
-    for (const ChatLine& line : tab.lines) {
-      int lineRows = wrappedRowsForLine(line, textWidth);
-      if (currentRow + lineRows <= startRow) {
+    if (tab.lines.empty()) {
+      String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
+      int cardW = (int)hint.length() * CHAR_W + 16;
+      int cardX = (textWidth - cardW) / 2;
+      int cardY = BODY_Y + (BODY_H - 12) / 2;
+      gfx.fillRoundRect(cardX, cardY, cardW, 12, 4, UI_CARD);
+      gfx.drawRoundRect(cardX, cardY, cardW, 12, 4, UI_BORDER);
+      gfx.setTextColor(UI_DIM, UI_CARD);
+      gfx.setCursor(cardX + 8, cardY + 2);
+      gfx.print(hint);
+    } else {
+      int y = BODY_Y + 1;
+      int drawnRows = 0;
+      int currentRow = 0;
+      for (const ChatLine& line : tab.lines) {
+        int lineRows = wrappedRowsForLine(line, textWidth);
+        if (currentRow + lineRows <= startRow) {
+          currentRow += lineRows;
+          continue;
+        }
+        int skipRows = std::max(0, startRow - currentRow);
+        int rowsLeft = visibleRows - drawnRows;
+        if (rowsLeft <= 0) break;
+        int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
+        drawnRows += usedRows;
+        y += usedRows * ROW_H;
         currentRow += lineRows;
-        continue;
+        if (drawnRows >= visibleRows || y >= BODY_Y + BODY_H - CHAR_H) break;
       }
-      int skipRows = std::max(0, startRow - currentRow);
-      int rowsLeft = visibleRows - drawnRows;
-      if (rowsLeft <= 0) break;
-      int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
-      drawnRows += usedRows;
-      y += usedRows * ROW_H;
-      currentRow += lineRows;
-      if (drawnRows >= visibleRows || y >= BODY_Y + BODY_H - CHAR_H) break;
+    }
+    // Scrollbar for wrapped
+    if (totalRows > visibleRows) {
+      int h = std::max(6, BODY_H * visibleRows / totalRows);
+      int maxStart = std::max(1, totalRows - visibleRows);
+      int sy = BODY_Y + 1 + (startRow * (BODY_H - h - 2) / maxStart);
+      int sx = textWidth - 2;
+      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_BORDER);
+      gfx.fillRoundRect(sx, sy, 2, std::max(2, h/3), 1, UI_DIM);
     }
 
     if (showPane) drawNickPane(tab);
@@ -5453,112 +5469,84 @@ class SimpleTransport {
 
   void drawMarqueeChatLine(int x, int y, const ChatLine& line, int maxWidth) {
     auto& gfx = drawTarget();
-    // Modern bubble — ratspeak inspired: rounded, subtle
-    uint16_t bubbleBg = line.highlight ? UI_HILITE_BG : (line.own ? UI_CARD : UI_BG);
-    if (line.notice) bubbleBg = UI_CARD;
-    bool hasBubble = bubbleBg != UI_BG;
-    // Bubble background with 1px inset and 3px radius for softness
-    if (hasBubble) {
-      gfx.fillRoundRect(x + 1, y, maxWidth - 2, CHAR_H + 1, 3, bubbleBg);
-      gfx.drawRoundRect(x + 1, y, maxWidth - 2, CHAR_H + 1, 3, UI_BORDER);
-      if (line.highlight) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_WARN);
-      else if (line.own) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_ACCENT);
-      else if (line.notice) gfx.fillRect(x + 1, y + 1, 3, CHAR_H - 1, UI_DIM);
-    } else {
-      gfx.fillRect(x, y, maxWidth, CHAR_H + 1, UI_BG);
-      if (line.highlight) gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+    // Terminal flat — no bubbles, just text, highlight inverted
+    uint16_t bg = line.highlight ? UI_FG : UI_BG;
+    uint16_t fg = line.highlight ? UI_BG : UI_FG;
+    if (line.own && !line.highlight) { bg = UI_BG; fg = UI_FG; }
+    if (line.notice && !line.highlight) { bg = UI_BG; fg = UI_DIM; }
+    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, bg);
+    if (line.highlight) {
+      // left marker for mention
+      gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
     }
-
-    int stampX = x + 3;
-    uint16_t stampBg = hasBubble ? bubbleBg : UI_BG;
-    gfx.setTextColor(UI_DIM, stampBg);
+    int stampX = x + 2;
+    gfx.setTextColor(line.highlight ? UI_BG : UI_DIM, bg);
     gfx.setCursor(stampX, y);
     String stamp = line.stampShort;
     if (stamp.length() > 5) stamp = stamp.substring(0, 5);
     gfx.print(stamp);
-
-    int textX = x + 3 + TIMESTAMP_W_CHARS * CHAR_W;
-    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 6;
-    drawStyledText(textX, y, line.raw, textW, stampBg, currentTextScrollOffsetCols(line, textW));
+    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    // For highlight, drawStyledText needs inverted bg/fg handling
+    if (line.highlight) {
+      // Temporarily swap for styled text
+      drawStyledText(textX, y, line.raw, textW, bg, currentTextScrollOffsetCols(line, textW));
+    } else {
+      drawStyledText(textX, y, line.raw, textW, bg, currentTextScrollOffsetCols(line, textW));
+    }
   }
 
   int drawWrappedChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
     auto& gfx = drawTarget();
-    uint16_t bubbleBg = line.highlight ? UI_HILITE_BG : (line.own ? UI_CARD : UI_BG);
-    if (line.notice) bubbleBg = UI_CARD;
-    bool hasBubble = bubbleBg != UI_BG;
+    uint16_t bg = line.highlight ? UI_FG : UI_BG;
     int totalRows = wrappedRowsForLine(line, maxWidth);
     int rowsToDraw = std::max(0, std::min(maxRows, totalRows - skipRows));
-    // Single bubble spanning all rows of this message for modern grouped look
-    if (hasBubble && rowsToDraw > 0) {
-      int bubbleH = rowsToDraw * ROW_H;
-      // Slight vertical padding inside bubble
-      gfx.fillRoundRect(x + 1, y, maxWidth - 2, bubbleH, 4, bubbleBg);
-      gfx.drawRoundRect(x + 1, y, maxWidth - 2, bubbleH, 4, UI_BORDER);
-      if (line.highlight) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_WARN);
-      else if (line.own) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_ACCENT);
-      else if (line.notice) gfx.fillRect(x + 1, y + 1, 3, bubbleH - 2, UI_DIM);
-    } else {
-      for (int row = 0; row < rowsToDraw; ++row) {
-        int rowY = y + row * ROW_H;
-        gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, UI_BG);
-      }
-      if (line.highlight && skipRows == 0 && rowsToDraw > 0) {
-        gfx.fillRect(x, y, 2, rowsToDraw * ROW_H, UI_WARN);
-      }
+    for (int row = 0; row < rowsToDraw; ++row) {
+      int rowY = y + row * ROW_H;
+      gfx.fillRect(x, rowY, maxWidth, CHAR_H + 1, bg);
     }
-
+    if (line.highlight && rowsToDraw > 0) {
+      gfx.fillRect(x, y, 2, rowsToDraw * ROW_H, UI_WARN);
+    }
     if (skipRows == 0 && rowsToDraw > 0) {
-      int stampX = x + 3;
-      uint16_t stampBg = hasBubble ? bubbleBg : UI_BG;
-      gfx.setTextColor(UI_DIM, stampBg);
+      int stampX = x + 2;
+      gfx.setTextColor(line.highlight ? UI_BG : UI_DIM, bg);
       gfx.setCursor(stampX, y);
       String stamp = line.stampShort;
       if (stamp.length() > 5) stamp = stamp.substring(0, 5);
       gfx.print(stamp);
     }
-
-    int textX = x + 3 + TIMESTAMP_W_CHARS * CHAR_W;
-    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 6;
-    drawWrappedStyledText(textX, y, line.raw, textW, bubbleBg == UI_BG ? UI_BG : bubbleBg, skipRows, rowsToDraw);
+    int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
+    int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
+    drawWrappedStyledText(textX, y, line.raw, textW, bg, skipRows, rowsToDraw);
     return rowsToDraw;
   }
 
   void drawNickPane(const Tab& tab) {
     auto& gfx = drawTarget();
     int x = SCREEN_W - NICK_PANE_W;
-    // Modern card pane — rounded left edge, subtle border
-    gfx.fillRoundRect(x, BODY_Y, NICK_PANE_W, BODY_H, 6, UI_CARD);
-    gfx.drawRoundRect(x, BODY_Y, NICK_PANE_W, BODY_H, 6, UI_BORDER);
-    gfx.fillRect(x + 6, BODY_Y, NICK_PANE_W - 6, BODY_H, UI_CARD); // square right edge
-    gfx.drawFastVLine(x + 6, BODY_Y, BODY_H, UI_BORDER);
-    // Header pill
-    gfx.fillRoundRect(x + 4, BODY_Y + 2, NICK_PANE_W - 8, 10, 4, UI_BG);
+    // Terminal flat pane — no rounded, just vertical separator
+    gfx.fillRect(x, BODY_Y, NICK_PANE_W, BODY_H, UI_BG);
+    gfx.drawFastVLine(x, BODY_Y, BODY_H, UI_DIM);
     gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(x + 8, BODY_Y + 3);
+    gfx.setCursor(x + 2, BODY_Y + 1);
     String hdr = String(tab.users.size()) + " users";
-    gfx.print(ellipsize(hdr, 9));
-    // Top accent dot for count
-    gfx.fillCircle(x + NICK_PANE_W - 10, BODY_Y + 7, 2, UI_ACCENT);
+    gfx.print(ellipsize(hdr, 10));
 
-    int y = BODY_Y + 14;
-    int maxRows = (BODY_H - 16) / (CHAR_H + 1);
+    int y = BODY_Y + 11;
+    int maxRows = (BODY_H - 12) / ROW_H;
     for (int i = 0; i < maxRows && i < static_cast<int>(tab.users.size()); ++i) {
       String row;
       if (tab.users[i].prefix) row += tab.users[i].prefix;
       row += tab.users[i].nick;
-      int maxChars = (NICK_PANE_W - 10) / CHAR_W;
+      int maxChars = (NICK_PANE_W - 4) / CHAR_W;
       if (row.length() > static_cast<size_t>(maxChars)) row = row.substring(0, maxChars);
       bool isSelf = equalsIgnoreCase(tab.users[i].nick, _selfNick);
-      uint16_t bg = isSelf ? UI_HILITE_BG : UI_CARD;
       uint16_t fg = isSelf ? UI_ACCENT : UI_FG;
-      if (isSelf) gfx.fillRoundRect(x + 3, y - 1, NICK_PANE_W - 6, CHAR_H + 2, 3, bg);
-      gfx.setTextColor(fg, bg);
-      gfx.setCursor(x + 6, y);
+      gfx.setTextColor(fg, UI_BG);
+      gfx.setCursor(x + 2, y);
       gfx.print(row);
-      // prefix dot
-      if (tab.users[i].prefix == '@' || tab.users[i].prefix == '~') gfx.fillCircle(x + 4, y + 4, 1, UI_WARN);
-      y += CHAR_H + 1;
+      y += ROW_H;
     }
   }
 
@@ -5584,61 +5572,39 @@ class SimpleTransport {
   void drawInput() {
     auto& gfx = drawTarget();
     int y = INPUT_Y;
-    // Modern floating input — ratspeak style
+    // Terminal input — simple, reliable, no rounded card
     gfx.fillRect(0, y, SCREEN_W, INPUT_H, UI_BG);
-    gfx.drawFastHLine(0, y, SCREEN_W, UI_BORDER);
-    // Rounded field
-    const int fx = 4;
-    const int fy = y + 2;
-    const int fw = SCREEN_W - 8;
-    const int fh = INPUT_H - 4;
-    gfx.fillRoundRect(fx, fy, fw, fh, 6, UI_CARD);
-    gfx.drawRoundRect(fx, fy, fw, fh, 6, UI_BORDER);
-    // Cursor blink (only when not sleeping)
+    gfx.drawFastHLine(0, y, SCREEN_W, UI_DIM);
     bool showCursor = !_screenSleeping && (millis() % 1000 < 500);
-    String display = _input;
-    if (display.isEmpty()) {
-      // Placeholder hint — dim
+    if (_input.isEmpty()) {
       String hint;
-      if (_tabs[_activeTab].type == TabType::Channel) hint = "Message " + _tabs[_activeTab].name + "...";
-      else if (_tabs[_activeTab].type == TabType::Query) hint = "Message " + _tabs[_activeTab].name + "...";
-      else hint = "Type / for commands...";
-      hint = ellipsize(hint, (fw - 12) / CHAR_W);
-      gfx.setTextColor(UI_DIM, UI_CARD);
-      gfx.setCursor(fx + 8, fy + 4);
+      if (_tabs[_activeTab].type == TabType::Channel) hint = "Message " + _tabs[_activeTab].name;
+      else if (_tabs[_activeTab].type == TabType::Query) hint = "Message " + _tabs[_activeTab].name;
+      else hint = "/join #chan or /help";
+      hint = ellipsize(hint, (SCREEN_W - 12) / CHAR_W);
+      gfx.setTextColor(UI_DIM, UI_BG);
+      gfx.setCursor(2, y + 4);
+      gfx.print(">");
+      gfx.setCursor(10, y + 4);
       gfx.print(hint);
-      // subtle dim prompt char
-      gfx.setCursor(fx + 6, fy + 13);
-      gfx.print("> ");
-      gfx.setTextColor(UI_DIM, UI_CARD);
-      gfx.print("|");
+      if (showCursor) {
+        gfx.setTextColor(UI_DIM, UI_BG);
+        gfx.setCursor(10 + hint.length() * CHAR_W, y + 4);
+        gfx.print("_");
+      }
     } else {
-      int charsPerRow = (fw - 12) / CHAR_W;
+      int charsPerRow = (SCREEN_W - 10) / CHAR_W;
       std::vector<String> rows = buildInputRows(charsPerRow, 2);
-      // Add blinking cursor to last row
       if (showCursor) {
         if (rows.size() >= 2 && !rows[1].isEmpty()) rows[1] += "_";
         else if (!rows[0].isEmpty()) rows[0] += "_";
         else rows[1] += "_";
       }
-      gfx.setTextColor(UI_FG, UI_CARD);
-      gfx.setCursor(fx + 6, fy + 4);
+      gfx.setTextColor(UI_FG, UI_BG);
+      gfx.setCursor(2, y + 4);
       gfx.print(ellipsize(rows[0], charsPerRow));
-      gfx.setCursor(fx + 6, fy + 13);
+      gfx.setCursor(2, y + 13);
       gfx.print(ellipsize(rows[1], charsPerRow));
-    }
-    // Hint for section nav at right edge of field (tiny)
-    gfx.setTextColor(UI_DIM, UI_CARD);
-    // Draw subtle ,/ hint if space
-    if (fw > 80) {
-      String navHint = ",/ sec";
-      int hx = fx + fw - (int)navHint.length() * CHAR_W - 4;
-      // Only if input short enough not to overlap
-      if (_input.length() < (size_t)((fw - 30) / CHAR_W)) {
-        gfx.setCursor(hx, fy + 13);
-        gfx.setTextColor(UI_DIM, UI_CARD);
-        gfx.print(navHint);
-      }
     }
   }
 
@@ -6018,17 +5984,15 @@ void IrcClientApp::closeServerList() {
 void IrcClientApp::drawServerListPage() {
   auto& gfx = drawTarget();
   gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
-  gfx.drawFastHLine(0, HEADER_H-1, SCREEN_W, UI_BORDER);
+  gfx.drawFastHLine(0, HEADER_H-1, SCREEN_W, UI_DIM);
   gfx.setTextColor(UI_FG, UI_BG);
-  gfx.setCursor(6, 3);
+  gfx.setCursor(2, 2);
   gfx.print("SERVERS");
-  String rhs = String(_servers.size()) + "/" + String(MAX_SERVERS) + "  ` close";
-  int rhsW = rhs.length()*CHAR_W+6;
-  gfx.fillRoundRect(SCREEN_W - rhsW -4, 2, rhsW, 10, 4, UI_CARD);
-  gfx.setTextColor(UI_DIM, UI_CARD);
-  gfx.setCursor(SCREEN_W - rhsW -1, 3);
+  String rhs = String(_servers.size()) + "/" + String(MAX_SERVERS) + " `close";
+  gfx.setTextColor(UI_DIM, UI_BG);
+  gfx.setCursor(SCREEN_W - rhs.length()*CHAR_W - 2, 2);
   gfx.print(rhs);
-  drawBatteryIndicator(gfx, UI_BG);
+
   gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
   int visibleRows = bodyVisibleRows();
   if (_serverListSelected < _serverListScroll) _serverListScroll = _serverListSelected;
@@ -6036,40 +6000,34 @@ void IrcClientApp::drawServerListPage() {
   if (_serverListScroll<0) _serverListScroll=0;
   if (_servers.empty()) {
     gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(8, BODY_Y+10); gfx.print("No servers. Edit /irc/servers.txt");
-    gfx.setCursor(8, BODY_Y+22); gfx.print("or use config preset.");
+    gfx.setCursor(2, BODY_Y+10); gfx.print("No servers. Edit /irc/servers.txt");
+    gfx.setCursor(2, BODY_Y+20); gfx.print("or use config preset.");
   } else {
     int y = BODY_Y+1;
     for (int i=_serverListScroll; i<(int)_servers.size() && i<_serverListScroll+visibleRows; ++i) {
       bool sel = i==_serverListSelected;
       bool active = i==_activeServerIdx;
       bool paused = _servers[i].paused;
-      uint16_t bg = sel ? UI_HILITE_BG : UI_CARD;
-      uint16_t bd = sel ? UI_ACCENT : UI_BORDER;
-      gfx.fillRoundRect(2, y, SCREEN_W-4, CHAR_H+2, 3, bg);
-      gfx.drawRoundRect(2, y, SCREEN_W-4, CHAR_H+2, 3, bd);
-      if (active) gfx.fillRect(3, y+1, 2, CHAR_H, UI_ACCENT);
-      if (paused) gfx.fillRect(SCREEN_W-7, y+1, 3, CHAR_H, UI_WARN);
-      // indicator
-      String mark = active ? ">" : (paused ? "z" : " ");
-      gfx.setTextColor(sel?UI_WARN:UI_DIM, bg);
-      gfx.setCursor(6, y); gfx.print(mark);
-      String label = _servers[i].id + " " + _servers[i].host + ":" + String(_servers[i].port) + (paused?" [paused]":"");
-      gfx.setTextColor(sel?UI_ACCENT:UI_FG, bg);
-      gfx.setCursor(14, y);
-      gfx.print(ellipsize(label, 34));
+      uint16_t bg = sel ? UI_FG : UI_BG;
+      uint16_t fg = sel ? UI_BG : UI_FG;
+      gfx.fillRect(0, y, SCREEN_W, CHAR_H+1, bg);
+      gfx.setTextColor(sel ? UI_BG : UI_DIM, bg);
+      gfx.setCursor(2, y);
+      gfx.print(active ? ">" : (paused ? "z" : " "));
+      String label = _servers[i].id + " " + _servers[i].host + ":" + String(_servers[i].port) + (paused?" [paused]":"") + (active?" *":"");
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(10, y);
+      gfx.print(ellipsize(label, 38));
       y += ROW_H;
     }
   }
-  // Input hint area
+  // Input hint area — terminal flat
   int inputY = INPUT_Y;
   gfx.fillRect(0, inputY, SCREEN_W, INPUT_H, UI_BG);
-  gfx.drawFastHLine(0, inputY, SCREEN_W, UI_BORDER);
-  gfx.fillRoundRect(4, inputY+2, SCREEN_W-8, INPUT_H-4, 6, UI_CARD);
-  gfx.drawRoundRect(4, inputY+2, SCREEN_W-8, INPUT_H-4, 6, UI_BORDER);
-  gfx.setTextColor(UI_DIM, UI_CARD);
-  gfx.setCursor(8, inputY+6); gfx.print("ENTER switch  DEL pause/resume  ` close");
-  gfx.setCursor(8, inputY+14); gfx.print(String("heap ") + String(ESP.getFreeHeap()/1024) + "k  tabs " + String(_tabs.size()));
+  gfx.drawFastHLine(0, inputY, SCREEN_W, UI_DIM);
+  gfx.setTextColor(UI_DIM, UI_BG);
+  gfx.setCursor(2, inputY+4); gfx.print("ENTER switch  DEL pause/resume  ` close");
+  gfx.setCursor(2, inputY+13); gfx.print(String("heap ") + String(ESP.getFreeHeap()/1024) + "k  tabs " + String(_tabs.size()));
 }
 void IrcClientApp::handleServerListKeyboard() {
   if (!M5Cardputer.Keyboard.isChange()) return;
