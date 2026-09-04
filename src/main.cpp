@@ -679,7 +679,7 @@ static void loadConfig(){
     return;
   }
   // MUTEX GAUNTLET: wrap all SD file read operations inside irc_mutex
-  if(!irc_mutex || xSemaphoreTake(irc_mutex, portMAX_DELAY)!=pdTRUE){
+  if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE){
     logStatus("No /irc/config.txt, defaults");
     return;
   }
@@ -746,7 +746,7 @@ static void loadConfig(){
 static void saveConfig(){
   if(!gSdReady || gSafeBoot) return;
   // MUTEX GAUNTLET: wrap all SD file write operations inside irc_mutex
-  if(!irc_mutex || xSemaphoreTake(irc_mutex, portMAX_DELAY)!=pdTRUE) return;
+  if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return;
   if(!SD.exists("/irc")) SD.mkdir("/irc");
   if(SD.exists(CONFIG_PATH)) SD.remove(CONFIG_PATH);
   File f=SD.open(CONFIG_PATH, FILE_WRITE);
@@ -791,7 +791,7 @@ static void saveConfig(){
 // DYNAMIC BACKUP HOOK: thread-safe backup of active config per spec
 static void trigger_config_backup(){
   // Enveloped within irc_mutex to safeguard shared SPI bus (SD + ST7789 share same peripheral)
-  if(!irc_mutex || xSemaphoreTake(irc_mutex, portMAX_DELAY)!=pdTRUE) return;
+  if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return;
   // Copy active contents of /irc/config.txt to /irc/config.bak
   if(SD.exists("/irc/config.bak")) SD.remove("/irc/config.bak");
   if(!SD.exists("/irc/config.txt")){
@@ -876,7 +876,7 @@ static void sweepRecursive(const char* base, int depth){
 static void sweepOldLogs(){
   if(!gSdReady || gSafeBoot) return;
   // MUTEX GAUNTLET: wrap all SD file read/delete operations inside irc_mutex
-  if(!irc_mutex || xSemaphoreTake(irc_mutex, portMAX_DELAY)!=pdTRUE) return;
+  if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return;
   const char* roots[] = {"/irc/logs","/irc","/IRC", nullptr};
   for(int i=0;roots[i];++i){
     if(SD.exists(roots[i])){
@@ -951,7 +951,7 @@ void run_retro_splash_screen(){
   M5Cardputer.Display.setCursor(8,10);
   M5Cardputer.Display.print("Cardputer IRC");
   if(safe_mode_active){ M5Cardputer.Display.setCursor(8,70); M5Cardputer.Display.print("[G0 SAFE BOOT]"); }
-  delay(200);
+  vTaskDelay(pdMS_TO_TICKS(200)); yield();
 }
 
 
@@ -1087,10 +1087,11 @@ void draw_chat_view(){
       canvas.setTextColor(0xFD20);
       canvas.setCursor(10, 45);
       canvas.print("SAFE MODE TERMINAL ACTIVE");
-      canvas.pushSprite(0, 12);
+      if(gCanvasReady) canvas.pushSprite(0, 12);
       ui_needs_redraw = false;
       return;
   }
+  if(!gCanvasReady){ initCanvas(); if(!gCanvasReady){ ui_needs_redraw=false; return; } }
   // Safe Mode: bypass active network streams / socket connections / client statuses / packet buffers
   if (!safe_mode_active) {
     // guard active network streams / WiFiClientSecure / gIrcConnected / gRxAccum packet buffers
@@ -1129,7 +1130,7 @@ void draw_chat_view(){
     xSemaphoreGive(irc_mutex);
   }
   // STEP B (THE DIRECT HARDWARE BLIT): push middle chat viewport first, offset by 12px past top bar
-  canvas.pushSprite(0, 12);
+  if(gCanvasReady) canvas.pushSprite(0, 12);
   // STEP C (THE FIXED HEADER & FOOTER OVERLAYS): draw top 12px and bottom 14px straight to glass with zero flicker
   // Explicit direct hardware blit per spec: M5Cardputer.Display.fillRect and M5Cardputer.Display.print
   M5Cardputer.Display.fillRect(0,0,1,1,0x0000); M5Cardputer.Display.print("");
@@ -1374,14 +1375,11 @@ void handle_keyboard_inputs() {
     if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) {
         int total_tabs = gTabCount;
         if (total_tabs <= 1) return;
-
-        String current_server = (strlen(gTabs[current_tab_index].server) > 0) ? String(gTabs[current_tab_index].server) : String(bnc_host);
-
+        char current_server[96]; if(strlen(gTabs[current_tab_index].server)>0) safeCopy(current_server,gTabs[current_tab_index].server,sizeof(current_server)); else if(bnc_host.length()>0) safeCopy(current_server,bnc_host.c_str(),sizeof(current_server)); else safeCopy(current_server,gCfg.host,sizeof(current_server));
         for (int i = 1; i < total_tabs; ++i) {
             int idx = (current_tab_index + i) % total_tabs;
-            String target_server = (strlen(gTabs[idx].server) > 0) ? String(gTabs[idx].server) : String(bnc_host);
-
-            if (current_server != target_server) {
+            char target_server[96]; if(strlen(gTabs[idx].server)>0) safeCopy(target_server,gTabs[idx].server,sizeof(target_server)); else if(bnc_host.length()>0) safeCopy(target_server,bnc_host.c_str(),sizeof(target_server)); else safeCopy(target_server,gCfg.host,sizeof(target_server));
+            if (!eqI(current_server, target_server)) {
                 current_tab_index = idx;
                 ui_needs_redraw = true;
                 return;
@@ -1392,11 +1390,11 @@ void handle_keyboard_inputs() {
     if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT)) {
         int total_tabs = gTabCount;
         if (total_tabs <= 1) return;
-        String current_server = (strlen(gTabs[current_tab_index].server) > 0) ? String(gTabs[current_tab_index].server) : String(bnc_host);
+        char current_server[96]; if(strlen(gTabs[current_tab_index].server)>0) safeCopy(current_server,gTabs[current_tab_index].server,sizeof(current_server)); else if(bnc_host.length()>0) safeCopy(current_server,bnc_host.c_str(),sizeof(current_server)); else safeCopy(current_server,gCfg.host,sizeof(current_server));
         for (int i = 1; i < total_tabs; ++i) {
             int idx = (current_tab_index - i + total_tabs) % total_tabs;
-            String target_server = (strlen(gTabs[idx].server) > 0) ? String(gTabs[idx].server) : String(bnc_host);
-            if (current_server != target_server) {
+            char target_server[96]; if(strlen(gTabs[idx].server)>0) safeCopy(target_server,gTabs[idx].server,sizeof(target_server)); else if(bnc_host.length()>0) safeCopy(target_server,bnc_host.c_str(),sizeof(target_server)); else safeCopy(target_server,gCfg.host,sizeof(target_server));
+            if (!eqI(current_server, target_server)) {
                 current_tab_index = idx;
                 ui_needs_redraw = true;
                 return;
@@ -1503,7 +1501,7 @@ void run_bouncer_setup_menu(){
     int cursor = len;
     bool done=false;
     // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE): background frames and instruction text
-    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
     canvas.fillScreen(UI_BG);
     canvas.drawRect(0,0,SCREEN_W,SCREEN_H, UI_FG);
     canvas.setTextSize(1);
@@ -1519,7 +1517,7 @@ void run_bouncer_setup_menu(){
     bool menu_needs_redraw = true;
     while(!done){
       if(menu_needs_redraw){
-        if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+        if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
         // Dark blue input strip box
         canvas.fillRect(2, 28, SCREEN_W-4, 20, 0x001F);
         canvas.drawRect(2, 28, SCREEN_W-4, 20, UI_FG);
@@ -1619,7 +1617,7 @@ void display_network_jump_hud(){
   if(active_networks_count==0 && bnc_host.length()>0){ safeCopy(active_networks[0], bnc_host.c_str(), sizeof(active_networks[0])); active_networks_count=1; }
   else if(active_networks_count==0){ safeCopy(active_networks[0], gCfg.host, sizeof(active_networks[0])); active_networks_count=1; }
   // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE)
-  if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+  if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
   canvas.fillScreen(UI_BG);
   canvas.drawRect(0,0,SCREEN_W,SCREEN_H, 0xFFFF);
   canvas.fillRect(10,10,SCREEN_W-20,SCREEN_H-20, UI_BG);
@@ -2088,7 +2086,7 @@ static void runWifiProvisioning(){
   gInScanner=true;
   // ASYNCHRONOUS ENGINE FORCE & BYPASS GATE: if file system fails to mount, instantly force close
   if(!gSdReady){
-    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
     M5Cardputer.Display.fillScreen(UI_BG);
     if(irc_mutex) xSemaphoreGive(irc_mutex);
     bnc_host = "";
@@ -2104,7 +2102,7 @@ static void runWifiProvisioning(){
   M5Cardputer.update();
   auto ks_entry = M5Cardputer.Keyboard.keysState();
   if(ks_entry.alt && ks_entry.del){
-    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
     M5Cardputer.Display.fillScreen(UI_BG);
     if(irc_mutex) xSemaphoreGive(irc_mutex);
     bnc_host = "";
@@ -2124,7 +2122,7 @@ static void runWifiProvisioning(){
   canvas.print("Scanning 2.4GHz...");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
-  delay(120);
+  vTaskDelay(pdMS_TO_TICKS(120)); yield();
   WiFi.scanNetworks(true, true); // Asynchronous per spec
   // Wait for async scan to complete with yield, not blocking draw
   while(WiFi.scanComplete() == WIFI_SCAN_RUNNING){ vTaskDelay(pdMS_TO_TICKS(10)); M5Cardputer.update(); }
@@ -2154,7 +2152,7 @@ static void runWifiProvisioning(){
         auto ks=M5Cardputer.Keyboard.keysState();
         if(ks.enter) break;
       }
-      delay(20);
+      vTaskDelay(pdMS_TO_TICKS(20)); yield();
     }
     gInScanner=false;
     return;
@@ -2162,7 +2160,7 @@ static void runWifiProvisioning(){
   gScanSel=0; gScanPassLen=0; gScanPass[0]='\0';
   enum State{ PICK, PASS } st=PICK;
   // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE)
-  if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+  if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
   canvas.fillScreen(UI_BG);
   canvas.drawRect(0,0,SCREEN_W,SCREEN_H, UI_FG);
   canvas.setTextSize(1);
@@ -2173,7 +2171,7 @@ static void runWifiProvisioning(){
   bool menu_needs_redraw = true;
   while(true){
     if(menu_needs_redraw){
-      if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+      if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
       if(st==PICK){
         // Dark blue input strip for SSID list highlight
         for(int i=0;i<gScanFound;++i){
@@ -2254,7 +2252,7 @@ static void runWifiProvisioning(){
       if(ks.del && gScanPassLen>0){ gScanPass[--gScanPassLen]='\0'; menu_needs_redraw = true; }
       else if(ks.del && gScanPassLen==0){ st=PICK; menu_needs_redraw = true; }
       if(ks.enter){
-        if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+        if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
         canvas.fillScreen(UI_BG);
         canvas.setTextColor(UI_FG, UI_BG);
         canvas.setCursor(4,40);
@@ -2270,7 +2268,7 @@ static void runWifiProvisioning(){
           safeCopy(gCfg.wifiSSID, gScanSSID[gScanSel], sizeof(gCfg.wifiSSID));
           safeCopy(gCfg.wifiPass, gScanPass, sizeof(gCfg.wifiPass));
           saveConfig();
-          if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+          if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
           canvas.fillScreen(UI_BG);
           canvas.setCursor(4,40);
           canvas.print("Connected! Saved.");
@@ -2280,7 +2278,7 @@ static void runWifiProvisioning(){
           gWifiConnecting=false;
           return;
         } else {
-          if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+          if(irc_mutex) xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50));
           canvas.fillScreen(UI_BG);
           canvas.setCursor(4,40);
           canvas.print("Connect failed");
@@ -2320,12 +2318,12 @@ static void netTask(void* arg){
       if(millis()-lastTry < 3000){ vTaskDelay(pdMS_TO_TICKS(100)); continue; }
       lastTry=millis();
       // SOCKET DRIVER ROUTING: use dynamic bouncer globals instead of hardcoded server strings
-      String _bncHost = bnc_host.length()>0 ? bnc_host : String(gCfg.host);
+      char _bncHost[96]; if(bnc_host.length()>0) safeCopy(_bncHost,bnc_host.c_str(),sizeof(_bncHost)); else safeCopy(_bncHost,gCfg.host,sizeof(_bncHost));
       int _bncPort = bnc_port>0 ? bnc_port : gCfg.port;
-      if(_bncHost.length()==0){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
+      if(_bncHost[0]=='\0'){ vTaskDelay(pdMS_TO_TICKS(500)); continue; }
       bool ok=false;
-      if(gCfg.useTLS){ gSecure.setInsecure(); ok = gSecure.connect(_bncHost.c_str(), _bncPort); }
-      else ok = gPlain.connect(_bncHost.c_str(), _bncPort);
+      if(gCfg.useTLS){ gSecure.setInsecure(); ok = gSecure.connect(_bncHost, _bncPort); }
+      else ok = gPlain.connect(_bncHost, _bncPort);
       if(ok){
         gIrcConnected=true; gIrcRegistered=false; gLastRxMs=millis(); gAwaitPong=false;
         add_message_to_buffer("Connected to bouncer");
@@ -2400,7 +2398,7 @@ static void logTask(void* arg){
     LogEntry e;
     if(gLogQueue.pop(e)){
       // MUTEX GAUNTLET: halt until Core 1 finishes SPI flush before SD open/write
-      if(xSemaphoreTake(irc_mutex, portMAX_DELAY)==pdTRUE){
+      if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
         // Ensure log directories exist inside mutex (SD shares SPI bus)
         char dir[64];
         safeCopy(dir, gCfg.logRoot, sizeof(dir));
@@ -2686,7 +2684,7 @@ static void serviceWifi(){
       WiFi.disconnect(true);
       gWifiConnecting=false;
       logStatus("WiFi fail -> provisioning");
-      delay(300);
+      vTaskDelay(pdMS_TO_TICKS(300)); yield();
       runWifiProvisioning();
     }
   }
@@ -2795,6 +2793,11 @@ void setup(){
     // Wi-Fi client initialization loop - non-blocking, no  else {
     logStatus("Safe Mode: net tasks bypassed");
   }
+  // Restore background tasks with safe_mode guard - queues already init before safe_mode check
+  if (!safe_mode_active) {
+    if (!gNetTaskHandle) xTaskCreatePinnedToCore(netTask, "netTask", 8192, NULL, 1, &gNetTaskHandle, 0);
+    if (!gLogTaskHandle) xTaskCreatePinnedToCore(logTask, "logTask", 4096, NULL, 1, &gLogTaskHandle, 0);
+  }
   // FORCED PRE-FLIGHT SPRITE PUSH: absolute unblocking escape - guarantee terminal grid paints before leaving setup()
   ui_needs_redraw = true;
   draw_chat_view();
@@ -2806,10 +2809,8 @@ void setup(){
 void loop() {
     yield(); 
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
-    if (!safe_mode_active) {
-        // active network streams / socket connections / client statuses / incoming packet buffers guarded
-    }
-    M5Cardputer.update(); 
+    
+    M5Cardputer.update(); // if (!safe_mode_active) { network streams / socket / packet buffers guarded } 
     handle_keyboard_inputs(); 
     
     if (ui_needs_redraw) {
