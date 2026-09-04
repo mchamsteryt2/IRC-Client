@@ -34,8 +34,11 @@ static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
 static constexpr int HEADER_H = 14;
 static constexpr int INPUT_H = 26;
+static constexpr int NAV_H = 10;
+static constexpr int NAV_Y = SCREEN_H - INPUT_H - NAV_H;
 static constexpr int BODY_Y = HEADER_H + 1;
-static constexpr int BODY_H = SCREEN_H - HEADER_H - INPUT_H - 2;
+static constexpr int BODY_H = NAV_Y - BODY_Y - 1;
+static constexpr int INPUT_Y = SCREEN_H - INPUT_H;
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
 static constexpr int ROW_H = CHAR_H + 2;
@@ -665,6 +668,74 @@ class IrcClientApp {
     if (_sdMutex) xSemaphoreGiveRecursive(_sdMutex);
   }
 
+  // Subtle refresh helpers
+  void markAllDirty() { _dirty = true; _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
+  void markHeaderDirty() { _headerDirty = true; }
+  void markBodyDirty() { _bodyDirty = true; }
+  void markInputDirty() { _inputDirty = true; }
+  void markNavDirty() { _navDirty = true; }
+  void drawNavBar();
+
+  // Section navigation (bottom bar): 0=Servers,1=Channels,2=Chats,3=Settings
+  enum SectionId { SEC_SERVERS = 0, SEC_CHANNELS, SEC_CHATS, SEC_SETTINGS, SEC_COUNT };
+  int sectionForTab(int idx) const {
+    if (idx < 0 || idx >= (int)_tabs.size()) return SEC_SERVERS;
+    if (_tabs[idx].type == TabType::Status) return SEC_SERVERS;
+    if (_tabs[idx].type == TabType::Channel) return SEC_CHANNELS;
+    return SEC_CHATS;
+  }
+  int currentSection() const {
+    if (_configOpen) return SEC_SETTINGS;
+    return sectionForTab(_activeTab);
+  }
+  int firstTabInSection(int sec) const {
+    for (int i = 0; i < (int)_tabs.size(); ++i) {
+      if (sectionForTab(i) == sec) return i;
+    }
+    return -1;
+  }
+  bool sectionHasUnread(int sec) const {
+    for (int i = 0; i < (int)_tabs.size(); ++i) if (sectionForTab(i)==sec && _tabs[i].unread) return true;
+    return false;
+  }
+  bool sectionHasMention(int sec) const {
+    for (int i = 0; i < (int)_tabs.size(); ++i) if (sectionForTab(i)==sec && _tabs[i].mention) return true;
+    return false;
+  }
+  int countInSection(int sec) const {
+    int c=0; for (int i=0;i<(int)_tabs.size();++i) if(sectionForTab(i)==sec) ++c; return c;
+  }
+  void switchToSection(int sec) {
+    if (sec < 0) sec = SEC_COUNT-1;
+    if (sec >= SEC_COUNT) sec = 0;
+    // Skip empty channel/chat sections if possible, but allow settings always
+    // Try to find non-empty section in direction if target empty
+    int orig = sec;
+    for (int tries=0; tries<SEC_COUNT; ++tries) {
+      if (sec == SEC_SETTINGS) break;
+      if (firstTabInSection(sec) >= 0 || sec==SEC_SERVERS) break; // servers always has status
+      sec = (sec + 1) % SEC_COUNT;
+      if (sec==orig) break;
+    }
+    if (sec == SEC_SETTINGS) {
+      if (!_configOpen) { openConfigPage(); markAllDirty(); return; }
+      // already in settings
+      markNavDirty(); return;
+    }
+    // Leaving settings
+    if (_configOpen) { closeConfigPage(); }
+    int idx = firstTabInSection(sec);
+    if (idx >= 0) {
+      _activeTab = idx;
+      _tabs[_activeTab].unread=false; _tabs[_activeTab].mention=false; _tabs[_activeTab].scroll=0;
+      markAllDirty(); markStateDirty();
+    } else {
+      // No tabs in section - stay but update nav highlight
+      markNavDirty();
+    }
+  }
+  void cycleSection(int delta) { switchToSection(currentSection()+delta); }
+
  private:
   Config _cfg;
   M5Canvas _frameBuffer;
@@ -678,6 +749,11 @@ class IrcClientApp {
   bool _wifiReady = false;
   bool _sdReady = false;
   bool _dirty = true;
+  // Subtle refresh: per-region dirty flags. _dirty is full redraw.
+  bool _headerDirty = true;
+  bool _bodyDirty = true;
+  bool _inputDirty = true;
+  bool _navDirty = true;
   bool _ircRegistered = false;
   bool _awaitingPong = false;
   String _lastPingToken;
@@ -1158,7 +1234,7 @@ class IrcClientApp {
     if (level != _batteryLevel || chargeState != _batteryChargeState) {
       _batteryLevel = level;
       _batteryChargeState = chargeState;
-      _dirty = true;
+      markHeaderDirty();
     }
   }
 
@@ -1175,7 +1251,7 @@ class IrcClientApp {
     if (!_screenSleeping) return;
     _screenSleeping = false;
     M5Cardputer.Display.wakeup();
-    _dirty = true;
+    markAllDirty();
   }
 
   void recordUserActivity() {
@@ -1558,7 +1634,7 @@ class IrcClientApp {
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
     if (tick != _lastTextScrollTick) {
       _lastTextScrollTick = tick;
-      _dirty = true;
+      markBodyDirty();
     }
   }
 
@@ -2457,9 +2533,12 @@ class IrcClientApp {
         int page = std::max(1, bodyVisibleRows() - 1);
         if (c == ';') { moveConfigSelection(-page); continue; }
         if (c == '.') { moveConfigSelection(page); continue; }
-        if (c == ',') { moveConfigSelection(-page); continue; }
-        if (c == '/') { moveConfigSelection(page); continue; }
+        if (c == ',') { cycleSection(-1); return; }
+        if (c == '/') { cycleSection(1); return; }
       }
+      // Plain ,/ also navigates sections (bottom bar) when not editing
+      if (c == ',' ) { if (!shouldHandleDebouncedActionChar(c)) continue; cycleSection(-1); return; }
+      if (c == '/' ) { if (!shouldHandleDebouncedActionChar(c)) continue; cycleSection(1); return; }
       if (c == '.') moveConfigSelection(1);
       else if (c == ';') moveConfigSelection(-1);
       else if (c == ' ') activateConfigField();
@@ -3770,12 +3849,16 @@ class IrcClientApp {
       tab.scroll += scrollUnitsForLine(tab, line);
       clampTabScroll(tab);
     }
-    if (&tab != &_tabs[_activeTab]) {
+    bool isActive = (&tab == &_tabs[_activeTab]) && !_configOpen && !_channelListOpen;
+    if (!isActive) {
       tab.unread = true;
       if (highlight) tab.mention = true;
+      // Subtle: only nav + header need update for background tab
+      markNavDirty(); markHeaderDirty();
+    } else {
+      markBodyDirty();
     }
     logToSD(tab.name, line.stampLog + " " + line.plain);
-    _dirty = true;
   }
 
   void logStatus(const String& s) {
@@ -4033,7 +4116,7 @@ class IrcClientApp {
   void applyKeyboardScroll(Tab& tab, int delta) {
     tab.scroll = std::max(0, tab.scroll + delta);
     clampTabScroll(tab);
-    _dirty = true;
+    markBodyDirty();
   }
 
   bool handleFnScrollShortcut(char c) {
@@ -4050,14 +4133,21 @@ class IrcClientApp {
         applyKeyboardScroll(tab, -1);
         return true;
       case ',':
-        applyKeyboardScroll(tab, page);
+        // Fn+, = section left (subtle horizontal nav)
+        cycleSection(-1);
         return true;
       case '/':
-        applyKeyboardScroll(tab, -page);
+        cycleSection(1);
         return true;
       default:
         return false;
     }
+  }
+
+  bool handleSectionNavKey(char c, bool fn) {
+    if (c == ',' ) { cycleSection(-1); return true; }
+    if (c == '/' ) { cycleSection(1); return true; }
+    return false;
   }
 
   void handleKeyboard() {
@@ -4071,29 +4161,43 @@ class IrcClientApp {
       if (ks.fn && shouldHandleDebouncedActionChar(c) && handleFnScrollShortcut(c)) {
         continue;
       }
+      // Plain ,/ navigates sections when input empty and not in Fn mode
+      if (!ks.fn && (c == ',' || c == '/') && _input.isEmpty()) {
+        if (!shouldHandleDebouncedActionChar(c)) continue;
+        handleSectionNavKey(c, false);
+        continue;
+      }
       if (c == '`') {
         if (!shouldHandleDebouncedActionChar(c)) continue;
         openChannelListPage(true);
         continue;
       }
       if (c >= 32 || c == '\t') {
-        if (_input.length() < MAX_INPUT_CHARS) _input += c;
+        if (_input.length() < MAX_INPUT_CHARS) { _input += c; markInputDirty(); }
       }
     }
 
     if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs) && !_input.isEmpty()) {
       _input.remove(_input.length() - 1);
+      markInputDirty();
     }
 
     if (shouldHandleDebouncedKey(ks.enter, _lastEnterKeyMs)) {
       submitInput();
+      // submitInput already marks dirty via appendLine
+      markInputDirty();
     }
 
     if (shouldHandleDebouncedKey(ks.tab, _lastTabKeyMs)) {
       cycleTab(1);
     }
 
-    _dirty = true;
+    // Input typing already marked _inputDirty; other changes need full/body
+    if (_inputDirty || _bodyDirty || _headerDirty || _navDirty) {
+      // already marked
+    } else {
+      markInputDirty();
+    }
   }
 
   void handleChannelListKeyboard() {
@@ -4136,6 +4240,19 @@ class IrcClientApp {
     if (shouldHandleDebouncedKey(ks.del, _lastDeleteKeyMs)) moveChannelListSelection(-1);
 
     for (char c : ks.word) {
+      if (ks.fn && (c == ',' || c == '/')) {
+        if (!shouldHandleDebouncedActionChar(c)) continue;
+        if (c == ',') cycleSection(-1); else cycleSection(1);
+        closeChannelListPage();
+        return;
+      }
+      if (!ks.fn && (c == ',' || c == '/')) {
+        if (!shouldHandleDebouncedActionChar(c)) continue;
+        // Plain ,/ also leaves channel list to section nav
+        if (c == ',') cycleSection(-1); else cycleSection(1);
+        closeChannelListPage();
+        return;
+      }
       if (c == '`') {
         if (!shouldHandleDebouncedActionChar(c)) continue;
         closeChannelListPage();
@@ -4582,7 +4699,7 @@ class IrcClientApp {
     _tabs[_activeTab].unread = false;
     _tabs[_activeTab].mention = false;
     _tabs[_activeTab].scroll = 0;
-    _dirty = true;
+    markAllDirty();
     markStateDirty();
   }
 
@@ -4602,20 +4719,27 @@ class IrcClientApp {
   }
 
   void draw() {
-    if (_screenSleeping || !_dirty) return;
-    _dirty = false;
+    if (_screenSleeping) return;
+    bool full = _dirty;
+    if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
+    if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
     auto& gfx = drawTarget();
-    gfx.fillScreen(UI_BG);
+    // Subtle refresh: only redraw dirty regions, no full fillScreen to avoid flicker.
     if (_configOpen) {
       drawConfigPage();
+      drawNavBar();
     } else if (_channelListOpen) {
       drawChannelListPage();
+      drawNavBar();
     } else {
-      drawHeader();
-      drawBody();
-      drawInput();
+      if (_headerDirty) drawHeader();
+      if (_bodyDirty) drawBody();
+      if (_navDirty) drawNavBar();
+      if (_inputDirty) drawInput();
     }
     presentFrame();
+    _dirty = false;
+    _headerDirty = _bodyDirty = _inputDirty = _navDirty = false;
   }
 
   void drawConfigPage() {
@@ -4876,6 +5000,54 @@ class IrcClientApp {
       gfx.drawLine(x + 8, y + 1, x + 6, y + 4, UI_FG);
       gfx.drawLine(x + 6, y + 4, x + 9, y + 4, UI_FG);
       gfx.drawLine(x + 9, y + 4, x + 7, y + 7, UI_FG);
+    }
+  }
+
+  void drawNavBar() {
+    auto& gfx = drawTarget();
+    // Nav bar spans full width at NAV_Y, height NAV_H
+    gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_HEADER);
+    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_DIM);
+    gfx.drawFastHLine(0, NAV_Y + NAV_H, SCREEN_W, UI_DIM);
+    const char* labels[SEC_COUNT] = {"SERVERS", "CHANNELS", "CHATS", "SETTINGS"};
+    int cur = currentSection();
+    int segW = SCREEN_W / SEC_COUNT;
+    for (int i = 0; i < SEC_COUNT; ++i) {
+      int x = i * segW;
+      int w = (i == SEC_COUNT - 1) ? SCREEN_W - x : segW;
+      bool active = (i == cur);
+      uint16_t bg = active ? UI_HILITE_BG : UI_HEADER;
+      uint16_t fg = active ? UI_ACCENT : UI_DIM;
+      // active accent top bar
+      if (active) gfx.fillRect(x, NAV_Y, w, 2, UI_ACCENT);
+      else gfx.fillRect(x, NAV_Y, w, NAV_H, bg);
+      if (active) gfx.fillRect(x, NAV_Y + 2, w, NAV_H - 2, bg);
+      // vertical separators
+      if (i > 0) gfx.drawFastVLine(x, NAV_Y, NAV_H, UI_DIM);
+      // label centered
+      String lbl = labels[i];
+      // Shorten CHANNELS->CHAN if needed but we have 10 chars
+      int lblW = (int)lbl.length() * CHAR_W;
+      int cx = x + (w - lblW) / 2;
+      // unread/mention dot
+      bool mention = sectionHasMention(i);
+      bool unread = sectionHasUnread(i);
+      if (mention) fg = UI_WARN;
+      else if (active) fg = UI_FG;
+      gfx.setTextColor(fg, bg);
+      gfx.setCursor(cx, NAV_Y + 2);
+      gfx.print(lbl);
+      // indicator dot top-right of segment
+      if ((mention || unread) && !active) {
+        int dotX = x + w - 5;
+        int dotY = NAV_Y + 2;
+        gfx.fillCircle(dotX, dotY, 2, mention ? UI_WARN : UI_ACCENT);
+      } else if ((mention || unread) && active) {
+        // dot inside active bg but accent already
+        int dotX = x + w - 5;
+        int dotY = NAV_Y + 2;
+        gfx.fillCircle(dotX, dotY, 2, mention ? UI_WARN : UI_ACCENT);
+      }
     }
   }
 
