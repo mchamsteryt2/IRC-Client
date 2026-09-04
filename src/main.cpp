@@ -5607,10 +5607,13 @@ class SimpleTransport {
     getVisibleBodyRange(tab, start, end, maxLines);
     int by = BODY_Y;
 
-    // No full clear — direct chat uses space-padded overwrite (flicker-free)
-
+    // Efficient: no full clear to avoid flicker — space-padded lines overwrite
+    // Only the leftover bottom strip (if new tab has fewer rows than old) is cleared
+    int bodyEndY = by + BODY_H;
+    int y = by + 1;
     // Empty-state card — ratspeak modern
     if (tab.lines.empty()) {
+      gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
       String hint;
       if (tab.type == TabType::Channel) hint = "No messages — say hi!";
       else if (tab.type == TabType::Query) hint = "No DMs — /query nick";
@@ -5624,11 +5627,12 @@ class SimpleTransport {
       gfx.setCursor(cardX + 8, cardY + 2);
       gfx.print(hint);
     } else {
-      int y = by + 1;
       for (int i = start; i < end && y + ROW_H <= by + BODY_H; ++i) {
         drawMarqueeChatLine(0, y, tab.lines[i], textWidth);
         y += ROW_H;
       }
+      // Clean up any stale wrapped bottom rows from previous channel (only bottom strip)
+      if (y < bodyEndY) gfx.fillRect(0, y, SCREEN_W, bodyEndY - y, UI_BG);
     }
 
     // Scrollbar — 2px modern indicator on body right edge
@@ -5670,7 +5674,9 @@ class SimpleTransport {
     }
     int by = BODY_Y;
 
-    // No full clear — direct
+    // Efficient: no full clear — trailing bottom strip cleared only if needed
+    int bodyEndY = by + BODY_H;
+    int y = by + 1;
 
     if (tab.lines.empty()) {
       String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
@@ -5683,7 +5689,7 @@ class SimpleTransport {
       gfx.setCursor(cardX + 8, cardY + 2);
       gfx.print(hint);
     } else {
-      int y = by + 1;
+      // y already defined as by+1 above, reuse
       int drawnRows = 0;
       int currentRow = 0;
       for (const ChatLine& line : tab.lines) {
@@ -5708,6 +5714,8 @@ class SimpleTransport {
         currentRow += lineRows;
         if (drawnRows >= effectiveVisible || y + ROW_H > by + BODY_H) break;
       }
+      // Clean up stale bottom rows from previous channel's wrapped message
+      if (y < bodyEndY) gfx.fillRect(0, y, SCREEN_W, bodyEndY - y, UI_BG);
     }
     // Scrollbar for wrapped
     if (totalRows > visibleRows) {
