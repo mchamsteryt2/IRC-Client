@@ -15,22 +15,6 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <esp_system.h>
-#if __has_include("USB.h")
-#include "USB.h"
-#endif
-// Avoid macro clash: M5Cardputer and USBHIDKeyboard both define KEY_* macros
-#ifdef KEY_BACKSPACE
-#undef KEY_BACKSPACE
-#endif
-#ifdef KEY_TAB
-#undef KEY_TAB
-#endif
-#if __has_include("USBHIDKeyboard.h")
-#include "USBHIDKeyboard.h"
-#endif
-#if __has_include("esp_psram.h")
-#include "esp_psram.h"
-#endif
 
 static constexpr int SD_SCK = 40;
 static constexpr int SD_MISO = 39;
@@ -670,7 +654,6 @@ class SimpleTransport {
     M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
     pinMode(CONFIG_BUTTON_PIN, INPUT_PULLUP);
     initFrameBuffer();
-    initExternalKeyboard();
     showBootTitle();
 
     initSD();
@@ -928,19 +911,14 @@ class SimpleTransport {
     return freeHeap < MIN_HEAP_BYTES;
   }
   void deduplicateTabs() {
-    // Fix channels stacking: remove duplicate tab names per serverId (case-insensitive), keep first.
     for (size_t i = 0; i < _tabs.size(); ++i) {
       for (size_t j = i + 1; j < _tabs.size(); ) {
         if (equalsIgnoreCase(_tabs[i].name, _tabs[j].name) && _tabs[i].type == _tabs[j].type && _tabs[i].serverId == _tabs[j].serverId) {
-          // Merge lines (keep newer lines) and unread state
           if (_tabs[j].unread) _tabs[i].unread = true;
           if (_tabs[j].mention) _tabs[i].mention = true;
-          // Prefer keeping richer history
           if (_tabs[j].lines.size() > _tabs[i].lines.size()) {
-            // Move extra lines
             for (auto &l : _tabs[j].lines) {
               bool exists = false;
-              // crude dedup by raw+stamp
               for (auto &e : _tabs[i].lines) if (e.raw==l.raw && e.stampLog==l.stampLog) { exists=true; break; }
               if (!exists) _tabs[i].lines.push_back(l);
             }
@@ -950,29 +928,18 @@ class SimpleTransport {
           if ((int)j <= _activeTab && _activeTab>0) --_activeTab;
           markAllDirty();
           markStateDirty();
-        } else {
-          ++j;
-        }
+        } else { ++j; }
       }
     }
   }
   void migrateLegacyTabs() {
-    // Assign legacy tabs with empty serverId to current server
     String cur = currentServerId();
     if (cur.isEmpty()) return;
     bool changed=false;
-    for (auto &t : _tabs) {
-      if (t.serverId.isEmpty()) {
-        // status tabs without serverId become per-server status
-        // Only migrate channels/queries and the first status; leave extra status if multiple
-        t.serverId = cur;
-        changed=true;
-      }
-    }
+    for (auto &tb : _tabs) if (tb.serverId.isEmpty()) { tb.serverId = cur; changed=true; }
     if (changed) { deduplicateTabs(); markStateDirty(); }
   }
   void clearDuplicateChannelLists() {
-    // Ensure channel list is clean on server switch (prevent stacking of stale entries)
     _channelList.clear();
     _channelListSelected=0;
     _channelListScroll=0;
@@ -1101,19 +1068,6 @@ class SimpleTransport {
   SemaphoreHandle_t _sdMutex = nullptr;
   TaskHandle_t _bgTaskHandle = nullptr;
   volatile bool _bgTaskRunning = false;
-
-  // Flicker-free double buffer (PSRAM)
-  lgfx::LGFX_Sprite _fb;
-  bool _fbReady = false;
-
-  // External USB-C keyboard state (host HID)
-  String _extWordBuf;
-  bool _extEnter = false;
-  bool _extDel = false;
-  bool _extTab = false;
-  bool _extFn = false;
-  uint32_t _lastExtPollMs = 0;
-  bool _usbHostStarted = false;
 
   bool _configOpen = false;
   bool _configEditing = false;
@@ -1586,55 +1540,6 @@ class SimpleTransport {
     _screenSleeping = true;
   }
 
-  void initExternalKeyboard() {
-    // USB-C external keyboard (ESP32-S3 USB host HID)
-#if defined(HAS_USB_HOST)
-    if (_usbHostStarted) return;
-    USB.begin();
-#if __has_include("USBHIDKeyboard.h")
-    // If USBHID host keyboard is available, it will feed via USB host stack.
-    // We also poll Serial as fallback for keyboards that present as CDC.
-#endif
-    _usbHostStarted = true;
-    logStatus("USB host started for external keyboard");
-#endif
-    // Also ensure Serial is ready for fallback external input
-    // Some USB keyboards via adapter appear as Serial input at 115200
-  }
-
-  void pollExternalKeyboard() {
-    // Poll interval to avoid spamming
-    uint32_t now = millis();
-    if (now - _lastExtPollMs < 20) return;
-    _lastExtPollMs = now;
-#if defined(HAS_USB_HOST)
-    // TinyUSB host will generate HID reports via callbacks; we poll Serial fallback here.
-#endif
-    // Fallback: read from Serial (USB CDC) — useful for external keyboards that send ASCII via serial bridge
-    while (Serial.available()) {
-      char c = (char)Serial.read();
-      if (c == '\r') continue;
-      if (c == '\n') { _extEnter = true; continue; }
-      if (c == 127 || c == 8) { _extDel = true; continue; }
-      if (c == 9) { _extTab = true; continue; }
-      if (c >= 32 && c < 127) { _extWordBuf += c; if (_extWordBuf.length()> 24) { _extWordBuf.remove(0,1); } }
-    }
-    // Also poll Serial1 if wired external keyboard via Grove/UART is connected
-    // (Cardputer exposes Grove port)
-    // Note: Serial1 may not be initialized; check available without init is safe (returns 0)
-  }
-
-  bool consumeExternalInput(String &wordOut, bool &enterOut, bool &delOut, bool &tabOut) {
-    pollExternalKeyboard();
-    bool has = false;
-    wordOut = _extWordBuf; _extWordBuf = "";
-    enterOut = _extEnter; _extEnter = false;
-    delOut = _extDel; _extDel = false;
-    tabOut = _extTab; _extTab = false;
-    has = !wordOut.isEmpty() || enterOut || delOut || tabOut;
-    return has;
-  }
-
   static String currentDateStamp() {
     time_t now = time(nullptr);
     struct tm tmNow;
@@ -1854,35 +1759,7 @@ class SimpleTransport {
   }
 
   void initFrameBuffer() {
-    // Cardputer ADV StampS3 has no PSRAM (ESP32-S3FN8, 320KB SRAM) — but a
-    // 240x135x2=63KB sprite still fits in internal RAM (~20% of 320KB).
-    // Prefer PSRAM if present, otherwise try internal RAM if heap allows.
-    // Fallback to direct dirty-region + clip if allocation fails.
-    if (_fbReady) return;
-    bool hasPsram = false;
-#if defined(BOARD_HAS_PSRAM) || defined(CONFIG_SPIRAM_SUPPORT)
-    hasPsram = psramFound() && ESP.getPsramSize() >= 64000;
-#else
-    hasPsram = ESP.getPsramSize() >= 64000;
-#endif
-    // Only use PSRAM flag when PSRAM is actually there; otherwise allocate in SRAM.
-    if (hasPsram) _fb.setPsram(true);
-    else {
-      // Avoid starving heap: need ~70KB free (sprite + overhead) on top of MIN_HEAP
-      if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 75000)) {
-        _fbReady = false;
-        return;
-      }
-    }
-    _fb.setColorDepth(16);
-    if (_fb.createSprite(SCREEN_W, SCREEN_H)) {
-      _fbReady = true;
-      _fb.fillScreen(UI_BG);
-      _fb.setTextSize(1);
-      _fb.setTextWrap(false);
-    } else {
-      _fbReady = false;
-    }
+    // Framebuffer removed to save 65KB RAM on 512KB device — direct draw is used.
   }
 
   void showBootTitle() {
@@ -1944,24 +1821,16 @@ class SimpleTransport {
   }
 
   lgfx::LovyanGFX& drawTarget() {
-    if (_fbReady) return _fb;
     return static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
   }
 
   void presentFrame() {
-    if (_fbReady) {
-      M5Cardputer.Display.startWrite();
-      _fb.pushSprite(0, 0);
-      M5Cardputer.Display.endWrite();
-    }
+    // No-op — direct draw, no sprite to push (saves RAM, subtle partial redraw handles flicker)
   }
 
   void serviceTextScroll() {
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (useWrappedText()) return;
-    // On no-PSRAM ADV, marquee requires full body redraw every 350ms → visible flicker on ST7789 direct draw.
-    // Prefer ellipsis truncation instead of scrolling when no sprite is available.
-    if (!_fbReady) return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -2851,29 +2720,6 @@ class SimpleTransport {
   }
 
   void handleConfigKeyboard() {
-    // External keyboard passthrough: treat external enter/del/tab as config navigation
-    String ew; bool ee=false, ed=false, et=false;
-    if (consumeExternalInput(ew, ee, ed, et)) {
-      recordUserActivity();
-      if (_configEditing) {
-        for (char c : ew) if (c>=32 && c!='\t' && _configEditBuffer.length()<MAX_INPUT_CHARS) _configEditBuffer+=c;
-        if (ed && !_configEditBuffer.isEmpty()) _configEditBuffer.remove(_configEditBuffer.length()-1);
-        if (ee) { setConfigFieldValue(_configSelected,_configEditBuffer); _configEditing=false; _configEditBuffer=""; }
-        if (et) { setConfigFieldValue(_configSelected,_configEditBuffer); _configEditing=false; _configEditBuffer=""; moveConfigSelection(1); }
-        _dirty=true; return;
-      }
-      if (et) moveConfigSelection(1);
-      if (ed) moveConfigSelection(-1);
-      if (ee) activateConfigField();
-      for (char c: ew) {
-        if (c=='.') moveConfigSelection(1);
-        else if (c==';') moveConfigSelection(-1);
-        else if (c==' ') activateConfigField();
-        else if (c==',' ) cycleSection(-1);
-        else if (c=='/' ) cycleSection(1);
-      }
-      return;
-    }
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
     recordUserActivity();
@@ -3032,14 +2878,12 @@ class SimpleTransport {
       String key = trimCopy(line.substring(0, eq));
       String value = trimCopy(line.substring(eq + 1));
       key.toLowerCase();
-
       auto createTabWithServer = [&](const String& raw, TabType tp){
         String sid = "";
         String name = raw;
         int pipe = raw.indexOf('|');
         if (pipe >= 0) { sid = raw.substring(0,pipe); name = raw.substring(pipe+1); }
         if (name.isEmpty()) return;
-        // Temporarily switch server context to create tab on correct server
         String savedSid = currentServerId();
         bool needSwitch = !sid.isEmpty() && sid != savedSid;
         int savedIdx = _activeServerIdx;
@@ -3060,7 +2904,6 @@ class SimpleTransport {
           else getOrCreateTab(value, TabType::Query);
         }
       } else if (key == "active") {
-        // new format: server|tab
         int pipe = value.indexOf('|');
         if (pipe>=0) _desiredActiveTabName = value.substring(pipe+1);
         else _desiredActiveTabName = value;
@@ -3091,16 +2934,11 @@ class SimpleTransport {
     if (!_stateDirty || !_sdReady || !_cfg.persistTabs) return;
     if (millis() - _lastStateDirtyMs < STATE_SAVE_DEBOUNCE_MS) return;
     if (!takeSdLock(50)) return;
-
-    // Deduplicate before persisting to prevent stacking on disk
-    // Must release lock for deduplicate (it may call markStateDirty) — do snapshot dedup inline
     {
-      // inline dedup without calling full method to avoid lock recursion issues
       for (size_t i=0;i<_tabs.size();++i) for (size_t j=i+1;j<_tabs.size();) {
         if (equalsIgnoreCase(_tabs[i].name,_tabs[j].name) && _tabs[i].type==_tabs[j].type && _tabs[i].serverId==_tabs[j].serverId) _tabs.erase(_tabs.begin()+j); else ++j;
       }
     }
-    // Snapshot state under lock to keep file consistent
     String activeName = _tabs[_activeTab].name;
     String activeServer = currentServerId();
     bool nickPane = _cfg.nickPaneEnabled;
@@ -4211,15 +4049,13 @@ class SimpleTransport {
       if (!equalsIgnoreCase(tab.name, name)) continue;
       if (tab.type == TabType::Status) {
         if (tab.serverId == sid) return &tab;
-        // legacy fallback: empty serverId matches any if no per-server status exists
         if (tab.serverId.isEmpty()) {
           bool hasPerServer = false;
-          for (auto &t : _tabs) if (t.type==TabType::Status && t.serverId==sid) { hasPerServer=true; break; }
+          for (auto &x : _tabs) if (x.type==TabType::Status && x.serverId==sid) { hasPerServer=true; break; }
           if (!hasPerServer && equalsIgnoreCase(name, "status")) return &tab;
         }
         continue;
       }
-      // Strict per-server isolation; legacy empty tabs are migrated, not matched cross-server
       if (tab.serverId == sid) return &tab;
     }
     return nullptr;
@@ -4231,30 +4067,24 @@ class SimpleTransport {
 
   Tab& getOrCreateTab(const String& name, TabType type) {
     if (Tab* existing = findTab(name)) {
-      // If type mismatches (e.g., promoting query to channel), upgrade
       if (existing->type != type && type == TabType::Channel) existing->type = type;
       return *existing;
     }
-    // RAM guard: if heap low, try to pause LRU network first
     if (isHeapLow()) checkRamAndPauseIfNeeded();
     if (_tabs.size() >= MAX_TABS) {
-      // Try to pause oldest background tab to make room
       if (isHeapLow()) {
         for (int i = (int)_tabs.size()-1; i>=0; --i) if (i != _activeTab && _tabs[i].lines.size()>20) { _tabs[i].lines.clear(); _tabs[i].lines.shrink_to_fit(); break; }
       }
       if (_tabs.size() >= MAX_TABS) return statusTab();
     }
-    // Prevent duplicate creation race: re-check after RAM handling
     if (Tab* existing2 = findTab(name)) return *existing2;
     Tab tab;
     tab.name = name;
     tab.type = type;
     tab.serverId = currentServerId();
-    // Enforce per-server tab limit
     int perServerCount = 0; for (auto &t: _tabs) if (t.serverId == tab.serverId) ++perServerCount;
     if (perServerCount >= (int)MAX_TABS_PER_SERVER) return statusTab();
     _tabs.push_back(tab);
-    // Immediately deduplicate in case of stale duplicates
     deduplicateTabs();
     _dirty = true;
     markStateDirty();
@@ -4672,29 +4502,11 @@ class SimpleTransport {
   }
 
   void handleKeyboard() {
-    // Merge external USB-C keyboard input with internal Cardputer keyboard
-    String extWord; bool extEnter=false, extDel=false, extTab=false;
-    bool hasExt = consumeExternalInput(extWord, extEnter, extDel, extTab);
-    bool internalChange = M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed();
-    if (!internalChange && !hasExt) return;
-    if (hasExt) recordUserActivity();
-    else recordUserActivity();
+    if (!M5Cardputer.Keyboard.isChange()) return;
+    if (!M5Cardputer.Keyboard.isPressed()) return;
+    recordUserActivity();
 
     auto ks = M5Cardputer.Keyboard.keysState();
-    // Inject external word chars into ks.word equivalent
-    if (hasExt && !extWord.isEmpty()) {
-      for (char c : extWord) {
-        if (c >= 32 || c == '\t') {
-          if (_input.length() < MAX_INPUT_CHARS) { _input += c; markInputDirty(); }
-        }
-      }
-    }
-    if (extDel) {
-      if (!_input.isEmpty()) { _input.remove(_input.length()-1); markInputDirty(); }
-    }
-    if (extEnter) { submitInput(); markInputDirty(); return; }
-    if (extTab) { if (!tryAutocompleteInput()) cycleTab(1); return; }
-    if (!internalChange) return;
 
     for (char c : ks.word) {
       if (ks.fn && shouldHandleDebouncedActionChar(c) && handleFnScrollShortcut(c)) {
@@ -4740,25 +4552,6 @@ class SimpleTransport {
   }
 
   void handleChannelListKeyboard() {
-    String ew; bool ee=false, ed=false, et=false;
-    if (consumeExternalInput(ew, ee, ed, et)) {
-      recordUserActivity();
-      if (_channelListFilterPrompt) {
-        for (char c: ew) if (c>=32 && c!='\t' && _channelListFilterBuffer.length()<MAX_INPUT_CHARS) _channelListFilterBuffer+=c;
-        if (ed && !_channelListFilterBuffer.isEmpty()) _channelListFilterBuffer.remove(_channelListFilterBuffer.length()-1);
-        if (ee) applyChannelListFilterAndRequest(true);
-        _dirty=true; return;
-      }
-      if (ee) { joinSelectedChannelFromList(); return; }
-      if (et) moveChannelListSelection(1);
-      if (ed) moveChannelListSelection(-1);
-      for (char c: ew) {
-        if (c=='`') { closeChannelListPage(); return; }
-        if (c=='.') moveChannelListSelection(1);
-        else if (c==';') moveChannelListSelection(-1);
-      }
-      return;
-    }
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
     recordUserActivity();
@@ -5282,46 +5075,25 @@ class SimpleTransport {
     if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
     auto& gfx = drawTarget();
-    if (_fbReady) {
-      // Sprite mode: full compositing then single push — no visible tearing
-      if (_configOpen) {
-        drawConfigPage();
-        drawNavBar();
-      } else if (_serverListOpen) {
-        drawServerListPage();
-        drawNavBar();
-      } else if (_channelListOpen) {
-        drawChannelListPage();
-        drawNavBar();
-      } else {
-        // Always composite full frame to sprite to avoid stale pixels
-        drawHeader();
-        drawBody();
-        drawNavBar();
-        drawInput();
-      }
-      presentFrame();
+    // Even less noticeable: batch SPI transaction and only redraw dirty regions
+    gfx.startWrite();
+    if (_configOpen) {
+      drawConfigPage();
+      drawNavBar();
+    } else if (_serverListOpen) {
+      drawServerListPage();
+      drawNavBar();
+    } else if (_channelListOpen) {
+      drawChannelListPage();
+      drawNavBar();
     } else {
-      // Direct draw path (no PSRAM): dirty-region + clip to minimize flicker on ST7789
-      gfx.startWrite();
-      if (_configOpen) {
-        drawConfigPage();
-        drawNavBar();
-      } else if (_serverListOpen) {
-        drawServerListPage();
-        drawNavBar();
-      } else if (_channelListOpen) {
-        drawChannelListPage();
-        drawNavBar();
-      } else {
-        if (_headerDirty) drawHeader();
-        if (_bodyDirty) drawBody();
-        if (_navDirty) drawNavBar();
-        if (_inputDirty) drawInput();
-      }
-      gfx.endWrite();
-      presentFrame();
+      if (_headerDirty) drawHeader();
+      if (_bodyDirty) drawBody();
+      if (_navDirty) drawNavBar();
+      if (_inputDirty) drawInput();
     }
+    gfx.endWrite();
+    presentFrame();
     _dirty = false;
     _headerDirty = _bodyDirty = _inputDirty = _navDirty = false;
   }
@@ -5671,7 +5443,6 @@ class SimpleTransport {
     getVisibleBodyRange(tab, start, end, maxLines);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
-    // Clip to body rect so no pixel spills under navbar/input
     gfx.setClipRect(0, BODY_Y, SCREEN_W, BODY_H);
 
     // Empty-state card — ratspeak modern
@@ -5747,11 +5518,9 @@ class SimpleTransport {
         int skipRows = std::max(0, startRow - currentRow);
         int rowsLeft = visibleRows - drawnRows;
         if (rowsLeft <= 0) break;
-        // Strict clip: don't start a row that would spill under navbar
         if (y + ROW_H > BODY_Y + BODY_H) break;
-        // Adjust rowsLeft to remaining drawable rows based on Y clipping
         int maxDrawableRows = (BODY_Y + BODY_H - y) / ROW_H;
-        if (maxDrawableRows <= 0) break;
+        if (maxDrawableRows <=0) break;
         rowsLeft = std::min(rowsLeft, maxDrawableRows);
         int usedRows = drawWrappedChatLine(0, y, line, textWidth, skipRows, rowsLeft);
         drawnRows += usedRows;
@@ -6252,7 +6021,6 @@ void IrcClientApp::resumeServer(int idx) {
 }
 void IrcClientApp::switchServer(int idx) {
   if (idx<0 || idx>=(int)_servers.size() || idx==_activeServerIdx) return;
-  // Save current server's tabs if needed (already in RAM) — sync config
   syncConfigToActiveServer();
   saveServers();
   deduplicateTabs();
@@ -6341,32 +6109,6 @@ void IrcClientApp::drawServerListPage() {
   gfx.setCursor(2, inputY+13); gfx.print(String("heap ") + String(ESP.getFreeHeap()/1024) + "k  tabs " + String(_tabs.size()));
 }
 void IrcClientApp::handleServerListKeyboard() {
-  String ew; bool ee=false, ed=false, et=false;
-  if (consumeExternalInput(ew, ee, ed, et)) {
-    recordUserActivity();
-    if (ee) {
-      if (!_servers.empty() && _serverListSelected>=0 && _serverListSelected<(int)_servers.size()) {
-        if (_servers[_serverListSelected].paused) resumeServer(_serverListSelected);
-        switchServer(_serverListSelected);
-        closeServerList();
-      }
-      return;
-    }
-    if (ed) {
-      if (!_servers.empty() && _serverListSelected>=0 && _serverListSelected<(int)_servers.size()) {
-        if (_servers[_serverListSelected].paused) resumeServer(_serverListSelected);
-        else pauseServer(_serverListSelected);
-      }
-      return;
-    }
-    if (et) { _serverListSelected = (_serverListSelected+1)%std::max(1,(int)_servers.size()); markBodyDirty(); return; }
-    for (char c: ew) {
-      if (c=='`') { closeServerList(); return; }
-      if (c=='.') { _serverListSelected = std::min((int)_servers.size()-1, _serverListSelected+1); markBodyDirty(); }
-      else if (c==';') { _serverListSelected = std::max(0, _serverListSelected-1); markBodyDirty(); }
-    }
-    return;
-  }
   if (!M5Cardputer.Keyboard.isChange()) return;
   if (!M5Cardputer.Keyboard.isPressed()) return;
   recordUserActivity();
