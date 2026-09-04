@@ -1078,17 +1078,54 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
+  // Short critical section: copy shared tab data under mutex, then release before drawing
+  Tab* tabCopy = nullptr;
+  int totalCopy=0, visCopy=0, startLogicalCopy=0, endLogicalCopy=0;
+  ChatLine localLines[12];
+  int localCount=0;
+  if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10))==pdTRUE){
+    Tab* t = activeTab();
+    tabCopy = t;
+    if(t){
+      totalCopy = t->count;
+      visCopy = CHAT_ROWS;
+      startLogicalCopy = totalCopy - visCopy - t->scroll;
+      if(startLogicalCopy<0) startLogicalCopy=0;
+      endLogicalCopy = startLogicalCopy + visCopy;
+      if(endLogicalCopy>totalCopy) endLogicalCopy=totalCopy;
+      for(int i=startLogicalCopy; i<endLogicalCopy && localCount<12; ++i){
+        const ChatLine* cl = ringAt(t,i);
+        if(cl) localLines[localCount++] = *cl;
+      }
+    }
+    xSemaphoreGive(irc_mutex);
+  } else {
+    Tab* t = activeTab();
+    tabCopy = t;
+    if(t){
+      totalCopy = t->count;
+      visCopy = CHAT_ROWS;
+      startLogicalCopy = totalCopy - visCopy - t->scroll;
+      if(startLogicalCopy<0) startLogicalCopy=0;
+      endLogicalCopy = startLogicalCopy + visCopy;
+      if(endLogicalCopy>totalCopy) endLogicalCopy=totalCopy;
+      for(int i=startLogicalCopy; i<endLogicalCopy && localCount<12; ++i){
+        const ChatLine* cl = ringAt(t,i);
+        if(cl) localLines[localCount++] = *cl;
+      }
+    }
+  }
   // STEP A (THE LOGS BUFFER): draw strictly within 109px canvas sprite instance
   canvas.fillSprite(0x0000);
   canvas.setTextSize(1);
-  Tab* tab=activeTab();
+  Tab* tab=tabCopy;
   if(tab){
-    ensureTabLayout(tab);
-    int total=tab->count, vis=CHAT_ROWS, startLogical=total-vis-tab->scroll;
+    // Use local copy for layout, no mutex held during rendering
+    int total=totalCopy, vis=visCopy, startLogical=startLogicalCopy;
     if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
-    int y=1;
-    for(int li=startLogical; li<endLogical; ++li){
-      const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
+        int y=1;
+  for(int li=0; li<localCount; ++li){
+    const ChatLine* cl=&localLines[li]; if(!cl) continue;; if(!cl) continue;
       canvas.setTextColor(0x5AEB, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
       canvas.drawFastVLine(64, y, ROW_H, 0x5AEB);
       char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
@@ -2673,6 +2710,8 @@ void setup(){
 // Loop - Core 1 graphics/keyboard, protected shared vars via mutex
 // ---------------------------------------------------------------------------
 void loop(){
+  yield();
+  // ISOLATE KEYBOARD SCANNERS: ensure every pass unhindered by socket states
   M5Cardputer.update();
   handle_keyboard_inputs();
   serviceKeyboard();
@@ -2705,15 +2744,9 @@ void loop(){
     if(gInScanner){
       // provision draws itself
     } else {
-      // Single unified draw - draw_chat_view handles Steps A,B,C with zero flicker and single push
-      if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
-        draw_chat_view();
-        xSemaphoreGive(irc_mutex);
-      } else {
-        draw_chat_view();
-      }
+      draw_chat_view();
     }
   }
-  delay(5);
+  vTaskDelay(pdMS_TO_TICKS(10));
 }
 
