@@ -1082,6 +1082,15 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
+  if (gTabCount == 0 || strlen(gTabs[current_tab_index].name) == 0) {
+      canvas.fillSprite(0x0000);
+      canvas.setTextColor(0xFD20);
+      canvas.setCursor(10, 45);
+      canvas.print("SAFE MODE TERMINAL ACTIVE");
+      canvas.pushSprite(0, 12);
+      ui_needs_redraw = false;
+      return;
+  }
   // Safe Mode: bypass active network streams / socket connections / client statuses / packet buffers
   if (!safe_mode_active) {
     // guard active network streams / WiFiClientSecure / gIrcConnected / gRxAccum packet buffers
@@ -1342,7 +1351,9 @@ void handle_keyboard_inputs() {
     if (!M5Cardputer.Keyboard.isPressed()) return;
     auto status = M5Cardputer.Keyboard.keysState();
     auto st = status;
-    // 1. CHANNEL STEPPING (ALT + ARROWS) - physical arrow keys
+    if (safe_mode_active) { /* Only permit basic character typing or mute toggling */ }
+    // 1. CHANNEL STEPPING (ALT + ARROWS) - physical arrow keys - bypassed in safe mode
+    if (!safe_mode_active) {
     if (status.alt && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) {
         int total_tabs = gTabCount;
         if (total_tabs > 0) {
@@ -1393,6 +1404,7 @@ void handle_keyboard_inputs() {
         }
         return;
     }
+    } // end safe_mode guard for advanced macros
     // HIGH-PRIORITY: Fn block - remaining shortcuts (server skip removed, now handled via Fn+Arrows)
     if(st.fn){
         for(char c : st.word){
@@ -2702,14 +2714,28 @@ void setup(){
   // Sample the G0 button state instantly on this boot pass
   if (digitalRead(0) == LOW) { 
       Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
-      add_message_to_buffer("System", "Safe Mode Active: Network tasks bypassed.", 0xFD20);
-      xSemaphoreGive(irc_mutex);
       safe_mode_active = true;
       gSafeBoot = true;
+      gTabCount = 1;
+      current_tab_index = 0;
+      strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
+      gTabs[0].name[sizeof(gTabs[0].name)-1]='\0';
+      strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
+      gTabs[0].server[sizeof(gTabs[0].server)-1]='\0';
+      add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
+      xSemaphoreGive(irc_mutex);
   } else {
       Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
       safe_mode_active = false;
       gSafeBoot = false;
+  }
+  if (safe_mode_active) {
+      gTabCount = 1;
+      current_tab_index = 0;
+      strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
+      strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
+      add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
+      xSemaphoreGive(irc_mutex); // Force release the initialization lock
   }
   // Execution MUST flow through cleanly past this block immediately!
 
