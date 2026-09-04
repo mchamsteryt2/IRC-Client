@@ -75,9 +75,6 @@ static constexpr const char* APP_VERSION = "0.3";
 static constexpr uint16_t DEFAULT_SCREEN_TIMEOUT_SEC = 10;
 static constexpr uint8_t DEFAULT_SCREEN_BRIGHTNESS = 10;
 
-extern const uint8_t title_boot_jpg_start[] asm("_binary_media_title_boot_jpg_start");
-extern const uint8_t title_boot_jpg_end[] asm("_binary_media_title_boot_jpg_end");
-
 enum class ProxyType {
   None,
   Socks5,
@@ -1434,22 +1431,113 @@ class IrcClientApp {
 
   void showBootTitle() {
     auto& gfx = drawTarget();
-    size_t titleLen = static_cast<size_t>(title_boot_jpg_end - title_boot_jpg_start);
-    gfx.fillScreen(UI_BG);
-    if (titleLen > 0) {
-      gfx.drawJpg(title_boot_jpg_start, titleLen, 0, 0);
-    } else {
-      gfx.setTextColor(UI_FG, UI_BG);
-      gfx.setCursor(8, 20);
-      gfx.println(String(APP_NAME) + " v" + APP_VERSION);
-    }
-    presentFrame();
-
     uint32_t start = millis();
+    // Procedural splash - no embedded JPG, saves flash and draws crisp at any rotation.
     while (millis() - start < TITLE_SCREEN_MS) {
+      float progress = static_cast<float>(millis() - start) / static_cast<float>(TITLE_SCREEN_MS);
+      if (progress > 1.0f) progress = 1.0f;
+
+      gfx.fillScreen(UI_BG);
+      // Top accent bar
+      gfx.fillRect(0, 0, SCREEN_W, 3, UI_ACCENT);
+      // Outer hairline border
+      gfx.drawRect(0, 0, SCREEN_W, SCREEN_H, UI_DIM);
+
+      // Center card background
+      gfx.fillRoundRect(10, 10, SCREEN_W - 20, SCREEN_H - 20, 6, UI_HEADER);
+      gfx.drawRoundRect(10, 10, SCREEN_W - 20, SCREEN_H - 20, 6, UI_DIM);
+      gfx.fillRect(11, 10, SCREEN_W - 22, 3, UI_ACCENT);
+
+      // Chat bubble icon (two overlapping bubbles for IRC vibe)
+      const int bubbleX = 22;
+      const int bubbleY = 22;
+      // Shadow
+      gfx.fillRoundRect(bubbleX + 1, bubbleY + 1, 40, 26, 4, UI_BG);
+      // Back bubble
+      gfx.fillRoundRect(bubbleX + 10, bubbleY + 6, 36, 22, 4, UI_DIM);
+      gfx.fillTriangle(bubbleX + 16, bubbleY + 26, bubbleX + 22, bubbleY + 26, bubbleX + 16, bubbleY + 32, UI_DIM);
+      // Front bubble
+      gfx.fillRoundRect(bubbleX, bubbleY, 36, 22, 4, UI_BG);
+      gfx.drawRoundRect(bubbleX, bubbleY, 36, 22, 4, UI_ACCENT);
+      gfx.fillTriangle(bubbleX + 8, bubbleY + 20, bubbleX + 14, bubbleY + 20, bubbleX + 8, bubbleY + 26, UI_BG);
+      gfx.drawLine(bubbleX + 8, bubbleY + 20, bubbleX + 8, bubbleY + 26, UI_ACCENT);
+      // Hash inside bubble
+      gfx.setTextSize(1);
+      gfx.setTextColor(UI_ACCENT, UI_BG);
+      gfx.setCursor(bubbleX + 12, bubbleY + 7);
+      gfx.print("#");
+
+      // Title - Cardputer (small) + IRC (large accent)
+      gfx.setTextSize(1);
+      gfx.setTextColor(UI_DIM, UI_HEADER);
+      gfx.setCursor(72, 22);
+      gfx.print("M5STACK  CARDPUTER");
+
+      gfx.setTextSize(2);
+      gfx.setTextColor(UI_FG, UI_HEADER);
+      gfx.setCursor(72, 34);
+      gfx.print("Cardputer");
+
+      gfx.setTextColor(UI_ACCENT, UI_HEADER);
+      // Bold trick: draw twice with 1px offset
+      gfx.setCursor(72 + 9 * 12, 34);
+      gfx.print("IRC");
+      gfx.setCursor(72 + 9 * 12 + 1, 34);
+      gfx.print("IRC");
+
+      gfx.setTextSize(1);
+      gfx.setTextColor(UI_DIM, UI_HEADER);
+      gfx.setCursor(72, 54);
+      gfx.print(String("v") + APP_VERSION + "  compact  secure  portable");
+
+      // Divider
+      gfx.drawFastHLine(22, 70, SCREEN_W - 44, UI_DIM);
+      // Feature chips
+      gfx.setTextColor(UI_FG, UI_HEADER);
+      gfx.setCursor(22, 78);
+      gfx.print("TLS");
+      gfx.fillCircle(44, 81, 1, UI_DIM);
+      gfx.setCursor(50, 78);
+      gfx.print("Soju");
+      gfx.fillCircle(78, 81, 1, UI_DIM);
+      gfx.setCursor(84, 78);
+      gfx.print("Socks5");
+      gfx.fillCircle(122, 81, 1, UI_DIM);
+      gfx.setCursor(128, 78);
+      gfx.print("IRCv3");
+
+      // Progress bar
+      const int barX = 22;
+      const int barY = 96;
+      const int barW = SCREEN_W - 44;
+      const int barH = 6;
+      gfx.drawRoundRect(barX, barY, barW, barH, 3, UI_DIM);
+      int fillW = static_cast<int>((barW - 4) * progress);
+      if (fillW > 0) {
+        gfx.fillRoundRect(barX + 2, barY + 2, fillW, barH - 4, 2, UI_ACCENT);
+      }
+      // Progress label
+      gfx.setTextColor(UI_DIM, UI_HEADER);
+      gfx.setCursor(22, 106);
+      if (progress < 0.33f) gfx.print("initializing display...");
+      else if (progress < 0.66f) gfx.print("checking SD  /irc/config.txt...");
+      else if (progress < 0.92f) gfx.print("starting IRC session...");
+      else gfx.print("ready");
+
+      // Version dots
+      int dots = (millis() / 250) % 4;
+      String dotStr;
+      for (int i = 0; i < dots; ++i) dotStr += ".";
+      gfx.setCursor(SCREEN_W - 44, 106);
+      gfx.print(dotStr + "   ");
+
+      presentFrame();
       M5Cardputer.update();
-      delay(5);
+      delay(16); // ~60fps
     }
+    // Reset text size for rest of UI
+    M5Cardputer.Display.setTextSize(1);
+    if (_useFrameBuffer) _frameBuffer.setTextSize(1);
   }
 
   lgfx::LovyanGFX& drawTarget() {
