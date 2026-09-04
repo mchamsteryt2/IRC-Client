@@ -1777,14 +1777,26 @@ class SimpleTransport {
 
   void initFrameBuffer() {
     if (_spritesReady) return;
-    // Zone sprites — 3 small sprites ~10KB total @8-bit, safe on 512KB SRAM no-PSRAM
-    // Never allocate full 240x135@16 (64.8KB) — triggers heap panic during WiFi init
-    // Use 8-bit (332) for zones: black(0x0000) and cyan(0x07FF) map cleanly, halves RAM
+    // ADV has NO PSRAM (all versions) — 512KB internal SRAM only
+    // Full 240x135@16=64.8KB must never be allocated (heap panic).
+    // Zone sprites 240x12/14/16 @8-bit ~10KB are safe only on PSRAM boards;
+    // on ADV we keep direct rendering with RatSpeak colors and space-padded overwrite.
+    // This matches the 512KB no-PSRAM constraint while preserving flicker mitigation
+    // via no-clear direct body and TAB_H/INPUT_H zone layout.
+    bool hasPsram = false;
+#if defined(CONFIG_SPIRAM_SUPPORT)
+    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
+#else
+    hasPsram = ESP.getPsramSize() >= 70000;
+#endif
+    if (!hasPsram) {
+      // No PSRAM on any Cardputer-Adv — stay direct, high-contrast cyan on black still applies
+      _spritesReady = false;
+      return;
+    }
     auto initSprite = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
-      // Require ample heap before WiFi (needs ~40KB) — abort if low
-      if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 80000)) return false;
-      spr.setPsram(false);
-      spr.setColorDepth(8);
+      spr.setPsram(true);
+      spr.setColorDepth(16);
       spr.setTextSize(1);
       spr.setTextWrap(false);
       if (!spr.createSprite(w, h)) return false;
@@ -1797,7 +1809,6 @@ class SimpleTransport {
     ok &= initSprite(_inputSprite, SCREEN_W, INPUT_H);
     _spritesReady = ok;
     if (!ok) {
-      // Clean up partial allocs to avoid fragmentation
       if (_topBarSprite.width() > 0) _topBarSprite.deleteSprite();
       if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
       if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
