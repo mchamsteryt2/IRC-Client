@@ -968,22 +968,34 @@ class SimpleTransport {
 
   // Rule 1: Comprehensive channel/tab clearing for server switch
   void clearChannelTabsComprehensive(const String& targetServerId) {
-    // Completely empty active channels + visual Tab metadata for target server
-    // before it repopulates — prevents stacking on every switch
+    // Spec: vector holding active channels + visual Tab metadata completely emptied
+    // before new server populates — prevents any stacking on every switch.
+    // We clear ALL Channel/Query tabs (not just per-server) to guarantee no stale stacking,
+    // keeping only Status tabs (one per server) for clean ribbon.
+    // Also handle legacy empty serverId tabs.
+    int cleared = 0;
     for (int i = (int)_tabs.size() - 1; i >= 0; --i) {
       if (_tabs[i].type == TabType::Channel || _tabs[i].type == TabType::Query) {
-        // If target specified, only clear that server's tabs; else clear all non-status
-        if (targetServerId.isEmpty() || _tabs[i].serverId == targetServerId) {
-          bool isActiveTab = (i == _activeTab);
-          _tabs.erase(_tabs.begin() + i);
-          if (isActiveTab) _activeTab = 0;
-          else if (i < _activeTab) --_activeTab;
-        }
+        // Completely empty — ignore targetServerId, clear all Channel/Query
+        // (previous per-server clear missed empty/legacy and case mismatches)
+        bool isActiveTab = (i == _activeTab);
+        _tabs.erase(_tabs.begin() + i);
+        ++cleared;
+        if (isActiveTab) _activeTab = 0;
+        else if (i < _activeTab) --_activeTab;
+      } else if (_tabs[i].type == TabType::Status && targetServerId.isEmpty() == false) {
+        // Keep Status tabs — they are per-server and not part of stacking
       }
     }
+    // Also clear any empty/legacy Channel/Query that slipped through (defensive)
+    // (already handled above, but keep for safety)
     if (_activeTab < 0) _activeTab = 0;
-    if (_activeTab >= (int)_tabs.size()) _activeTab = (int)_tabs.size() - 1;
+    if (!_tabs.empty() && _activeTab >= (int)_tabs.size()) _activeTab = (int)_tabs.size() - 1;
     if (_tabs.empty()) ensureStatusTab();
+    if (cleared > 0) {
+      metricsLog("Comprehensive tab clear: removed " + String(cleared) + " Channel/Query tabs for switch to " + targetServerId);
+      markStateDirty();
+    }
   }
 
   // Rule 2: Reset sprite and render state metrics for clean tab ribbon
