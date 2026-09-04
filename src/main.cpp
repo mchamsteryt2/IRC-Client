@@ -11,6 +11,9 @@
 #include <cctype>
 #include <cstring>
 #include <time.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 
 static constexpr int SD_SCK = 40;
 static constexpr int SD_MISO = 39;
@@ -587,6 +590,7 @@ class IrcClientApp {
     showBootTitle();
 
     initSD();
+    _sdMutex = xSemaphoreCreateRecursiveMutex();
     loadConfig();
     metricsLog(String(APP_NAME) + " metrics ready: bouncer=" +
       (_cfg.bncEnabled ? String("enabled, type=") + bouncerModeToString(_cfg.bncMode) : String("disabled")));
@@ -595,6 +599,19 @@ class IrcClientApp {
     _lastUserActivityMs = millis();
     ensureStatusTab();
     loadState();
+    // Start dual-core background task on core 0 for SD/storage.
+    // Arduino loop runs on core 1; this keeps UI responsive during SD writes.
+    if (_sdMutex) {
+      _bgTaskRunning = true;
+      BaseType_t res = xTaskCreatePinnedToCore(
+          bgTaskEntry, "irc_bg", 5120, this, 1, &_bgTaskHandle, 0);
+      if (res != pdPASS) {
+        _bgTaskRunning = false;
+        _bgTaskHandle = nullptr;
+      } else {
+        logStatus(String("Dual-core: UI core=") + String(xPortGetCoreID()) + " bg core=0");
+      }
+    }
     logStatus(String(APP_NAME) + " v" + APP_VERSION + " starting...");
     if (wifiNeedsSetup(_cfg)) {
       logStatus("Wi-Fi not configured, opening config");
@@ -613,8 +630,12 @@ class IrcClientApp {
     serviceWiFi();
     serviceIRC();
     serviceBncChannelAttachMetric();
-    serviceStateSave();
-    serviceSdLogFlush();
+    // SD/state flush is handled on core 0 when dual-core is active.
+    // Fallback to inline flush if bg task not running (mutex creation failed).
+    if (!_bgTaskRunning) {
+      serviceStateSave();
+      serviceSdLogFlush();
+    }
     serviceTextScroll();
     refreshBatteryStatus();
     serviceDisplayTimeout();
@@ -622,6 +643,29 @@ class IrcClientApp {
       draw();
       _lastUiRefresh = millis();
     }
+  }
+
+  // Background task entry (static trampoline)
+  static void bgTaskEntry(void* arg) {
+    static_cast<IrcClientApp*>(arg)->bgTaskLoop();
+  }
+
+  void bgTaskLoop() {
+    // Runs on core 0; handles blocking SD I/O so core 1 stays responsive.
+    while (_bgTaskRunning) {
+      serviceStateSave();
+      serviceSdLogFlush();
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    vTaskDelete(nullptr);
+  }
+
+  bool takeSdLock(uint32_t timeoutMs = 100) {
+    if (!_sdMutex) return true;
+    return xSemaphoreTakeRecursive(_sdMutex, pdMS_TO_TICKS(timeoutMs)) == pdTRUE;
+  }
+  void giveSdLock() {
+    if (_sdMutex) xSemaphoreGiveRecursive(_sdMutex);
   }
 
  private:
@@ -690,6 +734,11 @@ class IrcClientApp {
   String _cachedLogServerDir;
   String _cachedLogServerKey;
   String _cachedLogDate;
+
+  // Dual-core: background SD/storage task on core 0
+  SemaphoreHandle_t _sdMutex = nullptr;
+  TaskHandle_t _bgTaskHandle = nullptr;
+  volatile bool _bgTaskRunning = false;
 
   bool _configOpen = false;
   bool _configEditing = false;
@@ -821,13 +870,16 @@ class IrcClientApp {
   void metricsLog(const String& message) {
     if (!_cfg.serialLogEnabled) return;
     if (!_sdReady) return;
-
+    if (!takeSdLock(20)) return;
     File f = SD.open(METRICS_LOG_PATH, FILE_APPEND);
     if (!f) f = SD.open(METRICS_LOG_PATH, FILE_WRITE);
-    if (!f) return;
-
+    if (!f) {
+      giveSdLock();
+      return;
+    }
     f.println("[+" + formatSeconds(millis()) + "s] " + message);
     f.close();
+    giveSdLock();
   }
 
   void finishChannelListMetric() {
@@ -1378,19 +1430,6 @@ class IrcClientApp {
 
   void initFrameBuffer() {
     _useFrameBuffer = false;
-    _frameBuffer.deleteSprite();
-    _frameBuffer.setColorDepth(16);
-    _frameBuffer.setTextSize(1);
-    _frameBuffer.setTextWrap(false);
-    _frameBuffer.setTextColor(UI_FG, UI_BG);
-
-    _frameBuffer.setPsram(true);
-    if (!_frameBuffer.createSprite(SCREEN_W, SCREEN_H)) {
-      _frameBuffer.setPsram(false);
-      if (!_frameBuffer.createSprite(SCREEN_W, SCREEN_H)) return;
-    }
-
-    _useFrameBuffer = true;
   }
 
   void showBootTitle() {
@@ -1625,6 +1664,7 @@ class IrcClientApp {
 
   void ensureDirRecursive(const String& path) {
     if (!_sdReady || path.isEmpty()) return;
+    if (!takeSdLock()) return;
     String current;
     for (size_t i = 0; i < path.length(); ++i) {
       current += path[i];
@@ -1633,21 +1673,26 @@ class IrcClientApp {
       }
     }
     if (!SD.exists(path)) SD.mkdir(path);
+    giveSdLock();
   }
 
   void refreshLogPathCache() {
     if (!_sdReady) return;
-
+    if (!takeSdLock()) return;
     String root = _cfg.logRoot.isEmpty() ? "/IRC" : _cfg.logRoot;
     String serverKey = safeFileName(_cfg.endpointHost.isEmpty() ? "unknown_server" : _cfg.endpointHost);
     String date = currentDateStamp();
-    if (root == _cachedLogRoot && serverKey == _cachedLogServerKey && date == _cachedLogDate) return;
+    if (root == _cachedLogRoot && serverKey == _cachedLogServerKey && date == _cachedLogDate) {
+      giveSdLock();
+      return;
+    }
 
     _cachedLogRoot = root;
     _cachedLogServerKey = serverKey;
     _cachedLogDate = date;
     _cachedLogServerDir = root + "/" + serverKey;
     _logPathCache.clear();
+    giveSdLock();
     ensureDirRecursive(root);
     ensureDirRecursive(_cachedLogServerDir);
   }
@@ -1655,29 +1700,50 @@ class IrcClientApp {
   String resolveLogPath(const String& tabName) {
     if (!_sdReady) return "";
     refreshLogPathCache();
-
+    if (!takeSdLock()) return "";
     String tabFolder = logTabFolderName(tabName);
     for (const LogPathCacheEntry& entry : _logPathCache) {
-      if (entry.tabFolder == tabFolder) return entry.path;
+      if (entry.tabFolder == tabFolder) {
+        String p = entry.path;
+        giveSdLock();
+        return p;
+      }
     }
 
     String dir = _cachedLogServerDir + "/" + tabFolder;
+    String date = _cachedLogDate;
+    giveSdLock();
     ensureDirRecursive(dir);
-
+    if (!takeSdLock(50)) return dir + "/" + date + ".log";
+    // Re-check after re-lock (another core may have inserted)
+    for (const LogPathCacheEntry& entry : _logPathCache) {
+      if (entry.tabFolder == tabFolder) {
+        String p = entry.path;
+        giveSdLock();
+        return p;
+      }
+    }
     LogPathCacheEntry entry;
     entry.tabFolder = tabFolder;
-    entry.path = dir + "/" + _cachedLogDate + ".log";
+    entry.path = dir + "/" + date + ".log";
     _logPathCache.push_back(entry);
-    return entry.path;
+    String out = entry.path;
+    giveSdLock();
+    return out;
   }
 
   void serviceSdLogFlush() {
     if (!_sdReady) return;
+    if (!takeSdLock(20)) return;
     if (!_cfg.channelLogEnabled) {
       _pendingSdLogs.clear();
+      giveSdLock();
       return;
     }
-    if (_pendingSdLogs.empty()) return;
+    if (_pendingSdLogs.empty()) {
+      giveSdLock();
+      return;
+    }
 
     uint32_t startedAtUs = micros();
     size_t flushedLines = 0;
@@ -1685,6 +1751,7 @@ class IrcClientApp {
       if (static_cast<uint32_t>(micros() - startedAtUs) >= SD_LOG_FLUSH_TIME_BUDGET_US) break;
 
       const String path = _pendingSdLogs.front().path;
+      // SD.open is blocking; keep lock held to protect queue but release briefly if needed
       File f = SD.open(path, FILE_APPEND);
       if (!f) f = SD.open(path, FILE_WRITE);
       if (!f) {
@@ -1702,6 +1769,7 @@ class IrcClientApp {
       }
       f.close();
     }
+    giveSdLock();
   }
 
 
@@ -1960,6 +2028,24 @@ class IrcClientApp {
     }
   }
 
+  static bool isConfigCategoryStart(int idx) {
+    return idx == CFG_WIFI_SSID || idx == CFG_IRC_SERVER ||
+           idx == CFG_PROXY_TYPE || idx == CFG_BNC_ENABLED ||
+           idx == CFG_SASL_ENABLED || idx == CFG_NICK_PANE ||
+           idx == CFG_SERIAL_LOG || idx == CFG_SAVE_AND_RECONNECT;
+  }
+
+  static const char* getConfigCategoryName(int idx) {
+    if (idx <= CFG_WIFI_PASS) return "WIFI";
+    if (idx <= CFG_AUTOJOIN) return "IRC";
+    if (idx <= CFG_PROXY_PASS) return "PROXY";
+    if (idx <= CFG_BNC_PASS) return "BNC";
+    if (idx <= CFG_SASL_PASS) return "SASL";
+    if (idx <= CFG_TEXT_OVERFLOW) return "UI";
+    if (idx <= CFG_LOG_ROOT) return "SYSTEM";
+    return "ACTIONS";
+  }
+
   String getConfigFieldLabel(int idx) const {
     switch (idx) {
       case CFG_WIFI_SSID: return "wifi_ssid";
@@ -2101,10 +2187,14 @@ class IrcClientApp {
 
   void saveConfigToSD(const Config& cfg) {
     if (!_sdReady) return;
+    if (!takeSdLock(100)) return;
     ensureDirRecursive("/irc");
     if (SD.exists(CONFIG_PATH)) SD.remove(CONFIG_PATH);
     File f = SD.open(CONFIG_PATH, FILE_WRITE);
-    if (!f) return;
+    if (!f) {
+      giveSdLock();
+      return;
+    }
 
     f.println("wifi_ssid=" + cfg.wifiSSID);
     f.println("wifi_pass=" + cfg.wifiPass);
@@ -2147,6 +2237,7 @@ class IrcClientApp {
     f.println("screen_timeout_sec=" + String(cfg.screenTimeoutSec));
     f.println("screen_brightness=" + String(cfg.screenBrightness));
     f.close();
+    giveSdLock();
   }
 
   void activateConfigField() {
@@ -2274,6 +2365,13 @@ class IrcClientApp {
 
     for (char c : ks.word) {
       if ((c == '.' || c == ';' || c == ' ') && !shouldHandleDebouncedActionChar(c)) continue;
+      if (ks.fn) {
+        int page = std::max(1, bodyVisibleRows() - 1);
+        if (c == ';') { moveConfigSelection(-page); continue; }
+        if (c == '.') { moveConfigSelection(page); continue; }
+        if (c == ',') { moveConfigSelection(-page); continue; }
+        if (c == '/') { moveConfigSelection(page); continue; }
+      }
       if (c == '.') moveConfigSelection(1);
       else if (c == ';') moveConfigSelection(-1);
       else if (c == ' ') activateConfigField();
@@ -2418,22 +2516,38 @@ class IrcClientApp {
   void serviceStateSave() {
     if (!_stateDirty || !_sdReady || !_cfg.persistTabs) return;
     if (millis() - _lastStateDirtyMs < STATE_SAVE_DEBOUNCE_MS) return;
+    if (!takeSdLock(50)) return;
 
+    // Snapshot state under lock to keep file consistent
+    String activeName = _tabs[_activeTab].name;
+    bool nickPane = _cfg.nickPaneEnabled;
+    ColorMode cm = _cfg.colorMode;
+    std::vector<String> channels;
+    std::vector<String> queries;
+    channels.reserve(_tabs.size());
+    queries.reserve(_tabs.size());
+    for (size_t i = 1; i < _tabs.size(); ++i) {
+      if (_tabs[i].type == TabType::Channel) channels.push_back(_tabs[i].name);
+      else if (_tabs[i].type == TabType::Query) queries.push_back(_tabs[i].name);
+    }
+    // Keep lock for SD operations (recursive mutex allows nested ensureDir)
     ensureDirRecursive("/irc");
     if (SD.exists(STATE_PATH)) SD.remove(STATE_PATH);
 
     File f = SD.open(STATE_PATH, FILE_WRITE);
-    if (!f) return;
-
-    f.println("active=" + _tabs[_activeTab].name);
-    f.println("nick_pane_enabled=" + String(_cfg.nickPaneEnabled ? "true" : "false"));
-    f.println("color_mode=" + colorModeToString(_cfg.colorMode));
-    for (size_t i = 1; i < _tabs.size(); ++i) {
-      if (_tabs[i].type == TabType::Channel) f.println("channel=" + _tabs[i].name);
-      else if (_tabs[i].type == TabType::Query) f.println("query=" + _tabs[i].name);
+    if (!f) {
+      giveSdLock();
+      return;
     }
+
+    f.println("active=" + activeName);
+    f.println("nick_pane_enabled=" + String(nickPane ? "true" : "false"));
+    f.println("color_mode=" + colorModeToString(cm));
+    for (auto &c : channels) f.println("channel=" + c);
+    for (auto &q : queries) f.println("query=" + q);
     f.close();
     _stateDirty = false;
+    giveSdLock();
   }
 
   void connectWiFi() {
@@ -3589,14 +3703,17 @@ class IrcClientApp {
 
   void logToSD(const String& tabName, const String& line) {
     if (!_sdReady || !_cfg.channelLogEnabled) return;
+    String path = resolveLogPath(tabName);
+    if (path.isEmpty()) return;
+    if (!takeSdLock(20)) return;
     PendingSdLogLine entry;
-    entry.path = resolveLogPath(tabName);
-    if (entry.path.isEmpty()) return;
+    entry.path = path;
     entry.line = line;
     if (_pendingSdLogs.size() >= MAX_PENDING_SD_LOG_LINES) {
       _pendingSdLogs.pop_front();
     }
     _pendingSdLogs.push_back(entry);
+    giveSdLock();
   }
 
   void handleJoin(const IrcMessage& msg) {
@@ -4437,23 +4554,34 @@ class IrcClientApp {
 
     for (int idx = _configScroll; idx < CFG_COUNT && idx < _configScroll + visibleRows; ++idx) {
       bool selected = idx == _configSelected;
+      bool catStart = isConfigCategoryStart(idx);
+
       uint16_t bg = selected ? UI_HILITE_BG : UI_BG;
       gfx.fillRect(0, y, SCREEN_W, CHAR_H + 2, bg);
+
+      if (catStart) {
+        gfx.fillRect(0, y, SCREEN_W, 2, UI_ACCENT);
+      }
+
       gfx.setTextColor(selected ? UI_WARN : UI_DIM, bg);
       gfx.setCursor(2, y);
       gfx.print(selected ? (_configEditing ? "*" : ">") : " " );
 
-      String label = ellipsize(getConfigFieldLabel(idx), labelChars);
-      String value = ellipsize(getConfigFieldValue(idx, true), valueChars);
-
-      gfx.setTextColor(UI_FG, bg);
+      String label;
+      if (catStart) {
+        label = ellipsize(getConfigCategoryName(idx), labelChars);
+        gfx.setTextColor(UI_ACCENT, bg);
+      } else {
+        label = ellipsize(getConfigFieldLabel(idx), labelChars);
+        gfx.setTextColor(UI_FG, bg);
+      }
       gfx.setCursor(10, y);
       gfx.print(label);
 
       if (!configFieldIsAction(idx)) {
         gfx.setTextColor(selected ? UI_ACCENT : UI_FG, bg);
         gfx.setCursor(10 + labelChars * CHAR_W, y);
-        gfx.print(value);
+        gfx.print(ellipsize(getConfigFieldValue(idx, true), valueChars));
       }
 
       y += ROW_H;
@@ -4485,7 +4613,7 @@ class IrcClientApp {
       gfx.setCursor(2, inputY + 4);
       gfx.print("; up  . down  ENT ok");
       gfx.setCursor(2, inputY + 13);
-      gfx.print("TAB/DEL alt  hold G0");
+      gfx.print("Fn:pgup pgdn TAB nav");
     }
   }
 
