@@ -1880,10 +1880,42 @@ class SimpleTransport {
   }
 
   bool ensureZoneSprites() {
-    // ADV has no PSRAM — any late alloc still risks heap panic at ~10-12s (WiFi/BT + SD)
-    // Keep direct rendering on ADV; zone sprites only on PSRAM boards (handled in initFrameBuffer)
-    // This prevents 10s crash while preserving flicker mitigation via no-clear + wrap
-    return _spritesReady;
+    if (_spritesReady) return true;
+    // ADV no PSRAM — defer 10KB 8-bit zones until heap stable post-WiFi (fixes 5s header flicker)
+    // Previous instant alloc at setup() fragmented WiFi heap → 10s panic; now lazy after 12s
+    bool hasPsram = false;
+#if defined(CONFIG_SPIRAM_SUPPORT)
+    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
+#else
+    hasPsram = ESP.getPsramSize() >= 70000;
+#endif
+    if (hasPsram) return false; // already tried in initFrameBuffer
+    if (millis() < 15000) return false;
+    if (!_wifiReady) return false;
+    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 70000)) return false;
+    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 15000) return false;
+    auto try8 = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
+      spr.setPsram(false);
+      spr.setColorDepth(8);
+      spr.setTextSize(1);
+      spr.setTextWrap(false);
+      if (!spr.createSprite(w, h)) return false;
+      spr.fillScreen(UI_BG);
+      return true;
+    };
+    bool ok = true;
+    ok &= try8(_topBarSprite, SCREEN_W, STATUS_H);
+    ok &= try8(_tabBarSprite, SCREEN_W, TAB_H);
+    ok &= try8(_inputSprite, SCREEN_W, INPUT_H);
+    _spritesReady = ok;
+    if (!ok) {
+      if (_topBarSprite.width() > 0) _topBarSprite.deleteSprite();
+      if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
+      if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
+    } else {
+      markAllDirty();
+    }
+    return ok;
   }
 
   void showBootTitle() {
