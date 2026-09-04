@@ -5717,15 +5717,15 @@ class SimpleTransport {
       }
     }
 
-    // Scrollbar — 2px single cyan, clamped to body
+    // Scrollbar — 2px single cyan at screen right edge, clamped, no top/bottom dots
     if ((int)tab.lines.size() > maxLines) {
       int total = (int)tab.lines.size();
-      int h = std::max(8, std::min(BODY_H - 2, BODY_H * maxLines / total));
+      int h = std::max(8, std::min(BODY_H - 4, BODY_H * maxLines / total));
       int maxStart = std::max(1, total - maxLines);
-      int sy = by + 1 + (start * (BODY_H - h - 2) / maxStart);
+      int sy = by + 1 + (start * (BODY_H - h - 4) / maxStart);
       sy = std::max(by+1, std::min(sy, by+BODY_H - h -1));
-      int sx = textWidth - 2;
-      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_ACCENT);
+      int sx = SCREEN_W - 3;
+      gfx.fillRect(sx, sy, 2, h, UI_ACCENT);
     }
 
     if (showPane) drawNickPane(tab);
@@ -5739,10 +5739,9 @@ class SimpleTransport {
     clampTabScroll(tab);
     int visibleRows = bodyVisibleRows();
     int totalRows = totalWrappedRows(tab, textWidth);
-    // Wrap optimized for navbar: reserve 1 row clearance above navbar when at bottom,
-    // and align top to full line to avoid partial-line clutter (limits top messages).
+    // Wrap: no extra row reserve — text sits 1px above navbar (by+BODY_H) for max density,
+    // top cut is minimized by line-aligned startRow, bottom is closest to navbar
     int effectiveVisible = visibleRows;
-    if (tab.scroll == 0 && totalRows > visibleRows) effectiveVisible = std::max(1, visibleRows - 1);
     int startRow = std::max(0, totalRows - effectiveVisible - tab.scroll);
     // Align startRow to line boundary
     {
@@ -5802,14 +5801,14 @@ class SimpleTransport {
         gfx.fillRect(0, y, SCREEN_W, clearH, UI_BG);
       }
     }
-    // Scrollbar for wrapped — single cyan, not split
+    // Scrollbar for wrapped — single cyan at screen edge, no dots
     if (totalRows > visibleRows) {
-      int h = std::max(8, std::min(BODY_H - 2, BODY_H * visibleRows / totalRows));
+      int h = std::max(8, std::min(BODY_H - 4, BODY_H * visibleRows / totalRows));
       int maxStart = std::max(1, totalRows - visibleRows);
-      int sy = by + 1 + (startRow * (BODY_H - h - 2) / maxStart);
+      int sy = by + 1 + (startRow * (BODY_H - h - 4) / maxStart);
       sy = std::max(by+1, std::min(sy, by+BODY_H - h -1));
-      int sx = textWidth - 2;
-      gfx.fillRoundRect(sx, sy, 2, h, 1, UI_ACCENT);
+      int sx = SCREEN_W - 3;
+      gfx.fillRect(sx, sy, 2, h, UI_ACCENT);
     }
 
     if (showPane) drawNickPane(tab);
