@@ -1775,7 +1775,7 @@ class SimpleTransport {
 #else
     hasPsram = ESP.getPsramSize() >= 70000;
 #endif
-    // Full PSRAM path (64.8KB)
+    // Full PSRAM path (64.8KB) — only on boards with PSRAM
     if (hasPsram) {
       _fb.setPsram(true);
       _fb.setColorDepth(16);
@@ -1789,25 +1789,11 @@ class SimpleTransport {
       }
       _fbReady = false;
     }
-    // No PSRAM (ADV) — try body-only 8-bit 20.4KB in internal SRAM (vs 40.8KB 16-bit)
-    // 8-bit uses palette, still flicker-free but halves RAM and avoids OOM reboot on FN8 (blue/black flash).
-    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 40000)) {
-      _fbReady = false;
-      return;
-    }
-    _fb.setPsram(false);
-    _fb.setColorDepth(8);
-    if (_fb.createSprite(SCREEN_W, BODY_H)) {
-      _fbReady = true;
-      _fbHeight = BODY_H;
-      // 8-bit palette approx for UI_BG navy / UI_FG white — LovyanGFX auto-maps 565 via palette
-      _fb.fillScreen(UI_BG);
-      _fb.setTextSize(1);
-      _fb.setTextWrap(false);
-    } else {
-      _fbReady = false;
-      _fbHeight = 0;
-    }
+    // ADV has no PSRAM (S3FN8) — any 20-64KB sprite in 320KB SRAM risks instant panic
+    // (previous blue/black flash → reboot, now 8-bit instant crash). Disable FB on ADV
+    // and rely on dirty-region + y+ROW_H clamp + marquee-disabled flicker mitigation.
+    _fbReady = false;
+    _fbHeight = 0;
   }
 
   void showBootTitle() {
