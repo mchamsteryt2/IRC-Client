@@ -24,18 +24,18 @@ static constexpr int SD_MISO = 39;
 static constexpr int SD_MOSI = 14;
 static constexpr int SD_CS = 12;
 
-// RatSpeak RSCardputer aesthetic — Deep Cyber Blue + Vibrant Cyan
-static constexpr uint16_t UI_BG = 0x011F; // Deep Cyber Blue (R0 G2 B31)
-static constexpr uint16_t UI_FG = 0xFFFF; // White
-static constexpr uint16_t UI_DIM = 0x3B5D; // Muted cyan/grey for secondary text
-static constexpr uint16_t UI_HEADER = 0x011F;
-static constexpr uint16_t UI_INPUT = 0x011F;
-static constexpr uint16_t UI_ACCENT = 0x03EF; // Vibrant Cyan/Teal highlight
-static constexpr uint16_t UI_WARN = 0xF800; // Red for mention (kept)
-static constexpr uint16_t UI_PANE = 0x011F;
-static constexpr uint16_t UI_HILITE_BG = 0xFFFF; // inverted
-static constexpr uint16_t UI_CARD = 0x011F;
-static constexpr uint16_t UI_BORDER = 0x03EF;
+// RatSpeak high-contrast — Black BG, Cyan text/borders (per user request)
+static constexpr uint16_t UI_BG = 0x0000; // Near-black for max contrast
+static constexpr uint16_t UI_FG = 0x07FF; // Bright cyan primary text
+static constexpr uint16_t UI_DIM = 0x04FF; // Dim cyan secondary
+static constexpr uint16_t UI_HEADER = 0x0000;
+static constexpr uint16_t UI_INPUT = 0x0000;
+static constexpr uint16_t UI_ACCENT = 0x07FF; // Vibrant cyan highlight
+static constexpr uint16_t UI_WARN = 0xF800; // Red for mention
+static constexpr uint16_t UI_PANE = 0x0000;
+static constexpr uint16_t UI_HILITE_BG = 0x07FF; // cyan inverted
+static constexpr uint16_t UI_CARD = 0x0000;
+static constexpr uint16_t UI_BORDER = 0x07FF; // Cyan borders
 
 static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
@@ -1777,11 +1777,14 @@ class SimpleTransport {
 
   void initFrameBuffer() {
     if (_spritesReady) return;
-    // Zone sprites — 3 small sprites ~20KB total, safe on 512KB SRAM no-PSRAM
-    // Never allocate full 240x135@16 (64.8KB) — triggers heap panic on ADV
+    // Zone sprites — 3 small sprites ~10KB total @8-bit, safe on 512KB SRAM no-PSRAM
+    // Never allocate full 240x135@16 (64.8KB) — triggers heap panic during WiFi init
+    // Use 8-bit (332) for zones: black(0x0000) and cyan(0x07FF) map cleanly, halves RAM
     auto initSprite = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
+      // Require ample heap before WiFi (needs ~40KB) — abort if low
+      if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 80000)) return false;
       spr.setPsram(false);
-      spr.setColorDepth(16);
+      spr.setColorDepth(8);
       spr.setTextSize(1);
       spr.setTextWrap(false);
       if (!spr.createSprite(w, h)) return false;
