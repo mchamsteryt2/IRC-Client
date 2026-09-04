@@ -238,7 +238,7 @@ struct Config {
 
 // Multi-server support — each profile maps to a network that can be paused out of RAM
 static constexpr size_t MAX_SERVERS = 4;
-static constexpr uint32_t MIN_HEAP_BYTES = 35000; // pause LRU network if heap drops below this
+static constexpr uint32_t MIN_HEAP_BYTES = 55000; // pause LRU network if heap drops below this (raised from 35k to avoid 10s heap panic)
 static constexpr const char* SERVERS_PATH = "/irc/servers.txt";
 static constexpr const char* PAUSED_ROOT = "/irc/paused";
 
@@ -729,6 +729,15 @@ class SimpleTransport {
     // Multi-server RAM guard — pause LRU network if heap low
     static uint32_t _lastRamCheck = 0;
     if (millis() - _lastRamCheck > 4000) { _lastRamCheck = millis(); checkRamAndPauseIfNeeded(); }
+    // 10s post-load heap diagnostic — helps diagnose reboot at ~10s after splash (past WiFi)
+    static bool _heapLogged10s = false;
+    if (!_heapLogged10s && millis() > 10000) {
+      _heapLogged10s = true;
+      String h = "Heap @10s: free=" + String(ESP.getFreeHeap()/1024) + "k largest=" + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)/1024) + "k";
+      Serial.println(h);
+      metricsLog(h);
+    }
+    yield(); // feed WDT, prevents 10s task watchdog reboot (was blocking in connectWiFi)
     if (millis() - _lastUiRefresh >= UI_REFRESH_MS) {
       draw();
       _lastUiRefresh = millis();
@@ -1859,42 +1868,10 @@ class SimpleTransport {
   }
 
   bool ensureZoneSprites() {
-    if (_spritesReady) return true;
-    // Only retry on ADV (no PSRAM) after WiFi stable and 12s uptime to avoid 0s panic
-    bool hasPsram = false;
-#if defined(CONFIG_SPIRAM_SUPPORT)
-    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
-#else
-    hasPsram = ESP.getPsramSize() >= 70000;
-#endif
-    if (hasPsram) return false; // already tried in initFrameBuffer
-    if (millis() < 12000) return false;
-    if (!_wifiReady) return false;
-    if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 60000)) return false;
-    if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 12000) return false;
-    auto try8 = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
-      spr.setPsram(false);
-      spr.setColorDepth(8);
-      spr.setTextSize(1);
-      spr.setTextWrap(false);
-      if (!spr.createSprite(w, h)) return false;
-      spr.fillScreen(UI_BG);
-      return true;
-    };
-    bool ok = true;
-    ok &= try8(_topBarSprite, SCREEN_W, STATUS_H);
-    ok &= try8(_tabBarSprite, SCREEN_W, TAB_H);
-    ok &= try8(_inputSprite, SCREEN_W, INPUT_H);
-    _spritesReady = ok;
-    if (!ok) {
-      if (_topBarSprite.width() > 0) _topBarSprite.deleteSprite();
-      if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
-      if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
-    } else {
-      // Force full redraw once sprites ready
-      markAllDirty();
-    }
-    return ok;
+    // ADV has no PSRAM — any late alloc still risks heap panic at ~10-12s (WiFi/BT + SD)
+    // Keep direct rendering on ADV; zone sprites only on PSRAM boards (handled in initFrameBuffer)
+    // This prevents 10s crash while preserving flicker mitigation via no-clear + wrap
+    return _spritesReady;
   }
 
   void showBootTitle() {
@@ -3126,42 +3103,37 @@ class SimpleTransport {
       logStatus("Wi-Fi SSID missing or placeholder");
       return;
     }
-
+    // Non-blocking — WiFi connect runs async to avoid WDT. Past splash (~1.8s) + 10s = 12s mark
+    // where heap + WiFi TX brownout previously caused reboot at ~10s after load.
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
+    // Lower TX power on ADV (no PSRAM, 512KB) to avoid brownout on battery at ~10s
+    WiFi.setTxPower(WIFI_POWER_11dBm);
     WiFi.begin(_cfg.wifiSSID.c_str(), _cfg.wifiPass.c_str());
-
-    uint32_t start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < WIFI_CONNECT_TIMEOUT_MS) {
-      delay(100);
-      M5Cardputer.update();
-      drawSplash("Connecting Wi-Fi", _cfg.wifiSSID, String((millis() - start) / 1000) + "s");
-    }
-
-    _wifiReady = WiFi.status() == WL_CONNECTED;
-    if (_wifiReady) {
-      configTime(0, 0, "pool.ntp.org", "time.nist.gov");
-      logStatus("Wi-Fi connected: " + WiFi.localIP().toString());
-      _nextWifiAttemptAt = 0;
-    } else {
-      logStatus("Wi-Fi connect timeout");
-    }
+    _wifiReady = false;
+    _nextWifiAttemptAt = millis() + 8000; // back off longer to reduce 10s contention
+    logStatus("WiFi begin: " + _cfg.wifiSSID + " heap " + String(ESP.getFreeHeap()/1024) + "k largest " + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)/1024) + "k");
   }
 
   void serviceWiFi() {
     if (wifiNeedsSetup(_cfg)) return;
     if (WiFi.status() == WL_CONNECTED) {
-      _wifiReady = true;
+      if (!_wifiReady) {
+        _wifiReady = true;
+        configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+        logStatus("WiFi connected: " + WiFi.localIP().toString() + " heap " + String(ESP.getFreeHeap()/1024) + "k largest " + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)/1024) + "k");
+        _nextWifiAttemptAt = 0;
+      }
       return;
     }
-
     _wifiReady = false;
     if (millis() < _nextWifiAttemptAt) return;
-
-    _nextWifiAttemptAt = millis() + 5000;
+    _nextWifiAttemptAt = millis() + 8000;
     WiFi.disconnect();
+    delay(100);
+    WiFi.setTxPower(WIFI_POWER_11dBm);
     WiFi.begin(_cfg.wifiSSID.c_str(), _cfg.wifiPass.c_str());
-    logStatus("Wi-Fi reconnect...");
+    logStatus("WiFi reconnect... heap " + String(ESP.getFreeHeap()/1024) + "k largest " + String(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)/1024) + "k");
   }
 
   void scheduleReconnect(const String& reason) {
