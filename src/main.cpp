@@ -707,10 +707,10 @@ class SimpleTransport {
     serviceWiFi();
     serviceIRC();
     serviceBncChannelAttachMetric();
-    // SD/state flush is handled on core 0 when dual-core is active.
-    // Fallback to inline flush if bg task not running (mutex creation failed).
+    // State save must run on UI core (core 1) to avoid cross-core _tabs vector race.
+    // SD log flush can run on bg core when available.
+    serviceStateSave();
     if (!_bgTaskRunning) {
-      serviceStateSave();
       serviceSdLogFlush();
     }
     serviceTextScroll();
@@ -731,9 +731,9 @@ class SimpleTransport {
   }
 
   void bgTaskLoop() {
-    // Runs on core 0; handles blocking SD I/O so core 1 stays responsive.
+    // Runs on core 0; handles blocking SD log flush so core 1 stays responsive.
+    // State save is intentionally kept on UI core to avoid _tabs vector race.
     while (_bgTaskRunning) {
-      serviceStateSave();
       serviceSdLogFlush();
       vTaskDelay(pdMS_TO_TICKS(20));
     }
@@ -2933,12 +2933,11 @@ class SimpleTransport {
   void serviceStateSave() {
     if (!_stateDirty || !_sdReady || !_cfg.persistTabs) return;
     if (millis() - _lastStateDirtyMs < STATE_SAVE_DEBOUNCE_MS) return;
+    // Deduplication is handled on the UI core (loop) only to avoid mutating _tabs
+    // from the bg core (core 0) while loop core (core 1) may be appending lines.
+    // Do not mutate _tabs here — just snapshot.
     if (!takeSdLock(50)) return;
-    {
-      for (size_t i=0;i<_tabs.size();++i) for (size_t j=i+1;j<_tabs.size();) {
-        if (equalsIgnoreCase(_tabs[i].name,_tabs[j].name) && _tabs[i].type==_tabs[j].type && _tabs[i].serverId==_tabs[j].serverId) _tabs.erase(_tabs.begin()+j); else ++j;
-      }
-    }
+    if (_tabs.empty() || _activeTab < 0 || _activeTab >= (int)_tabs.size()) { giveSdLock(); return; }
     String activeName = _tabs[_activeTab].name;
     String activeServer = currentServerId();
     bool nickPane = _cfg.nickPaneEnabled;
@@ -5443,7 +5442,6 @@ class SimpleTransport {
     getVisibleBodyRange(tab, start, end, maxLines);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
-    gfx.setClipRect(0, BODY_Y, SCREEN_W, BODY_H);
 
     // Empty-state card — ratspeak modern
     if (tab.lines.empty()) {
@@ -5466,7 +5464,6 @@ class SimpleTransport {
         y += ROW_H;
       }
     }
-    gfx.clearClipRect();
 
     // Scrollbar — 2px modern indicator on body right edge
     if ((int)tab.lines.size() > maxLines) {
@@ -5493,7 +5490,6 @@ class SimpleTransport {
     int startRow = std::max(0, totalRows - visibleRows - tab.scroll);
 
     gfx.fillRect(0, BODY_Y, SCREEN_W, BODY_H, UI_BG);
-    gfx.setClipRect(0, BODY_Y, SCREEN_W, BODY_H);
 
     if (tab.lines.empty()) {
       String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
@@ -5529,7 +5525,6 @@ class SimpleTransport {
         if (drawnRows >= visibleRows || y + ROW_H > BODY_Y + BODY_H) break;
       }
     }
-    gfx.clearClipRect();
     // Scrollbar for wrapped
     if (totalRows > visibleRows) {
       int h = std::max(6, BODY_H * visibleRows / totalRows);
