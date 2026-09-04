@@ -2251,7 +2251,7 @@ static void runWifiProvisioning(){
         uint32_t stt=millis();
         while(millis()-stt < 10000){
           if(WiFi.status()==WL_CONNECTED) break;
-          delay(200); M5Cardputer.update();
+          vTaskDelay(pdMS_TO_TICKS(50)); yield(); M5Cardputer.update();
         }
         if(WiFi.status()==WL_CONNECTED){
           safeCopy(gCfg.wifiSSID, gScanSSID[gScanSel], sizeof(gCfg.wifiSSID));
@@ -2262,7 +2262,7 @@ static void runWifiProvisioning(){
           canvas.setCursor(4,40);
           canvas.print("Connected! Saved.");
           if(irc_mutex) xSemaphoreGive(irc_mutex);
-          delay(1200);
+          vTaskDelay(pdMS_TO_TICKS(1200)); yield();
           gInScanner=false;
           gWifiConnecting=false;
           return;
@@ -2274,7 +2274,7 @@ static void runWifiProvisioning(){
           canvas.setCursor(4,60);
           canvas.print("Retry password");
           if(irc_mutex) xSemaphoreGive(irc_mutex);
-          delay(1400);
+          vTaskDelay(pdMS_TO_TICKS(1400)); yield();
           gScanPassLen=0; gScanPass[0]='\0';
           menu_needs_redraw = true;
         }
@@ -2735,7 +2735,6 @@ void setup(){
   canvas.deleteSprite();
   canvas.createSprite(240, 109);
   canvas.setColorDepth(8);
-  canvas.setRotation(1);
   if(canvas.width()==240 && canvas.height()==109){ canvas.fillScreen(UI_BG); gCanvasReady=true; } else { gCanvasReady=false; }
   // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
@@ -2780,7 +2779,7 @@ void setup(){
 void loop() {
     yield(); 
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
-    // if (!safe_mode_active) { network streams / socket / packet buffers bypassed in Safe Mode }
+    
     M5Cardputer.update(); 
     handle_keyboard_inputs(); 
     
