@@ -906,6 +906,7 @@ static void wakeFromSleep(){
 // ---------------------------------------------------------------------------
 static void initCanvas(){
   if(gCanvasReady) return;
+  // Unified composite canvas per spec: 240x135 8-bit, single heap allocation to prevent black screen from double allocation
   canvas.setColorDepth(8);
   canvas.setPsram(false);
   canvas.setTextSize(1);
@@ -913,19 +914,14 @@ static void initCanvas(){
   if(!canvas.createSprite(240, 135)){
     canvas.deleteSprite();
     canvas.setColorDepth(8);
-    canvas.createSprite(240, 135);
+    if(!canvas.createSprite(240, 135)){
+      gCanvasReady = false;
+      return;
+    }
   }
   canvas.fillScreen(UI_BG);
-  // Spec required unified composite 240x135 8-bit
-  canvas.createSprite(240, 135); canvas.setColorDepth(8);
-  canvas.setColorDepth(8);
-  canvas.setPsram(false);
-  if(!canvas.createSprite(SCREEN_W, CHAT_H)){
-    canvas.deleteSprite();
-    canvas.setColorDepth(8);
-    canvas.createSprite(SCREEN_W, CHAT_H);
-  }
   gCanvasReady = canvas.width()==240 && canvas.height()==135;
+  // Do not allocate legacy gChatCanvas - saves 26KB heap on 512KB device, prevents allocation failure black screen
 }
 // ZERO-MUTEX INTRO ANIMATION - unshielded direct drawing to physical display glass
 void run_retro_splash_screen(){
@@ -2611,20 +2607,21 @@ void setup(){
   pinMode(LED_PIN, OUTPUT);
   neopixelWrite(LED_PIN,0,0,0);
   gLastInputMs=millis();
-  gSavedBrightness=gCfg.brightness;
 
   // 2. ZERO-MUTEX INTRO ANIMATION & INITIAL REDRAW
   run_retro_splash_screen(); // unshielded, no mutex
-  // Initialize 8-bit canvas immediately following splash
-  canvas.createSprite(240, 135); canvas.setColorDepth(8);
+  // Initialize 8-bit canvas immediately following splash - correct order setColorDepth before create
+  canvas.setColorDepth(8);
   canvas.setPsram(false);
   canvas.setTextSize(1);
   canvas.setTextWrap(false);
+  if(!canvas.createSprite(240, 135)){
+    canvas.deleteSprite();
+    canvas.setColorDepth(8);
+    canvas.createSprite(240, 135);
+  }
   canvas.fillScreen(UI_BG);
   gCanvasReady = canvas.width()==240 && canvas.height()==135;
-  // Also init legacy alias for compatibility
-  gChatCanvas.setColorDepth(8); gChatCanvas.setPsram(false);
-  if(!gChatCanvas.createSprite(SCREEN_W, CHAT_H)){ gChatCanvas.deleteSprite(); gChatCanvas.setColorDepth(8); gChatCanvas.createSprite(SCREEN_W, CHAT_H); }
   // Force initial draw before background tasks
   ui_needs_redraw = true;
   draw_chat_view();
@@ -2642,10 +2639,13 @@ void setup(){
   if(!gSafeBoot && gSdReady) sweepOldLogs();
   gLastBattPoll = millis();
   gBattVoltage = readBatteryVoltage();
+  // Fix black screen: apply brightness AFTER config load, default to 10 if still 0
+  if(gCfg.brightness==0) gCfg.brightness=10;
+  gSavedBrightness = gCfg.brightness;
+  applyBrightness(gSavedBrightness);
   M5Cardputer.Speaker.setVolume(128);
   digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
   pollJack();
-  applyBrightness(gSavedBrightness);
 
   if(gSafeBoot){
     logStatus("Safe Mode -> provisioning");
