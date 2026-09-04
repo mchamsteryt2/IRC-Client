@@ -24,30 +24,36 @@ static constexpr int SD_MISO = 39;
 static constexpr int SD_MOSI = 14;
 static constexpr int SD_CS = 12;
 
-static constexpr uint16_t UI_BG = 0x000C; // Ratspeak terminal navy
-static constexpr uint16_t UI_FG = 0xFFFF;
-static constexpr uint16_t UI_DIM = 0xAD55;
-static constexpr uint16_t UI_HEADER = 0x000C;
-static constexpr uint16_t UI_INPUT = 0x000C;
-static constexpr uint16_t UI_ACCENT = 0xFFE0; // yellow for selection
-static constexpr uint16_t UI_WARN = 0xF800; // red for mention
-static constexpr uint16_t UI_PANE = 0x000C;
+// RatSpeak RSCardputer aesthetic — Deep Cyber Blue + Vibrant Cyan
+static constexpr uint16_t UI_BG = 0x011F; // Deep Cyber Blue (R0 G2 B31)
+static constexpr uint16_t UI_FG = 0xFFFF; // White
+static constexpr uint16_t UI_DIM = 0x3B5D; // Muted cyan/grey for secondary text
+static constexpr uint16_t UI_HEADER = 0x011F;
+static constexpr uint16_t UI_INPUT = 0x011F;
+static constexpr uint16_t UI_ACCENT = 0x03EF; // Vibrant Cyan/Teal highlight
+static constexpr uint16_t UI_WARN = 0xF800; // Red for mention (kept)
+static constexpr uint16_t UI_PANE = 0x011F;
 static constexpr uint16_t UI_HILITE_BG = 0xFFFF; // inverted
-static constexpr uint16_t UI_CARD = 0x000C;
-static constexpr uint16_t UI_BORDER = 0xAD55;
+static constexpr uint16_t UI_CARD = 0x011F;
+static constexpr uint16_t UI_BORDER = 0x03EF;
 
 static constexpr int SCREEN_W = 240;
 static constexpr int SCREEN_H = 135;
-static constexpr int HEADER_H = 12;
-static constexpr int INPUT_H = 24;
-static constexpr int NAV_H = 12;
-static constexpr int NAV_Y = SCREEN_H - INPUT_H - NAV_H;
-static constexpr int BODY_Y = HEADER_H + 1;
-static constexpr int BODY_H = NAV_Y - BODY_Y - 1;
-static constexpr int INPUT_Y = SCREEN_H - INPUT_H;
+// Zone-based layout — RatSpeak ribbon architecture (3 sprites + direct chat)
+static constexpr int STATUS_H = 12; // Top status bar
+static constexpr int TAB_H = 14; // Tab ribbon right above input
+static constexpr int INPUT_H = 16; // Bottom input line
+static constexpr int HEADER_H = STATUS_H; // alias for legacy code
+static constexpr int NAV_H = TAB_H; // alias
+static constexpr int STATUS_Y = 0;
+static constexpr int TAB_Y = SCREEN_H - INPUT_H - TAB_H; // 105
+static constexpr int INPUT_Y = SCREEN_H - INPUT_H; // 119
+static constexpr int NAV_Y = TAB_Y; // alias
+static constexpr int BODY_Y = STATUS_H + 1; // 13
+static constexpr int BODY_H = TAB_Y - BODY_Y - 1; // 91
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
-static constexpr int ROW_H = CHAR_H + 2;
+static constexpr int ROW_H = CHAR_H + 1; // high density 1px vertical padding
 static constexpr int NICK_PANE_W = 64;
 static constexpr int TIMESTAMP_W_CHARS = 5;
 static constexpr int CONFIG_BUTTON_PIN = 0;
@@ -1072,11 +1078,13 @@ class SimpleTransport {
   TaskHandle_t _bgTaskHandle = nullptr;
   volatile bool _bgTaskRunning = false;
 
-  // Framebuffer sprites for flicker-free rendering
-  // Full 240x135x2=64.8KB needs PSRAM; body-only 240x85x2=40.8KB fits in internal SRAM on ADV (no PSRAM)
-  lgfx::LGFX_Sprite _fb;
-  bool _fbReady = false;
-  int _fbHeight = 0; // SCREEN_H for full, BODY_H for body-only
+  // Zone-based sprites — globally allocated ONCE in setup() to avoid SRAM fragmentation
+  // ADV has 512KB SRAM no PSRAM — never allocate full 240x135@16 (64.8KB) panic
+  // Three zones: Top 240x12=5.6KB, Tab 240x14=6.5KB, Input 240x16=7.5KB → ~20KB total
+  lgfx::LGFX_Sprite _topBarSprite; // STATUS_H
+  lgfx::LGFX_Sprite _tabBarSprite; // TAB_H
+  lgfx::LGFX_Sprite _inputSprite; // INPUT_H
+  bool _spritesReady = false;
 
   bool _configOpen = false;
   bool _configEditing = false;
@@ -1768,32 +1776,29 @@ class SimpleTransport {
   }
 
   void initFrameBuffer() {
-    if (_fbReady) return;
-    bool hasPsram = false;
-#if defined(CONFIG_SPIRAM_SUPPORT)
-    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
-#else
-    hasPsram = ESP.getPsramSize() >= 70000;
-#endif
-    // Full PSRAM path (64.8KB) — only on boards with PSRAM
-    if (hasPsram) {
-      _fb.setPsram(true);
-      _fb.setColorDepth(16);
-      if (_fb.createSprite(SCREEN_W, SCREEN_H)) {
-        _fbReady = true;
-        _fbHeight = SCREEN_H;
-        _fb.fillScreen(UI_BG);
-        _fb.setTextSize(1);
-        _fb.setTextWrap(false);
-        return;
-      }
-      _fbReady = false;
+    if (_spritesReady) return;
+    // Zone sprites — 3 small sprites ~20KB total, safe on 512KB SRAM no-PSRAM
+    // Never allocate full 240x135@16 (64.8KB) — triggers heap panic on ADV
+    auto initSprite = [&](lgfx::LGFX_Sprite &spr, int w, int h) -> bool {
+      spr.setPsram(false);
+      spr.setColorDepth(16);
+      spr.setTextSize(1);
+      spr.setTextWrap(false);
+      if (!spr.createSprite(w, h)) return false;
+      spr.fillScreen(UI_BG);
+      return true;
+    };
+    bool ok = true;
+    ok &= initSprite(_topBarSprite, SCREEN_W, STATUS_H);
+    ok &= initSprite(_tabBarSprite, SCREEN_W, TAB_H);
+    ok &= initSprite(_inputSprite, SCREEN_W, INPUT_H);
+    _spritesReady = ok;
+    if (!ok) {
+      // Clean up partial allocs to avoid fragmentation
+      if (_topBarSprite.width() > 0) _topBarSprite.deleteSprite();
+      if (_tabBarSprite.width() > 0) _tabBarSprite.deleteSprite();
+      if (_inputSprite.width() > 0) _inputSprite.deleteSprite();
     }
-    // ADV has no PSRAM (S3FN8) — any 20-64KB sprite in 320KB SRAM risks instant panic
-    // (previous blue/black flash → reboot, now 8-bit instant crash). Disable FB on ADV
-    // and rely on dirty-region + y+ROW_H clamp + marquee-disabled flicker mitigation.
-    _fbReady = false;
-    _fbHeight = 0;
   }
 
   void showBootTitle() {
@@ -1855,27 +1860,32 @@ class SimpleTransport {
   }
 
   lgfx::LovyanGFX& drawTarget() {
-    if (_fbReady) return _fb;
     return static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
   }
 
   void presentFrame() {
-    if (!_fbReady) return;
+    // No-op — chat is direct, zones pushed via pushZoneSprites()
+  }
+
+  void pushZoneSprites() {
+    if (!_spritesReady) return;
     M5Cardputer.Display.startWrite();
-    if (_fbHeight == SCREEN_H) {
-      _fb.pushSprite(0, 0);
-    } else {
-      // Body-only sprite (40KB) — push at BODY_Y to avoid full allocation
-      _fb.pushSprite(0, BODY_Y);
-    }
+    _topBarSprite.pushSprite(0, STATUS_Y);
+    _tabBarSprite.pushSprite(0, TAB_Y);
+    _inputSprite.pushSprite(0, INPUT_Y);
     M5Cardputer.Display.endWrite();
   }
+
+  // Helpers for zone sprites — drawTargetForZone returns sprite ref
+  lgfx::LGFX_Sprite& topBarTarget() { return _topBarSprite; }
+  lgfx::LGFX_Sprite& tabBarTarget() { return _tabBarSprite; }
+  lgfx::LGFX_Sprite& inputTarget() { return _inputSprite; }
 
   void serviceTextScroll() {
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (useWrappedText()) return;
-    // Without sprite, marquee forces full body redraw every 350ms → visible flicker on direct ST7789
-    if (!_fbReady) return;
+    // Direct body (no full FB) cannot do smooth marquee without flicker — use wrap mode
+    return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -5118,76 +5128,33 @@ class SimpleTransport {
     bool full = _dirty;
     if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
-    auto& gfx = drawTarget();
-    if (_fbReady) {
-      if (_fbHeight == SCREEN_H) {
-        // Full-screen sprite (PSRAM or large SRAM) — composite off-screen then single push
-        if (_configOpen) {
-          drawConfigPage();
-          drawNavBar();
-        } else if (_serverListOpen) {
-          drawServerListPage();
-          drawNavBar();
-        } else if (_channelListOpen) {
-          drawChannelListPage();
-          drawNavBar();
-        } else {
-          drawHeader();
-          drawBody();
-          drawNavBar();
-          drawInput();
-        }
-        presentFrame();
-      } else {
-        // Body-only sprite (40KB, ADV no PSRAM) — flicker-free body, direct rest
-        if (_configOpen || _serverListOpen || _channelListOpen) {
-          // Full-screen pages don't fit body sprite — draw directly
-          bool saved = _fbReady;
-          _fbReady = false;
-          auto& disp = static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
-          disp.startWrite();
-          if (_configOpen) { drawConfigPage(); drawNavBar(); }
-          else if (_serverListOpen) { drawServerListPage(); drawNavBar(); }
-          else if (_channelListOpen) { drawChannelListPage(); drawNavBar(); }
-          disp.endWrite();
-          _fbReady = saved;
-        } else {
-          // Normal chat: body via sprite, header/nav/input direct
-          if (_bodyDirty || full) {
-            drawBody();
-            presentFrame();
-          }
-          bool saved = _fbReady;
-          _fbReady = false;
-          auto& disp = static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
-          disp.startWrite();
-          if (_headerDirty || full) drawHeader();
-          if (_navDirty || full) drawNavBar();
-          if (_inputDirty || full) drawInput();
-          disp.endWrite();
-          _fbReady = saved;
-        }
-      }
+    // Zone-based RatSpeak TUI — top/tab/input via sprites, body direct
+    if (_configOpen || _serverListOpen || _channelListOpen) {
+      // Overlay pages cover full screen — force direct to avoid sprite clipping
+      bool saved = _spritesReady;
+      _spritesReady = false;
+      M5Cardputer.Display.startWrite();
+      if (_configOpen) { drawConfigPage(); drawNavBar(); }
+      else if (_serverListOpen) { drawServerListPage(); drawNavBar(); }
+      else if (_channelListOpen) { drawChannelListPage(); drawNavBar(); }
+      M5Cardputer.Display.endWrite();
+      _spritesReady = saved;
     } else {
-      // Direct mode (no sprite): batch SPI and redraw only dirty regions to minimize flicker
-      gfx.startWrite();
-      if (_configOpen) {
-        drawConfigPage();
-        drawNavBar();
-      } else if (_serverListOpen) {
-        drawServerListPage();
-        drawNavBar();
-      } else if (_channelListOpen) {
-        drawChannelListPage();
-        drawNavBar();
+      // Normal chat: zones via sprites, body direct flicker-free (space-padded, no clear)
+      if (_spritesReady) {
+        if (_headerDirty || full) drawHeader();
+        if (_navDirty || full) drawTabRibbon();
+        if (_inputDirty || full) drawInput();
+        pushZoneSprites();
       } else {
-        if (_headerDirty) drawHeader();
-        if (_bodyDirty) drawBody();
-        if (_navDirty) drawNavBar();
-        if (_inputDirty) drawInput();
+        // Fallback direct (should not happen after init)
+        M5Cardputer.Display.startWrite();
+        if (_headerDirty || full) drawHeader();
+        if (_navDirty || full) drawNavBar();
+        if (_inputDirty || full) drawInput();
+        M5Cardputer.Display.endWrite();
       }
-      gfx.endWrite();
-      presentFrame();
+      if (_bodyDirty || full) drawBody();
     }
     _dirty = false;
     _headerDirty = _bodyDirty = _inputDirty = _navDirty = false;
@@ -5400,27 +5367,28 @@ class SimpleTransport {
   }
 
   void drawHeader() {
-    auto& gfx = drawTarget();
-    // Terminal flat header — simple, reliable, no circles
-    gfx.fillRect(0, 0, SCREEN_W, HEADER_H, UI_BG);
-    gfx.drawFastHLine(0, HEADER_H - 1, SCREEN_W, UI_DIM);
-
+    // RatSpeak top status bar — 240x12 sprite, deep cyber blue, cyan pills
+    auto &target = _spritesReady ? (lgfx::LovyanGFX&)_topBarSprite : (lgfx::LovyanGFX&)M5Cardputer.Display;
+    if (_spritesReady) {
+      _topBarSprite.fillScreen(UI_BG);
+      _topBarSprite.setTextSize(1);
+      _topBarSprite.setTextWrap(false);
+    } else {
+      target.fillRect(0, 0, SCREEN_W, STATUS_H, UI_BG);
+    }
     String title = _tabs[_activeTab].name;
     bool hasMention = _tabs[_activeTab].mention;
     bool hasUnread = _tabs[_activeTab].unread;
     if (hasMention) title = "!" + title;
     else if (hasUnread) title = "*" + title;
-    // Keep channel glyph for scan, but plain
     if (_tabs[_activeTab].type == TabType::Channel) title = "#" + title;
     else if (_tabs[_activeTab].type == TabType::Query) title = "@" + title;
 
     String net = _wifiReady ? ( _transport.connected() ? (_ircRegistered ? "IRC" : "IRC*") : "online") : "offline";
-    // Battery as text percent, centered
     String batt;
     if (_batteryLevel >= 0) batt = String(_batteryLevel) + "%" + (_batteryChargeState == m5::Power_Class::is_charging ? "+" : "");
     else batt = "";
 
-    // Layout: title left, batt center, net right — all 6x8 mono, truncate to fit
     int battW = batt.length() * CHAR_W;
     int battX = (SCREEN_W - battW) / 2;
     int leftW = battX - 4;
@@ -5428,19 +5396,25 @@ class SimpleTransport {
     String left = ellipsize(title, std::max(0, leftW / CHAR_W));
     String right = ellipsize(net, std::max(0, rightW / CHAR_W));
 
-    gfx.setTextColor(hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG), UI_BG);
-    gfx.setCursor(2, 2);
-    gfx.print(left);
-
-    if (!batt.isEmpty()) {
-      gfx.setTextColor(UI_DIM, UI_BG);
-      gfx.setCursor(battX, 2);
-      gfx.print(batt);
-    }
-
-    gfx.setTextColor(UI_DIM, UI_BG);
-    gfx.setCursor(SCREEN_W - right.length() * CHAR_W - 2, 2);
-    gfx.print(right);
+    auto drawTo = [&](lgfx::LovyanGFX &g){
+      g.setTextColor(hasMention ? UI_WARN : (hasUnread ? UI_ACCENT : UI_FG), UI_BG);
+      g.setCursor(2, 2);
+      g.print(left);
+      if (!batt.isEmpty()) {
+        // Battery pill — cyan accent on cyber blue
+        int pillW = batt.length()*CHAR_W + 6;
+        int pillX = battX - 3;
+        g.fillRoundRect(pillX, 1, pillW, 10, 3, hasMention ? UI_WARN : UI_ACCENT);
+        g.setTextColor(UI_BG, hasMention ? UI_WARN : UI_ACCENT);
+        g.setCursor(battX, 2);
+        g.print(batt);
+      }
+      g.setTextColor(UI_DIM, UI_BG);
+      g.setCursor(SCREEN_W - right.length() * CHAR_W - 2, 2);
+      g.print(right);
+    };
+    if (_spritesReady) drawTo(_topBarSprite);
+    else drawTo(target);
   }
 
   void drawBatteryIndicator(lgfx::LovyanGFX& gfx, uint16_t bg) {
@@ -5480,11 +5454,18 @@ class SimpleTransport {
     }
   }
 
-  void drawNavBar() {
-    auto& gfx = drawTarget();
-    // Terminal footer — simple, reliable, no rounded rects
-    gfx.fillRect(0, NAV_Y, SCREEN_W, NAV_H, UI_BG);
-    gfx.drawFastHLine(0, NAV_Y, SCREEN_W, UI_DIM);
+  void drawNavBar() { drawTabRibbon(); }
+  void drawTabRibbon() {
+    // RatSpeak inverted tab ribbon — 240x14 continuous dark ribbon, active = solid cyan block inverted
+    auto &target = _spritesReady ? (lgfx::LovyanGFX&)_tabBarSprite : (lgfx::LovyanGFX&)M5Cardputer.Display;
+    int baseY = _spritesReady ? 0 : TAB_Y;
+    if (_spritesReady) {
+      _tabBarSprite.fillScreen(UI_BG);
+      _tabBarSprite.setTextSize(1);
+      _tabBarSprite.setTextWrap(false);
+    } else {
+      target.fillRect(0, TAB_Y, SCREEN_W, TAB_H, UI_BG);
+    }
     const char* labels[SEC_COUNT] = {"Home", "Chans", "Msgs", "Setup"};
     int cur = currentSection();
     int segW = SCREEN_W / SEC_COUNT;
@@ -5504,13 +5485,20 @@ class SimpleTransport {
       else if (unread) lbl = "*" + lbl;
       int lblW = (int)lbl.length() * CHAR_W;
       int cx = x + (w - lblW) / 2;
-      uint16_t bg = active ? UI_FG : UI_BG;
-      uint16_t fg = active ? UI_BG : (mention ? UI_WARN : (unread ? UI_FG : UI_DIM));
-      gfx.fillRect(x, NAV_Y + 1, w, NAV_H - 1, bg);
-      gfx.setTextColor(fg, bg);
-      gfx.setCursor(cx, NAV_Y + 2);
-      gfx.print(lbl);
-      if (i > 0) gfx.drawFastVLine(x, NAV_Y, NAV_H, UI_DIM);
+      int ty = baseY + 3; // 14px tall, 8px font + 6px padding → centered
+      if (active) {
+        // Inverted: solid cyan block
+        target.fillRect(x, baseY, w, TAB_H, UI_ACCENT);
+        target.setTextColor(UI_BG, UI_ACCENT);
+        target.setCursor(cx, ty);
+        target.print(lbl);
+      } else {
+        // Inactive: flat text, no borders, dim or warn
+        uint16_t fg = mention ? UI_WARN : (unread ? UI_FG : UI_DIM);
+        target.setTextColor(fg, UI_BG);
+        target.setCursor(cx, ty);
+        target.print(lbl);
+      }
     }
   }
 
@@ -5536,10 +5524,9 @@ class SimpleTransport {
     int end = 0;
     int maxLines = 0;
     getVisibleBodyRange(tab, start, end, maxLines);
-    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
-    int by = isBodySprite ? 0 : BODY_Y;
+    int by = BODY_Y;
 
-    gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
+    // No full clear — direct chat uses space-padded overwrite (flicker-free)
 
     // Empty-state card — ratspeak modern
     if (tab.lines.empty()) {
@@ -5600,10 +5587,9 @@ class SimpleTransport {
         else break;
       }
     }
-    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
-    int by = isBodySprite ? 0 : BODY_Y;
+    int by = BODY_Y;
 
-    gfx.fillRect(0, by, SCREEN_W, BODY_H, UI_BG);
+    // No full clear — direct
 
     if (tab.lines.empty()) {
       String hint = (tab.type == TabType::Channel) ? "No messages — say hi!" : (tab.type == TabType::Query ? "No DMs — /query nick" : "No messages — /join #chan");
@@ -5657,31 +5643,32 @@ class SimpleTransport {
 
   void drawMarqueeChatLine(int x, int y, const ChatLine& line, int maxWidth) {
     auto& gfx = drawTarget();
-    // Terminal flat — no bubbles, just text, highlight inverted
-    uint16_t bg = line.highlight ? UI_FG : UI_BG;
-    uint16_t fg = line.highlight ? UI_BG : UI_FG;
-    if (line.own && !line.highlight) { bg = UI_BG; fg = UI_FG; }
-    if (line.notice && !line.highlight) { bg = UI_BG; fg = UI_DIM; }
-    gfx.fillRect(x, y, maxWidth, CHAR_H + 1, bg);
+    // RatSpeak direct — no fillRect clear, space-padded overwrite with WHITE on DEEP_BLUE
+    uint16_t bg = line.highlight ? UI_ACCENT : UI_BG;
+    uint16_t fg = line.highlight ? UI_BG : (line.own ? UI_FG : (line.notice ? UI_DIM : UI_FG));
+    // Left accent for mention (2px cyan/red) — drawn as single fill, not per-line clear
     if (line.highlight) {
-      // left marker for mention
       gfx.fillRect(x, y, 2, CHAR_H + 1, UI_WARN);
+      x += 2; maxWidth -= 2;
     }
     int stampX = x + 2;
-    gfx.setTextColor(line.highlight ? UI_BG : UI_DIM, bg);
+    // Timestamp — always dim on bg
+    gfx.setTextColor(UI_DIM, bg);
     gfx.setCursor(stampX, y);
     String stamp = line.stampShort;
     if (stamp.length() > 5) stamp = stamp.substring(0, 5);
+    // Space-pad timestamp to fixed width + text to full margin in one pass
     gfx.print(stamp);
     int textX = x + 2 + TIMESTAMP_W_CHARS * CHAR_W;
     int textW = maxWidth - (TIMESTAMP_W_CHARS * CHAR_W) - 4;
-    // For highlight, drawStyledText needs inverted bg/fg handling
-    if (line.highlight) {
-      // Temporarily swap for styled text
-      drawStyledText(textX, y, line.raw, textW, bg, currentTextScrollOffsetCols(line, textW));
-    } else {
-      drawStyledText(textX, y, line.raw, textW, bg, currentTextScrollOffsetCols(line, textW));
-    }
+    // Pad the whole line to full width so background overwrites old artifacts
+    int cols = textW / CHAR_W;
+    int textCols = measureStyledTextColumns(line.raw);
+    int padCols = std::max(0, cols - textCols - (line.highlight?0:0));
+    String paddedRaw = line.raw;
+    for (int i=0;i<padCols;++i) paddedRaw += ' ';
+    gfx.setTextColor(fg, bg);
+    drawStyledText(textX, y, paddedRaw, textW, bg, currentTextScrollOffsetCols(line, textW));
   }
 
   int drawWrappedChatLine(int x, int y, const ChatLine& line, int maxWidth, int skipRows, int maxRows) {
@@ -5712,8 +5699,7 @@ class SimpleTransport {
 
   void drawNickPane(const Tab& tab) {
     auto& gfx = drawTarget();
-    bool isBodySprite = (_fbReady && _fbHeight == BODY_H && &gfx == &_fb);
-    int by = isBodySprite ? 0 : BODY_Y;
+    int by = BODY_Y;
     int x = SCREEN_W - NICK_PANE_W;
     // Terminal flat pane — no rounded, just vertical separator
     gfx.fillRect(x, by, NICK_PANE_W, BODY_H, UI_BG);
@@ -5760,11 +5746,18 @@ class SimpleTransport {
   }
 
   void drawInput() {
-    auto& gfx = drawTarget();
-    int y = INPUT_Y;
-    // Terminal input — simple, reliable, no rounded card
-    gfx.fillRect(0, y, SCREEN_W, INPUT_H, UI_BG);
-    gfx.drawFastHLine(0, y, SCREEN_W, UI_DIM);
+    // RatSpeak bottom input — 240x16 sprite, deep cyber blue, cyan prompt
+    auto &target = _spritesReady ? (lgfx::LovyanGFX&)_inputSprite : (lgfx::LovyanGFX&)M5Cardputer.Display;
+    int baseY = _spritesReady ? 0 : INPUT_Y;
+    if (_spritesReady) {
+      _inputSprite.fillScreen(UI_BG);
+      _inputSprite.setTextSize(1);
+      _inputSprite.setTextWrap(false);
+    } else {
+      target.fillRect(0, INPUT_Y, SCREEN_W, INPUT_H, UI_BG);
+    }
+    // Top hairline in cyan for RatSpeak accent
+    target.drawFastHLine(0, baseY, SCREEN_W, UI_ACCENT);
     bool showCursor = !_screenSleeping && (millis() % 1000 < 500);
     if (_input.isEmpty()) {
       String hint;
@@ -5772,15 +5765,16 @@ class SimpleTransport {
       else if (_tabs[_activeTab].type == TabType::Query) hint = "Message " + _tabs[_activeTab].name;
       else hint = "/join #chan or /help";
       hint = ellipsize(hint, (SCREEN_W - 12) / CHAR_W);
-      gfx.setTextColor(UI_DIM, UI_BG);
-      gfx.setCursor(2, y + 4);
-      gfx.print(">");
-      gfx.setCursor(10, y + 4);
-      gfx.print(hint);
+      target.setTextColor(UI_ACCENT, UI_BG);
+      target.setCursor(2, baseY + 2);
+      target.print(">");
+      target.setTextColor(UI_DIM, UI_BG);
+      target.setCursor(10, baseY + 2);
+      target.print(hint);
       if (showCursor) {
-        gfx.setTextColor(UI_DIM, UI_BG);
-        gfx.setCursor(10 + hint.length() * CHAR_W, y + 4);
-        gfx.print("_");
+        target.setTextColor(UI_ACCENT, UI_BG);
+        target.setCursor(10 + hint.length() * CHAR_W, baseY + 2);
+        target.print("_");
       }
     } else {
       int charsPerRow = (SCREEN_W - 10) / CHAR_W;
@@ -5790,11 +5784,11 @@ class SimpleTransport {
         else if (!rows[0].isEmpty()) rows[0] += "_";
         else rows[1] += "_";
       }
-      gfx.setTextColor(UI_FG, UI_BG);
-      gfx.setCursor(2, y + 4);
-      gfx.print(ellipsize(rows[0], charsPerRow));
-      gfx.setCursor(2, y + 13);
-      gfx.print(ellipsize(rows[1], charsPerRow));
+      target.setTextColor(UI_FG, UI_BG);
+      target.setCursor(2, baseY + 2);
+      target.print(ellipsize(rows[0], charsPerRow));
+      target.setCursor(2, baseY + 10);
+      target.print(ellipsize(rows[1], charsPerRow));
     }
   }
 
