@@ -17,7 +17,6 @@
 #include <esp_system.h>
 #if __has_include("USB.h")
 #include "USB.h"
-#define HAS_USB_HOST 1
 #endif
 // Avoid macro clash: M5Cardputer and USBHIDKeyboard both define KEY_* macros
 #ifdef KEY_BACKSPACE
@@ -1855,10 +1854,10 @@ class SimpleTransport {
   }
 
   void initFrameBuffer() {
-    // Cardputer ADV StampS3 has no PSRAM (ESP32-S3FN8, 320KB SRAM only).
-    // Full 240x135x2=~63KB sprite would eat ~20% of internal RAM and starve
-    // the heap (MIN_HEAP 35KB) — so only allocate if PSRAM is actually present.
-    // Otherwise stay in direct-draw mode and rely on dirty-region + clip + SPI batching.
+    // Cardputer ADV StampS3 has no PSRAM (ESP32-S3FN8, 320KB SRAM) — but a
+    // 240x135x2=63KB sprite still fits in internal RAM (~20% of 320KB).
+    // Prefer PSRAM if present, otherwise try internal RAM if heap allows.
+    // Fallback to direct dirty-region + clip if allocation fails.
     if (_fbReady) return;
     bool hasPsram = false;
 #if defined(BOARD_HAS_PSRAM) || defined(CONFIG_SPIRAM_SUPPORT)
@@ -1866,11 +1865,15 @@ class SimpleTransport {
 #else
     hasPsram = ESP.getPsramSize() >= 64000;
 #endif
-    if (!hasPsram) {
-      _fbReady = false;
-      return;
+    // Only use PSRAM flag when PSRAM is actually there; otherwise allocate in SRAM.
+    if (hasPsram) _fb.setPsram(true);
+    else {
+      // Avoid starving heap: need ~70KB free (sprite + overhead) on top of MIN_HEAP
+      if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 75000)) {
+        _fbReady = false;
+        return;
+      }
     }
-    _fb.setPsram(true);
     _fb.setColorDepth(16);
     if (_fb.createSprite(SCREEN_W, SCREEN_H)) {
       _fbReady = true;
@@ -1956,6 +1959,9 @@ class SimpleTransport {
   void serviceTextScroll() {
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (useWrappedText()) return;
+    // On no-PSRAM ADV, marquee requires full body redraw every 350ms → visible flicker on ST7789 direct draw.
+    // Prefer ellipsis truncation instead of scrolling when no sprite is available.
+    if (!_fbReady) return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -5296,7 +5302,7 @@ class SimpleTransport {
       }
       presentFrame();
     } else {
-      // Direct draw path: batch SPI and only redraw dirty regions to minimize flicker
+      // Direct draw path (no PSRAM): dirty-region + clip to minimize flicker on ST7789
       gfx.startWrite();
       if (_configOpen) {
         drawConfigPage();
