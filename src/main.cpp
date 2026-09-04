@@ -209,6 +209,7 @@ static char active_networks[4][32] = {0};
 static int active_networks_count = 0;
 static bool gSdReady = false;
 static bool gSafeBoot = false;
+bool safe_mode_active = false;
 static bool gNickOverlay = false;
 static uint32_t gLastInputMs = 0;
 static bool gDownclocked = false;
@@ -935,18 +936,11 @@ void run_retro_splash_screen(){
   M5Cardputer.Display.setCursor(8,46);
   M5Cardputer.Display.print("Hold G0 for safe WiFi setup");
   // Brief G0 check window without mutex
-  uint32_t splashStart = millis();
-  while(millis() - splashStart < 800){
-    if(digitalRead(G0_PIN)==LOW){
-      M5Cardputer.Display.setCursor(8,70);
-      M5Cardputer.Display.setTextColor(UI_WARN, UI_BG);
-      M5Cardputer.Display.print("[G0 SAFE BOOT]");
-      gSafeBoot = true;
-      break;
-    }
-    delay(10);
-    M5Cardputer.update();
-  }
+  // Single-pass splash - no while loop per spec
+  M5Cardputer.Display.fillScreen(UI_BG);
+  M5Cardputer.Display.setCursor(8,10);
+  M5Cardputer.Display.print("Cardputer IRC");
+  if(safe_mode_active){ M5Cardputer.Display.setCursor(8,70); M5Cardputer.Display.print("[G0 SAFE BOOT]"); }
   delay(200);
 }
 
@@ -2355,9 +2349,12 @@ static void netTask(void* arg){
     else vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
+void irc_network_task(void* pvParameters){ netTask(pvParameters); }
+
 
 // SPI BUS HARDWARE CONFLICT PROTECTION - Core 0 dedicated SD logging task
 // Completely halts and waits for Core 1 SPI screen canvas flushes via irc_mutex
+static void add_message_to_buffer(const char* system, const char* msg, int color){ (void)system; (void)color; if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); ui_needs_redraw = true; xSemaphoreGive(irc_mutex); }
 static void add_message_to_buffer(const char* msg){ if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); ui_needs_redraw = true; xSemaphoreGive(irc_mutex); }
 static void logTask(void* arg){
   (void)arg;
@@ -2707,7 +2704,23 @@ void setup(){
   // Create global mutex IMMEDIATELY after hardware init
   irc_mutex = xSemaphoreCreateMutex();
   gTabsMutex = irc_mutex;
-  gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
+    gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
+
+  // Safe Mode single-pass check - BAN INFINITE PIN-WAIT LOOPS
+  Serial.println("[BOOSTER-LOG] Safe Mode initialization check...");
+  pinMode(0, INPUT_PULLUP); // Enforce pullup on G0 button pin
+  // Sample the G0 button state instantly on this boot pass
+  if (digitalRead(0) == LOW) { 
+      Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
+      add_message_to_buffer("System", "Safe Mode Active: Network tasks bypassed.", 0xFD20);
+      safe_mode_active = true;
+      gSafeBoot = true;
+  } else {
+      Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
+      safe_mode_active = false;
+      gSafeBoot = false;
+  }
+  // Execution MUST flow through cleanly past this block immediately!
 
   // Hardware pin setup after mutex creation (does not touch irc_mutex)
   pinMode(G0_PIN, INPUT_PULLUP);
@@ -2761,7 +2774,7 @@ void setup(){
   digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
   pollJack();
 
-  if(gSafeBoot){
+  if(safe_mode_active){
     logStatus("Safe Mode -> provisioning");
   } else if(isWifiDummy(gCfg)){
     logStatus("Provisioning mode");
