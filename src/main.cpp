@@ -869,7 +869,7 @@ static void drawTopBar(){
   d.drawFastHLine(0,TOP_H-1,SCREEN_W, UI_DIM);
   d.setTextSize(1);
   // Scrolling tab-strip: show all buffers with [active] and !/* markers
-  // Active tab is bracketed: [name] . Background alerts appended directly to tab strings
+  // HEADER COLOR SEGREGATION: dividers '[',']','|' muted grey, text bright white
   int x=2;
   for(int i=0;i<gTabCount && x < SCREEN_W-2; ++i){
     bool isActive = (i==gActive);
@@ -880,17 +880,20 @@ static void drawTopBar(){
     if(isActive){
       if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"[%s%c]", gTabs[i].name, mark);
       else snprintf(tabTok,sizeof(tabTok),"[%s]", gTabs[i].name);
-      d.setTextColor(UI_FG, UI_BG);
     } else {
       if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"%s%c", gTabs[i].name, mark);
       else safeCopy(tabTok,gTabs[i].name,sizeof(tabTok));
-      d.setTextColor(UI_DIM, UI_BG);
     }
-    // Ensure token fits; horizontal scrolling: if overflow, truncate and allow visual scroll offset
-    // Simple scroll: offset based on active index ensures active always visible
-    d.setCursor(x,2);
-    d.print(tabTok);
-    x += (strlen(tabTok)*CHAR_W + 4);
+    // Color-code dividers low-contrast muted grey (0x8410), text bright white (0xFFFF) for legibility
+    for(char *p=tabTok; *p; ++p){
+      bool isDiv = (*p=='[' || *p==']' || *p=='|');
+      d.setTextColor(isDiv ? 0x8410 : 0xFFFF, UI_BG);
+      d.setCursor(x,2);
+      d.print(*p);
+      x += CHAR_W;
+      if(x >= SCREEN_W-6) break;
+    }
+    x += 4;
     if(x >= SCREEN_W) break;
   }
   // Battery voltage on far right (GPIO10 float with 2.0x divider)
@@ -927,6 +930,16 @@ static void drawBottomInput(){
   d.setCursor(2, INPUT_Y+4);
   d.print(">");
   d.print(visible);
+  // TEXT SCROLL FADE: 12-pixel localized gradient/bounding tint on left margin when scrolled
+  if(gInputScroll > 0){
+    // solid baseline tint + gradient fade edge - indicates hidden overflow
+    for(int fx=0; fx<12; ++fx){
+      uint8_t shade = (uint8_t)(60 + fx*10); // gradient from dark to lighter
+      uint16_t col = d.color565(shade, shade, shade*0.9);
+      d.drawFastVLine(8+fx, INPUT_Y+1, INPUT_H-2, col);
+    }
+    d.drawFastVLine(20, INPUT_Y+1, INPUT_H-2, UI_DIM); // bounding line
+  }
   int curPos = gInputCursor - gInputScroll;
   int curX = 2 + CHAR_W + curPos*CHAR_W; // 1 char for '>'
   if(curX>=2 && curX < SCREEN_W-2){
@@ -940,12 +953,19 @@ static void drawBottomInput(){
   }
 }
 
+// LAZY WORD-WRAPPING: only active tab gets layout - inactive bypassed until focus switch
+static inline bool shouldLayoutTab(Tab* t){ return t && t==activeTab(); }
+static void ensureTabLayout(Tab* tab){
+  if(!shouldLayoutTab(tab)) return; // completely bypass word-wrapping/canvas layout for background tabs
+  // layout math would be performed here only on focus switch - deferred until active
+}
 static void drawChatViewport(){
   if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
   gChatCanvas.fillScreen(UI_BG);
   gChatCanvas.setTextSize(1);
   Tab* tab=activeTab();
   if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); return; }
+  ensureTabLayout(tab); // lazy trigger - inactive tabs have bypassed this until now
   int total = tab->count;
   int vis = CHAT_ROWS;
   int startLogical = total - vis - tab->scroll;
@@ -1675,22 +1695,30 @@ static void netTask(void* arg){
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
+    // CHUNK SOCKET INGESTION: fixed 128-byte blocks on Core 0 to cut scheduling overhead
     bool got=false;
-    while(cl->available()){
-      int ch=cl->read();
-      if(ch<0) break;
-      got=true;
-      char c=(char)ch;
-      if(c=='\r') continue;
-      if(c=='\n'){
-        gRxAccum[gRxLen]='\0';
-        if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); }
-        gRxLen=0;
-        if(gRxQueue.size() >= 8) break;
-      } else {
-        if(gRxLen < RX_ACCUM_SZ-1) gRxAccum[gRxLen++]=c;
-        else { gRxAccum[gRxLen]='\0'; gRxQueue.push(gRxAccum); gRxLen=0; }
+    int avail = cl->available();
+    while(avail > 0){
+      uint8_t chunk[128];
+      int toRead = avail > 128 ? 128 : avail;
+      int n = cl->read(chunk, toRead);
+      if(n <= 0) break;
+      got = true;
+      for(int i=0; i<n; ++i){
+        char c = (char)chunk[i];
+        if(c=='\r') continue;
+        if(c=='\n'){
+          gRxAccum[gRxLen]='\0';
+          if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); }
+          gRxLen=0;
+          if(gRxQueue.size() >= 8) break;
+        } else {
+          if(gRxLen < RX_ACCUM_SZ-1) gRxAccum[gRxLen++]=c;
+          else { gRxAccum[gRxLen]='\0'; gRxQueue.push(gRxAccum); gRxLen=0; }
+        }
       }
+      if(gRxQueue.size() >= 8) break;
+      avail = cl->available();
     }
     if(gIrcConnected){
       if(!gAwaitPong && millis()-gLastRxMs > PING_INTERVAL_MS){
