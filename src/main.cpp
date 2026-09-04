@@ -52,8 +52,9 @@ static constexpr uint32_t CONFIG_BUTTON_SHORT_DEBOUNCE_MS = 180;
 static constexpr uint32_t CONFIG_BUTTON_LONG_PRESS_MS = 700;
 static constexpr uint32_t TITLE_SCREEN_MS = 1800;
 
-static constexpr size_t MAX_TAB_LINES = 350;
+static constexpr size_t MAX_TAB_LINES = 180;
 static constexpr size_t MAX_TABS = 24;
+static constexpr size_t MAX_TABS_PER_SERVER = 10;
 static constexpr size_t MAX_USERS_PER_TAB = 256;
 static constexpr size_t MAX_CHANNEL_LIST_ENTRIES = 320;
 static constexpr size_t MAX_INPUT_CHARS = 700;
@@ -62,14 +63,14 @@ static constexpr uint32_t PING_INTERVAL_MS = 60000;
 static constexpr uint32_t PONG_TIMEOUT_MS = 25000;
 static constexpr uint32_t UI_REFRESH_MS = 50;
 static constexpr uint32_t STATE_SAVE_DEBOUNCE_MS = 1200;
-static constexpr uint32_t TEXT_SCROLL_STEP_MS = 220;
+static constexpr uint32_t TEXT_SCROLL_STEP_MS = 350;
 static constexpr uint32_t BATTERY_POLL_MS = 5000;
 static constexpr uint32_t BNC_CHANNEL_ATTACH_IDLE_MS = 5000;
 static constexpr size_t IRC_RX_BYTE_BUDGET_PER_LOOP = 4096;
 static constexpr size_t IRC_RX_LINE_BUDGET_PER_LOOP = 24;
 static constexpr uint32_t KEYBOARD_ACTION_DEBOUNCE_MS = 120;
-static constexpr size_t MAX_PENDING_SD_LOG_LINES = 192;
-static constexpr size_t SD_LOG_FLUSH_MAX_LINES = 16;
+static constexpr size_t MAX_PENDING_SD_LOG_LINES = 96;
+static constexpr size_t SD_LOG_FLUSH_MAX_LINES = 12;
 static constexpr uint32_t SD_LOG_FLUSH_TIME_BUDGET_US = 2500;
 
 static constexpr const char* CONFIG_PATH = "/irc/config.txt";
@@ -638,9 +639,9 @@ class SimpleTransport {
   }
 };
 
-class IrcClientApp {
- public:
-  IrcClientApp() : _frameBuffer(&M5Cardputer.Display) {}
+ class IrcClientApp {
+  public:
+   IrcClientApp() {}
 
   void begin() {
     auto cfg = M5.config();
@@ -910,8 +911,6 @@ class IrcClientApp {
 
  private:
   Config _cfg;
-  M5Canvas _frameBuffer;
-  bool _useFrameBuffer = false;
   SimpleTransport _transport;
   std::vector<Tab> _tabs;
   int _activeTab = 0;
@@ -1680,7 +1679,7 @@ class IrcClientApp {
   }
 
   void initFrameBuffer() {
-    _useFrameBuffer = false;
+    // Framebuffer removed to save 65KB RAM on 512KB device — direct draw is used.
   }
 
   void showBootTitle() {
@@ -1791,17 +1790,14 @@ class IrcClientApp {
     }
     // Reset text size for rest of UI
     M5Cardputer.Display.setTextSize(1);
-    if (_useFrameBuffer) _frameBuffer.setTextSize(1);
   }
 
   lgfx::LovyanGFX& drawTarget() {
-    return _useFrameBuffer
-      ? static_cast<lgfx::LovyanGFX&>(_frameBuffer)
-      : static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
+    return static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
   }
 
   void presentFrame() {
-    if (_useFrameBuffer) _frameBuffer.pushSprite(0, 0);
+    // No-op — direct draw, no sprite to push (saves RAM, subtle partial redraw handles flicker)
   }
 
   void serviceTextScroll() {
@@ -1832,8 +1828,16 @@ class IrcClientApp {
     return std::max(1, BODY_H / ROW_H);
   }
 
+  bool isNickPaneVisible(const Tab& tab) const {
+    if (!_cfg.nickPaneEnabled) return false;
+    if (tab.type != TabType::Channel) return false;
+    if (tab.users.size() >= 2) return true;
+    // Peek when Fn held — modern ratspeak style slide-over
+    // M5Cardputer.Keyboard access is safe even in const context (global)
+    return M5Cardputer.Keyboard.keysState().fn;
+  }
   int bodyWidthForTab(const Tab& tab) const {
-    bool pane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
+    bool pane = isNickPaneVisible(tab);
     int paneWidth = pane ? NICK_PANE_W : 0;
     return SCREEN_W - paneWidth - 2;
   }
@@ -4957,7 +4961,8 @@ class IrcClientApp {
     if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
     auto& gfx = drawTarget();
-    // Subtle refresh: only redraw dirty regions, no full fillScreen to avoid flicker.
+    // Even less noticeable: batch SPI transaction and only redraw dirty regions
+    gfx.startWrite();
     if (_configOpen) {
       drawConfigPage();
       drawNavBar();
@@ -4973,6 +4978,7 @@ class IrcClientApp {
       if (_navDirty) drawNavBar();
       if (_inputDirty) drawInput();
     }
+    gfx.endWrite();
     presentFrame();
     _dirty = false;
     _headerDirty = _bodyDirty = _inputDirty = _navDirty = false;
@@ -5299,9 +5305,11 @@ class IrcClientApp {
     }
 
     if (_batteryChargeState == m5::Power_Class::is_charging) {
-      gfx.drawLine(x + 8, y + 1, x + 6, y + 4, UI_FG);
-      gfx.drawLine(x + 6, y + 4, x + 9, y + 4, UI_FG);
-      gfx.drawLine(x + 9, y + 4, x + 7, y + 7, UI_FG);
+      // Modern bolt — filled zigzag for visibility on 18×8 pill
+      gfx.fillTriangle(x + 8, y + 1, x + 5, y + 4, x + 8, y + 4, UI_FG);
+      gfx.fillTriangle(x + 8, y + 4, x + 11, y + 4, x + 7, y + 7, UI_FG);
+      gfx.drawLine(x + 8, y + 1, x + 5, y + 4, UI_BG);
+      gfx.drawLine(x + 7, y + 7, x + 11, y + 4, UI_BG);
     }
   }
 
@@ -5371,7 +5379,7 @@ class IrcClientApp {
   void drawMarqueeBody() {
     auto& gfx = drawTarget();
     const Tab& tab = _tabs[_activeTab];
-    bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
+    bool showPane = isNickPaneVisible(tab);
     int textWidth = bodyWidthForTab(tab);
     int start = 0;
     int end = 0;
@@ -5392,7 +5400,7 @@ class IrcClientApp {
   void drawWrappedBody() {
     auto& gfx = drawTarget();
     Tab& tab = _tabs[_activeTab];
-    bool showPane = _cfg.nickPaneEnabled && tab.type == TabType::Channel;
+    bool showPane = isNickPaneVisible(tab);
     int textWidth = bodyWidthForTab(tab);
     clampTabScroll(tab);
     int visibleRows = bodyVisibleRows();
