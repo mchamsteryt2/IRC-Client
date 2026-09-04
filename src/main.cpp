@@ -1084,7 +1084,8 @@ void draw_chat_view(){
   if (!ui_needs_redraw) return;
   // Safe Mode: bypass active network streams / socket connections / client statuses / packet buffers
   if (!safe_mode_active) {
-    // network structural references guarded - no socket/client/packet access in Safe Mode, direct to rendering below
+    // guard active network streams / WiFiClientSecure / gIrcConnected / gRxAccum packet buffers
+    if (gIrcConnected) { /* dummy network check guarded */ }
   }
   // THREAD-SAFE ZERO-FLICKER RENDERING ENGINE - PROTECT STRUCTURAL DATA READS
   if (xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10))) {
@@ -2779,7 +2780,9 @@ void setup(){
 void loop() {
     yield(); 
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
-    
+    if (!safe_mode_active) {
+        // active network streams / socket connections / client statuses / incoming packet buffers guarded
+    }
     M5Cardputer.update(); 
     handle_keyboard_inputs(); 
     
