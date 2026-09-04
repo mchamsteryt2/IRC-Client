@@ -2194,7 +2194,7 @@ static void netTask(void* arg){
       else ok = gPlain.connect(_bncHost.c_str(), _bncPort);
       if(ok){
         gIrcConnected=true; gIrcRegistered=false; gLastRxMs=millis(); gAwaitPong=false;
-        if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){ add_message_to_buffer("Connected to bouncer"); xSemaphoreGive(irc_mutex); }
+        add_message_to_buffer("Connected to bouncer");
         // AUTHENTICATION STRING ASSEMBLY: allocate temporary stack buffer and combine bouncer creds per spec
         char auth_buffer[160];
         snprintf(auth_buffer, sizeof(auth_buffer), "PASS %s/%s:%s\r\n", bnc_user, bnc_net, bnc_pass);
@@ -2256,7 +2256,7 @@ static void netTask(void* arg){
 
 // SPI BUS HARDWARE CONFLICT PROTECTION - Core 0 dedicated SD logging task
 // Completely halts and waits for Core 1 SPI screen canvas flushes via irc_mutex
-static void add_message_to_buffer(const char* msg){ if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); xSemaphoreGive(irc_mutex); }
+static void add_message_to_buffer(const char* msg){ if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); ui_needs_redraw = true; xSemaphoreGive(irc_mutex); }
 static void logTask(void* arg){
   (void)arg;
   for(;;){
@@ -2664,17 +2664,7 @@ void setup(){
   } else if(isWifiDummy(gCfg)){
     logStatus("Provisioning mode");
   } else {
-    // Wi-Fi client initialization loop - non-blocking, no while(WiFi.status()!=WL_CONNECTED) block in setup
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    WiFi.begin(gCfg.wifiSSID, gCfg.wifiPass);
-    gWifiConnecting=true; gWifiStartMs=millis();
-  }
-  // DE-COUPLE NETWORK SELECTION & BOOT BLOCKS: background worker at absolute END of setup()
-  if(!gSafeBoot){
-    xTaskCreatePinnedToCore(logTask, "irc_log", 4096, nullptr, 1, &gLogTaskHandle, 0);
-    xTaskCreatePinnedToCore(netTask, "irc_net", 8192, nullptr, 2, &gNetTaskHandle, 0);
-  } else {
+    // Wi-Fi client initialization loop - non-blocking, no  else {
     logStatus("Safe Mode: net tasks bypassed");
   }
 }
@@ -2683,7 +2673,8 @@ void setup(){
 // Loop - Core 1 graphics/keyboard, protected shared vars via mutex
 // ---------------------------------------------------------------------------
 void loop(){
-  // Safe Mode: if still dummy and not in scanner, keep provisioning active
+  M5Cardputer.update();
+  handle_keyboard_inputs();
   serviceKeyboard();
   if(gQuickOverlay && millis() - gQuickOverlayMs > 8000){ saveConfig(); gQuickOverlay=false; }
   if(!gSafeBoot) serviceWifi();
@@ -2692,6 +2683,7 @@ void loop(){
   pollBattery();
   pollJack();
   serviceStealthLed();
+  if (WiFi.status() != WL_CONNECTED) { ui_needs_redraw = true; }
 
   char line[IRC_LINE_MAX+1];
   int drained=0;
