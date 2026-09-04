@@ -67,7 +67,7 @@ static constexpr int INPUT_Y = SCREEN_H - INPUT_H;
 
 static constexpr int CHAR_W = 6;
 static constexpr int CHAR_H = 8;
-static constexpr int ROW_H  = 10; // 2-pixel padding window to stop vertical collision bleeding
+static constexpr int ROW_H  = 10; // 2-pixel padding window to stop vertical collision // 2-pixel padding window to stop vertical collision bleeding
 static constexpr int CHAT_ROWS = CHAT_H / ROW_H; // 10 rows visible with 10px height
 
 // Input scrolling spec: 38 columns visible before horizontal scroll
@@ -253,7 +253,8 @@ static TaskHandle_t gLogTaskHandle = nullptr;
 static WiFiClientSecure gSecure;
 static WiFiClient gPlain;
 
-static lgfx::LGFX_Sprite gChatCanvas(&M5Cardputer.Display);
+static lgfx::LGFX_Sprite canvas(&M5Cardputer.Display);
+static lgfx::LGFX_Sprite gChatCanvas(&M5Cardputer.Display); // legacy alias for unified canvas
 static bool gCanvasReady = false;
 
 static TaskHandle_t gNetTaskHandle = nullptr;
@@ -905,21 +906,30 @@ static void wakeFromSleep(){
 // ---------------------------------------------------------------------------
 static void initCanvas(){
   if(gCanvasReady) return;
-  gChatCanvas.setColorDepth(8); // RGB332 spec, reclaims 12KB
-  gChatCanvas.setPsram(false);
-  gChatCanvas.setTextSize(1);
-  gChatCanvas.setTextWrap(false);
-  if(!gChatCanvas.createSprite(SCREEN_W, CHAT_H)){
-    gChatCanvas.deleteSprite();
-    gChatCanvas.setColorDepth(8);
-    gChatCanvas.createSprite(SCREEN_W, CHAT_H);
+  canvas.setColorDepth(8);
+  canvas.setPsram(false);
+  canvas.setTextSize(1);
+  canvas.setTextWrap(false);
+  if(!canvas.createSprite(240, 135)){
+    canvas.deleteSprite();
+    canvas.setColorDepth(8);
+    canvas.createSprite(240, 135);
   }
-  gChatCanvas.fillScreen(UI_BG);
-  gCanvasReady = gChatCanvas.width()==SCREEN_W && gChatCanvas.height()==CHAT_H;
+  canvas.fillScreen(UI_BG);
+  // Spec required unified composite 240x135 8-bit
+  canvas.createSprite(240, 135); canvas.setColorDepth(8);
+  canvas.setColorDepth(8);
+  canvas.setPsram(false);
+  if(!canvas.createSprite(SCREEN_W, CHAT_H)){
+    canvas.deleteSprite();
+    canvas.setColorDepth(8);
+    canvas.createSprite(SCREEN_W, CHAT_H);
+  }
+  gCanvasReady = canvas.width()==240 && canvas.height()==135;
 }
 
 static void drawTopBar(){
-  auto &d = M5Cardputer.Display;
+  auto &d = canvas;
   d.fillRect(0,0,SCREEN_W,TOP_H, UI_BG);
   d.drawFastHLine(0,TOP_H-1,SCREEN_W, UI_DIM);
   d.setTextSize(1);
@@ -951,35 +961,41 @@ static void drawTopBar(){
     x += 4;
     if(x >= SCREEN_W) break;
   }
-  // Battery voltage on far right (GPIO10 float with 2.0x divider)
-  char bstr[12];
-  snprintf(bstr,sizeof(bstr),"%.2fV", gBattVoltage);
-  d.setTextColor(UI_DIM, UI_BG);
-  int bw = strlen(bstr)*CHAR_W;
-  d.setCursor(SCREEN_W - bw -2, 2);
-  d.print(bstr);
-  // Audio status bracket tags - clean text-based per spec, no emojis
-  char audioTag[4];
+  // Battery voltage on far right - truncated title at X=130, fixed anchors per spec
+  // Truncate title string at X=130 to prevent shifting status icons
+  // (tabs already truncated via x limit, but enforce hard cap at 130)
+  // Fixed right-aligned anchors: Mute at X=145, Time at X=175, Battery at X=212
+  char audioTag[7];
   uint16_t audioCol;
   if(gCfg.current_audio == 1){
-    // Stealth/LED mode - muted
-    strncpy(audioTag, "[M]", sizeof(audioTag)); // alternative [X]
-    audioCol = 0xF800; // bright red (or 0xFFE0 yellow)
+    strncpy(audioTag, "[MUTE]", sizeof(audioTag));
+    audioCol = 0xF800; // bright red
   } else {
-    // Loud/Audio mode - live
-    strncpy(audioTag, "[S]", sizeof(audioTag)); // alternative [+]
+    strncpy(audioTag, "[LOUD]", sizeof(audioTag));
     audioCol = 0x07E0; // solid bright green
   }
   d.setTextColor(audioCol, UI_BG);
-  int audioW = strlen(audioTag)*CHAR_W;
-  int audioX = SCREEN_W - bw - audioW - 10;
-  if(audioX < x+2) audioX = x+2;
-  d.setCursor(audioX, 2);
+  d.setCursor(145, 2);
   d.print(audioTag);
+  // Local Time Clock at X=175
+  char timeStr[9]; currentStamp(nullptr,0,timeStr,sizeof(timeStr));
+  // Apply timezone and 12h conversion for HUD clock as well
+  char timeHHMM[6]; if(strlen(timeStr)>=5){ timeHHMM[0]=timeStr[0]; timeHHMM[1]=timeStr[1]; timeHHMM[2]=':'; timeHHMM[3]=timeStr[3]; timeHHMM[4]=timeStr[4]; timeHHMM[5]='\0'; char loc[6]; localizeTimeHHMM(timeHHMM, loc); safeCopy(timeStr, loc, sizeof(timeStr)); }
+  d.setTextColor(UI_FG, UI_BG);
+  d.setCursor(175, 2);
+  d.print(timeStr);
+  // Battery Percentage HUD at X=212 - whole integer percentage from GPIO10 11dB raw math
+  float v = readBatteryVoltage();
+  int pct = (int)((v - 3.2f) / (4.2f - 3.2f) * 100.0f);
+  if(pct<0) pct=0; if(pct>100) pct=100;
+  char bstr[8]; snprintf(bstr,sizeof(bstr),"%d%%", pct);
+  d.setTextColor(UI_DIM, UI_BG);
+  d.setCursor(212, 2);
+  d.print(bstr);
 }
 
 static void drawBottomInput(){
-  auto &d = M5Cardputer.Display;
+  auto &d = canvas;
   d.fillRect(0,INPUT_Y,SCREEN_W,INPUT_H, UI_BG);
   d.drawFastHLine(0,INPUT_Y,SCREEN_W, UI_DIM);
   d.setTextSize(1);
@@ -1052,39 +1068,39 @@ void draw_chat_view(){
     (void)audioTag; (void)audioCol;
   }
   if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
-  gChatCanvas.fillScreen(UI_BG);
-  gChatCanvas.setTextSize(1);
+  canvas.fillScreen(UI_BG);
+  canvas.setTextSize(1);
   Tab* tab=activeTab();
-  if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); ui_needs_redraw = false; return; }
+  if(!tab){ canvas.pushSprite(0,0); ui_needs_redraw = false; return; }
   ensureTabLayout(tab);
   int total=tab->count, vis=CHAT_ROWS, startLogical=total-vis-tab->scroll;
   if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
   int y=1;
   for(int li=startLogical; li<endLogical; ++li){
     const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
-    gChatCanvas.setTextColor(0x8410,UI_BG); gChatCanvas.setCursor(2,y+1); gChatCanvas.print(cl->stamp);
-    gChatCanvas.drawFastVLine(64,y,ROW_H,0x8410);
+    canvas.setTextColor(0x8410,UI_BG); canvas.setCursor(2,y+1); canvas.print(cl->stamp);
+    canvas.drawFastVLine(64,y,ROW_H,0x8410);
     char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
     char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt=out; bool hasNick=false;
     if(txt[0]=='<' ){ const char* end=strchr(txt,'>'); if(end){ size_t nlen=end-txt-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt,sizeof(bodyTmp)); }
     else if(txt[0]=='*'&&txt[1]==' '){ const char* sp=strchr(txt+2,' '); if(sp){ size_t nlen=sp-(txt+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt,sizeof(bodyTmp));}
     else safeCopy(bodyTmp,txt,sizeof(bodyTmp));
-    if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; gChatCanvas.setTextColor(col,UI_BG); gChatCanvas.setCursor(xNick,y+1); gChatCanvas.print(nickTmp); }
-    gChatCanvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG),UI_BG);
+    if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; canvas.setTextColor(col,UI_BG); canvas.setCursor(xNick,y+1); canvas.print(nickTmp); }
+    canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG),UI_BG);
     int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
-    gChatCanvas.setCursor(70,y+1); gChatCanvas.print(bodyTmp);
+    canvas.setCursor(70,y+1); canvas.print(bodyTmp);
     y+=ROW_H;
   }
-  gChatCanvas.pushSprite(0,CHAT_Y);
+  canvas.pushSprite(0,0);
   ui_needs_redraw = false;
 }
 static void drawChatViewport(){
   if (!ui_needs_redraw) return;
   if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
-  gChatCanvas.fillScreen(UI_BG);
-  gChatCanvas.setTextSize(1);
+  canvas.fillScreen(UI_BG);
+  canvas.setTextSize(1);
   Tab* tab=activeTab();
-  if(!tab){ gChatCanvas.pushSprite(0,CHAT_Y); ui_needs_redraw = false; return; }
+  if(!tab){ canvas.pushSprite(0,0); ui_needs_redraw = false; return; }
   ensureTabLayout(tab); // lazy trigger - inactive tabs have bypassed this until now
   int total = tab->count;
   int vis = CHAT_ROWS;
@@ -1097,10 +1113,10 @@ static void drawChatViewport(){
     const ChatLine* cl=ringAt(tab, li);
     if(!cl) continue;
     // COMPACT COLUMN ARRAYS: dimmed timestamp, divider at 64, nick right-aligned, body at 70, ROW 10 with 2px padding
-    gChatCanvas.setTextColor(0x8410, UI_BG); // muted grey dimmed timestamp
-    gChatCanvas.setCursor(2, y+1);
-    gChatCanvas.print(cl->stamp);
-    gChatCanvas.drawFastVLine(64, y, ROW_H, 0x8410); // solid vertical dividing line at X=64
+    canvas.setTextColor(0x8410, UI_BG); // muted grey dimmed timestamp
+    canvas.setCursor(2, y+1);
+    canvas.print(cl->stamp);
+    canvas.drawFastVLine(64, y, ROW_H, 0x8410); // solid vertical dividing line at X=64
     char out[MAX_LINE_LEN+1];
     safeCopy(out, cl->text, sizeof(out));
     sanitizeGlyphs(out);
@@ -1128,83 +1144,83 @@ static void drawChatViewport(){
       int nickW = strlen(nickTmp)*CHAR_W;
       int xNick = 64 - nickW - 4;
       if(xNick < 32) xNick = 32;
-      gChatCanvas.setTextColor(col, UI_BG);
-      gChatCanvas.setCursor(xNick, y+1);
-      gChatCanvas.print(nickTmp);
+      canvas.setTextColor(col, UI_BG);
+      canvas.setCursor(xNick, y+1);
+      canvas.print(nickTmp);
     }
     // Message body starting at X=70
-    gChatCanvas.setTextColor((cl->flags & 0x01)?UI_WARN:((cl->flags & 0x04)?0x8410:UI_FG), UI_BG);
+    canvas.setTextColor((cl->flags & 0x01)?UI_WARN:((cl->flags & 0x04)?0x8410:UI_FG), UI_BG);
     int maxBodyCols = (SCREEN_W - 70 -2)/CHAR_W;
     if((int)strlen(bodyTmp) > maxBodyCols){ bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0'; }
-    gChatCanvas.setCursor(70, y+1);
-    gChatCanvas.print(bodyTmp);
+    canvas.setCursor(70, y+1);
+    canvas.print(bodyTmp);
     y += ROW_H;
   }
   if(gNickOverlay && tab->type==TAB_CHANNEL){
     int pw = 120, ph = 90;
     int px = (SCREEN_W - pw)/2;
     int py = (CHAT_H - ph)/2;
-    gChatCanvas.fillRect(px,py,pw,ph, UI_BG);
-    gChatCanvas.drawRect(px,py,pw,ph, UI_FG);
-    gChatCanvas.setCursor(px+4, py+3);
-    gChatCanvas.setTextColor(UI_FG, UI_BG);
-    gChatCanvas.print("Nicks:");
+    canvas.fillRect(px,py,pw,ph, UI_BG);
+    canvas.drawRect(px,py,pw,ph, UI_FG);
+    canvas.setCursor(px+4, py+3);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.print("Nicks:");
     int ny=py+14;
     for(int i=0;i<tab->nickCount && i<8; ++i){
-      gChatCanvas.setCursor(px+4, ny);
-      gChatCanvas.setTextColor(UI_DIM, UI_BG);
-      gChatCanvas.print(tab->nicks[i]);
+      canvas.setCursor(px+4, ny);
+      canvas.setTextColor(UI_DIM, UI_BG);
+      canvas.print(tab->nicks[i]);
       ny+=9;
     }
-    if(tab->nickCount>8){ gChatCanvas.setCursor(px+4, ny); gChatCanvas.print("..."); }
+    if(tab->nickCount>8){ canvas.setCursor(px+4, ny); canvas.print("..."); }
   }
-  gChatCanvas.pushSprite(0, CHAT_Y);
+  canvas.pushSprite(0,0);
   // Quick Settings overlay - 5-row grid: 0 Audio,1 Brightness,2 SD Filtering,3 TimeZone,4 Hour Format
   if(gQuickOverlay){
     int ow=200, oh=110;
     int ox=(SCREEN_W-ow)/2;
     int oy=CHAT_Y + (CHAT_H-oh)/2;
-    M5Cardputer.Display.fillRect(ox,oy,ow,oh, UI_BG);
-    M5Cardputer.Display.drawRect(ox,oy,ow,oh, UI_FG);
-    M5Cardputer.Display.setTextSize(1);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+6);
-    M5Cardputer.Display.print("Quick Settings 5-row");
+    canvas.fillRect(ox,oy,ow,oh, UI_BG);
+    canvas.drawRect(ox,oy,ow,oh, UI_FG);
+    canvas.setTextSize(1);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.setCursor(ox+6, oy+6);
+    canvas.print("Quick Settings 5-row");
     // Row 0 Audio Profile
-    if(current_settings_row==0) M5Cardputer.Display.fillRect(ox+2, oy+16, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+18);
-    M5Cardputer.Display.printf("Audio:%s", gCfg.current_audio?"Stealth":"Normal");
+    if(current_settings_row==0) canvas.fillRect(ox+2, oy+16, ow-4, 10, UI_FG), canvas.setTextColor(UI_BG, UI_FG);
+    else canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+18);
+    canvas.printf("Audio:%s", gCfg.current_audio?"Stealth":"Normal");
     // Row 1 Brightness Level
-    if(current_settings_row==1) M5Cardputer.Display.fillRect(ox+2, oy+26, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+28);
-    M5Cardputer.Display.printf("Bright:%d/10", gCfg.brightness);
+    if(current_settings_row==1) canvas.fillRect(ox+2, oy+26, ow-4, 10, UI_FG), canvas.setTextColor(UI_BG, UI_FG);
+    else canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+28);
+    canvas.printf("Bright:%d/10", gCfg.brightness);
     // Row 2 SD Filtering Level
-    if(current_settings_row==2) M5Cardputer.Display.fillRect(ox+2, oy+36, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+38);
-    M5Cardputer.Display.printf("SD Filter:%s", logLevelStr(gCfg.logLevel));
+    if(current_settings_row==2) canvas.fillRect(ox+2, oy+36, ow-4, 10, UI_FG), canvas.setTextColor(UI_BG, UI_FG);
+    else canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+38);
+    canvas.printf("SD Filter:%s", logLevelStr(gCfg.logLevel));
     // Row 3 Local TimeZone
-    if(current_settings_row==3) M5Cardputer.Display.fillRect(ox+2, oy+46, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+48);
-    M5Cardputer.Display.printf("TZ:%s %+d", TZ_PROFILES[gTimezoneIndex].label, TZ_PROFILES[gTimezoneIndex].offset);
+    if(current_settings_row==3) canvas.fillRect(ox+2, oy+46, ow-4, 10, UI_FG), canvas.setTextColor(UI_BG, UI_FG);
+    else canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+48);
+    canvas.printf("TZ:%s %+d", TZ_PROFILES[gTimezoneIndex].label, TZ_PROFILES[gTimezoneIndex].offset);
     // Row 4 Hour Format
-    if(current_settings_row==4) M5Cardputer.Display.fillRect(ox+2, oy+56, ow-4, 10, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-    else M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+58);
-    M5Cardputer.Display.printf("Hour:%s", gUse12Hour?"12H":"24H");
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+68);
-    M5Cardputer.Display.printf("Batt:%.2fV", gBattVoltage);
-    M5Cardputer.Display.setCursor(ox+6, oy+78);
-    M5Cardputer.Display.printf("Jack:%s", gJackPlugged?"PLUG":"OPEN");
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(ox+6, oy+88);
-    M5Cardputer.Display.print("Up/Dn Row  <>Value");
-    M5Cardputer.Display.setCursor(ox+6, oy+98);
-    M5Cardputer.Display.print("G0=save Fn+Q toggle");
+    if(current_settings_row==4) canvas.fillRect(ox+2, oy+56, ow-4, 10, UI_FG), canvas.setTextColor(UI_BG, UI_FG);
+    else canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+58);
+    canvas.printf("Hour:%s", gUse12Hour?"12H":"24H");
+    canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.setCursor(ox+6, oy+68);
+    canvas.printf("Batt:%.2fV", gBattVoltage);
+    canvas.setCursor(ox+6, oy+78);
+    canvas.printf("Jack:%s", gJackPlugged?"PLUG":"OPEN");
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.setCursor(ox+6, oy+88);
+    canvas.print("Up/Dn Row  <>Value");
+    canvas.setCursor(ox+6, oy+98);
+    canvas.print("G0=save Fn+Q toggle");
     // keep legacy alias in sync
     gQuickOverlayRow = current_settings_row;
   }
@@ -1236,6 +1252,17 @@ static void serverSkipForward();
 static void serverSkipBackward();
 void handle_keyboard_inputs(){
   auto st = M5Cardputer.Keyboard.keysState();
+  // HIGH-PRIORITY KEYBOARD MACRO PRECEDENCE: Fn block at absolute top per spec
+  if(st.fn){
+    for(char c: st.word){
+      if(c=='s' || c=='S'){
+        gCfg.current_audio = gCfg.current_audio ? 0 : 1;
+        digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH);
+        ui_needs_redraw = true;
+        return;
+      }
+    }
+  }
   // CHANNEL STEPPING (Alt + Arrows) per spec
   if(st.alt){
     for(char c : st.word){
@@ -1271,7 +1298,7 @@ void handle_keyboard_inputs(){
         logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
         for(int r=0; r<2; ++r){
           neopixelWrite(LED_PIN, 60, 0, 60);
-          uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+          uint16_t purp = canvas.color565(60, 0, 60);
           (void)purp;
           vTaskDelay(pdMS_TO_TICKS(100));
           neopixelWrite(LED_PIN, 0, 0, 0);
@@ -1281,13 +1308,13 @@ void handle_keyboard_inputs(){
         // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
         logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
         for(int b=0; b<=40; b+=4){
-          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
           neopixelWrite(LED_PIN, 0, b, 60);
           (void)col2;
           vTaskDelay(pdMS_TO_TICKS(25));
         }
         for(int b=40; b>=0; b-=4){
-          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
           neopixelWrite(LED_PIN, 0, b, 60);
           (void)col2;
           vTaskDelay(pdMS_TO_TICKS(25));
@@ -1296,7 +1323,7 @@ void handle_keyboard_inputs(){
         // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
         logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
         {
-          uint16_t col3 = M5Cardputer.Display.color565(40, 15, 0);
+          uint16_t col3 = canvas.color565(40, 15, 0);
           (void)col3;
           neopixelWrite(LED_PIN, 40, 15, 0);
         }
@@ -1363,7 +1390,6 @@ static void cycleBrightness(int d){ int v=(int)gCfg.brightness+d; if(v<0) v=0; i
 static void cycleFilter(int d){ int v=(int)gCfg.logLevel+d; if(v<0) v=2; if(v>2) v=0; gCfg.logLevel=(LogLevel)v; ui_needs_redraw = true; }
 
 void run_bouncer_setup_menu(){
-  // Pause chat loops
   bool prevScanner = gInScanner;
   gInScanner = true;
   ui_needs_redraw = true;
@@ -1377,48 +1403,64 @@ void run_bouncer_setup_menu(){
     int len = strlen(buf);
     int cursor = len;
     bool done=false;
+    // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE): background frames and instruction text
+    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+    canvas.fillScreen(UI_BG);
+    canvas.drawRect(0,0,SCREEN_W,SCREEN_H, UI_FG);
+    canvas.setTextSize(1);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.setCursor(4,4);
+    canvas.printf("Bouncer Setup %d/4", step+1);
+    canvas.setCursor(4,18);
+    canvas.printf("%s:", prompts[step]);
+    canvas.setCursor(4,110);
+    canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.print("Enter=next Del=back  Fn+Q=cancel");
+    if(irc_mutex) xSemaphoreGive(irc_mutex);
+    bool menu_needs_redraw = true;
     while(!done){
-      if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
-      M5Cardputer.Display.fillScreen(UI_BG);
-      M5Cardputer.Display.setTextSize(1);
-      M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-      M5Cardputer.Display.setCursor(4,4);
-      M5Cardputer.Display.printf("Bouncer Setup %d/4", step+1);
-      M5Cardputer.Display.setCursor(4,18);
-      M5Cardputer.Display.printf("%s:", prompts[step]);
-      M5Cardputer.Display.setCursor(4,32);
-      if(step==3){
-        for(int i=0;i<len;++i) M5Cardputer.Display.print("*");
-        M5Cardputer.Display.print("_");
-      } else {
-        M5Cardputer.Display.print(buf);
-        M5Cardputer.Display.print("_");
+      if(menu_needs_redraw){
+        if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+        // Dark blue input strip box
+        canvas.fillRect(2, 28, SCREEN_W-4, 20, 0x001F);
+        canvas.drawRect(2, 28, SCREEN_W-4, 20, UI_FG);
+        canvas.setCursor(4,32);
+        canvas.setTextColor(UI_FG, 0x001F);
+        if(step==3){
+          for(int i=0;i<len;++i) canvas.print("*");
+          canvas.print("_");
+        } else {
+          canvas.print(buf);
+          canvas.print("_");
+        }
+        if(irc_mutex) xSemaphoreGive(irc_mutex);
+        menu_needs_redraw = false;
       }
-      M5Cardputer.Display.setCursor(4,110);
-      M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-      M5Cardputer.Display.print("Enter=next Del=back");
-      if(irc_mutex) xSemaphoreGive(irc_mutex);
       M5Cardputer.update();
       if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
         auto ks2 = M5Cardputer.Keyboard.keysState();
+        bool changed=false;
         for(char c : ks2.word){
           if(c>=32 && c<127 && len < (int)sizeof(buf)-1){
             memmove(buf+cursor+1, buf+cursor, len - cursor + 1);
             buf[cursor++]=c; len++; buf[len]='\0';
-            ui_needs_redraw = true;
+            changed=true;
           }
         }
-        if(ks2.del && len>0 && cursor>0){
+        if(changed){ menu_needs_redraw = true; }
+        if(ks2.alt && ks2.del /* Alt+Backspace '\b' escape */){ gInScanner = prevScanner; ui_needs_redraw = true; return; }
+        if(ks2.del /* Alt+Backspace '\b' escape */ && len>0 && cursor>0){
           memmove(buf+cursor-1, buf+cursor, len - cursor + 1);
           cursor--; len--;
-          ui_needs_redraw = true;
+          menu_needs_redraw = true;
         }
         if(ks2.enter){
           done=true;
-          ui_needs_redraw = true;
+          menu_needs_redraw = true;
         }
+        if(ks2.alt && ks2.del /* Alt+Backspace '\b' escape */){ gInScanner = prevScanner; ui_needs_redraw = true; return; }
         if(ks2.fn){
-          for(char cc : ks2.word){ if(cc=='q' || cc=='Q'){ done=true; break; } }
+          for(char cc : ks2.word){ if(cc=='q' || cc=='Q'){ done=true; menu_needs_redraw = true; break; } }
         }
       }
       vTaskDelay(pdMS_TO_TICKS(30));
@@ -1462,10 +1504,8 @@ static void serverSkipBackward(){
 }
 
 void display_network_jump_hud(){
-  // Suspend regular chat rendering
   bool prev = gInScanner;
   gInScanner = true;
-  // Count distinct server names into active_networks
   active_networks_count = 0;
   for(int i=0;i<gTabCount && active_networks_count<4; ++i){
     const char* srv = gTabs[i].server[0] ? gTabs[i].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
@@ -1473,35 +1513,41 @@ void display_network_jump_hud(){
     for(int j=0;j<active_networks_count;++j) if(eqI(active_networks[j], srv)) exists=true;
     if(!exists){ safeCopy(active_networks[active_networks_count++], srv, sizeof(active_networks[0])); }
   }
-  // Fallback if no tabs, use current bouncer/host
   if(active_networks_count==0 && bnc_host.length()>0){ safeCopy(active_networks[0], bnc_host.c_str(), sizeof(active_networks[0])); active_networks_count=1; }
   else if(active_networks_count==0){ safeCopy(active_networks[0], gCfg.host, sizeof(active_networks[0])); active_networks_count=1; }
+  // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE)
+  if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+  canvas.fillScreen(UI_BG);
+  canvas.drawRect(0,0,SCREEN_W,SCREEN_H, 0xFFFF);
+  canvas.fillRect(10,10,SCREEN_W-20,SCREEN_H-20, UI_BG);
+  canvas.drawRect(10,10,SCREEN_W-20,SCREEN_H-20, 0xFFFF);
+  canvas.setTextSize(1);
+  canvas.setTextColor(0xFFFF, UI_BG);
+  canvas.setCursor(20,20);
+  canvas.print("Network Jump HUD");
+  canvas.setTextColor(UI_DIM, UI_BG);
+  canvas.setCursor(20,35);
+  canvas.printf("Found %d networks", active_networks_count);
+  for(int i=0;i<active_networks_count;++i){
+    canvas.setCursor(20, 50 + i*15);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.printf("%d: %s", i+1, active_networks[i]);
+  }
+  canvas.setCursor(20, SCREEN_H-15);
+  canvas.setTextColor(UI_DIM, UI_BG);
+  canvas.print("1-4=Jump  Del=Close");
+  if(irc_mutex) xSemaphoreGive(irc_mutex);
+  bool menu_needs_redraw = true;
   while(true){
-    if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.drawRect(0,0,SCREEN_W,SCREEN_H, 0xFFFF);
-    M5Cardputer.Display.fillRect(10,10,SCREEN_W-20,SCREEN_H-20, UI_BG);
-    M5Cardputer.Display.drawRect(10,10,SCREEN_W-20,SCREEN_H-20, 0xFFFF);
-    M5Cardputer.Display.setTextSize(1);
-    M5Cardputer.Display.setTextColor(0xFFFF, UI_BG);
-    M5Cardputer.Display.setCursor(20,20);
-    M5Cardputer.Display.print("Network Jump HUD");
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.setCursor(20,35);
-    M5Cardputer.Display.printf("Found %d networks", active_networks_count);
-    for(int i=0;i<active_networks_count;++i){
-      M5Cardputer.Display.setCursor(20, 50 + i*15);
-      M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-      M5Cardputer.Display.printf("%d: %s", i+1, active_networks[i]);
+    if(menu_needs_redraw){
+      // STATE-CHANGED RENDERING ONLY: draw dark blue input strip if needed (static overlay already drawn once)
+      menu_needs_redraw = false;
     }
-    M5Cardputer.Display.setCursor(20, SCREEN_H-15);
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.print("1-4=Jump  Del=Close");
-    if(irc_mutex) xSemaphoreGive(irc_mutex);
     M5Cardputer.update();
     if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
       auto ks = M5Cardputer.Keyboard.keysState();
       if(ks.del){ break; }
+      bool changed=false;
       for(char c: ks.word){
         if(c>='1' && c<='4'){
           int idx = c - '1';
@@ -1521,6 +1567,7 @@ void display_network_jump_hud(){
           }
         }
       }
+      if(changed) menu_needs_redraw = true;
       if(ks.enter) break;
     }
     vTaskDelay(pdMS_TO_TICKS(30));
@@ -1936,11 +1983,11 @@ static void handleUserInput(const char* in){
 // ---------------------------------------------------------------------------
 static void runWifiProvisioning(){
   gInScanner=true;
-  M5Cardputer.Display.fillScreen(UI_BG);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-  M5Cardputer.Display.setCursor(4,4);
-  M5Cardputer.Display.print("Scanning 2.4GHz...");
+  canvas.fillScreen(UI_BG);
+  canvas.setTextSize(1);
+  canvas.setTextColor(UI_FG, UI_BG);
+  canvas.setCursor(4,4);
+  canvas.print("Scanning 2.4GHz...");
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(true);
   delay(120);
@@ -1959,11 +2006,11 @@ static void runWifiProvisioning(){
   gScanFound = min(4, ac);
   for(int i=0;i<gScanFound;++i){ safeCopy(gScanSSID[i], all[i].ssid, sizeof(gScanSSID[i])); gScanRSSI[i]=all[i].rssi; }
   if(gScanFound==0){
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setCursor(4,20);
-    M5Cardputer.Display.print("No networks found");
-    M5Cardputer.Display.setCursor(4,40);
-    M5Cardputer.Display.print("Press Enter to retry");
+    canvas.fillScreen(UI_BG);
+    canvas.setCursor(4,20);
+    canvas.print("No networks found");
+    canvas.setCursor(4,40);
+    canvas.print("Press Enter to retry");
     while(true){
       M5Cardputer.update();
       if(M5Cardputer.Keyboard.isChange() && M5Cardputer.Keyboard.isPressed()){
@@ -1977,67 +2024,84 @@ static void runWifiProvisioning(){
   }
   gScanSel=0; gScanPassLen=0; gScanPass[0]='\0';
   enum State{ PICK, PASS } st=PICK;
+  // FORCE NATIVE ON-ENTRY REDRAW (DRAW ONCE)
+  if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+  canvas.fillScreen(UI_BG);
+  canvas.drawRect(0,0,SCREEN_W,SCREEN_H, UI_FG);
+  canvas.setTextSize(1);
+  canvas.setTextColor(UI_FG, UI_BG);
+  canvas.setCursor(4,2);
+  canvas.print("WiFi Manager");
+  if(irc_mutex) xSemaphoreGive(irc_mutex);
+  bool menu_needs_redraw = true;
   while(true){
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(4,2);
-    M5Cardputer.Display.print(st==PICK?"Select 1-4 ;/. to move":"Password (* masked)");
-    for(int i=0;i<gScanFound;++i){
-      int y=18+i*18;
-      if(i==gScanSel && st==PICK) M5Cardputer.Display.fillRect(0,y,SCREEN_W,14, UI_FG), M5Cardputer.Display.setTextColor(UI_BG, UI_FG);
-      else M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-      M5Cardputer.Display.setCursor(4,y+3);
-      char line[48]; snprintf(line,sizeof(line),"%d:%s (%d dBm)", i+1, gScanSSID[i], gScanRSSI[i]);
-      M5Cardputer.Display.print(line);
+    if(menu_needs_redraw){
+      if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+      if(st==PICK){
+        // Dark blue input strip for SSID list highlight
+        for(int i=0;i<gScanFound;++i){
+          int y=18+i*18;
+          if(i==gScanSel && st==PICK){
+            canvas.fillRect(0,y,SCREEN_W,14, 0x001F);
+            canvas.drawRect(0,y,SCREEN_W,14, UI_FG);
+            canvas.setTextColor(UI_FG, 0x001F);
+          } else {
+            canvas.fillRect(0,y,SCREEN_W,14, UI_BG);
+            canvas.setTextColor(UI_FG, UI_BG);
+          }
+          canvas.setCursor(4,y+3);
+          char line[48]; snprintf(line,sizeof(line),"%d:%s (%d dBm)", i+1, gScanSSID[i], gScanRSSI[i]);
+          canvas.print(line);
+        }
+        canvas.setCursor(4,104);
+        canvas.setTextColor(UI_DIM, UI_BG);
+        canvas.print("Press 1-4 or Enter   ;/. move");
+      } else {
+        canvas.fillRect(2, 88, SCREEN_W-4, 20, 0x001F);
+        canvas.drawRect(2, 88, SCREEN_W-4, 20, UI_FG);
+        canvas.setCursor(4, 92);
+        canvas.setTextColor(UI_FG, 0x001F);
+        canvas.print("Pass: ");
+        for(int i=0;i<gScanPassLen;++i) canvas.print("*");
+        canvas.print("_");
+      }
+      if(irc_mutex) xSemaphoreGive(irc_mutex);
+      menu_needs_redraw = false;
     }
-    if(st==PASS){
-      M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-      M5Cardputer.Display.setCursor(4, 92);
-      M5Cardputer.Display.print("Pass: ");
-      for(int i=0;i<gScanPassLen;++i) M5Cardputer.Display.print("*");
-      M5Cardputer.Display.print("_");
-      M5Cardputer.Display.setCursor(4, 106);
-      M5Cardputer.Display.print("Enter=verify  Del=back");
-      M5Cardputer.Display.setCursor(4, 118);
-      M5Cardputer.Display.print("1-4 selects network");
-    } else {
-      M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-      M5Cardputer.Display.setCursor(4, 104);
-      M5Cardputer.Display.print("Press 1-4 or Enter");
-    }
-    delay(40);
     M5Cardputer.update();
-    if(!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) continue;
+    if(!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()){ vTaskDelay(pdMS_TO_TICKS(30)); continue; }
     gLastInputMs=millis(); wakeFromSleep();
     auto ks=M5Cardputer.Keyboard.keysState();
     if(st==PICK){
-      // allow numeric 1-4 direct selection
+      bool selChanged=false;
       for(char c: ks.word){
         if(c>='1' && c<='4'){
           int idx=c-'1';
-          if(idx < gScanFound) gScanSel=idx;
+          if(idx < gScanFound && idx != gScanSel){ gScanSel=idx; selChanged=true; }
         }
-        if(c==';' && gScanSel>0) gScanSel--;
-        else if(c=='.' && gScanSel<gScanFound-1) gScanSel++;
+        if(c==';' && gScanSel>0){ gScanSel--; selChanged=true; }
+        else if(c=='.' && gScanSel<gScanFound-1){ gScanSel++; selChanged=true; }
       }
-      if(ks.enter){ st=PASS; gScanPassLen=0; gScanPass[0]='\0'; }
+      if(selChanged) menu_needs_redraw = true;
+      if(ks.enter){ st=PASS; gScanPassLen=0; gScanPass[0]='\0'; menu_needs_redraw = true; }
       if(ks.del){ gInScanner=false; return; }
     } else {
+      bool changed=false;
       for(char c: ks.word){
-        if(c>='1' && c<='4' && gScanPassLen==0){
-          // if user presses 1-4 while in PASS with empty buffer, treat as quick network switch? ignore
-        }
         if(c>=32 && c<127 && gScanPassLen < (int)sizeof(gScanPass)-1){
-          gScanPass[gScanPassLen++]=c; gScanPass[gScanPassLen]='\0';
+          gScanPass[gScanPassLen++]=c; gScanPass[gScanPassLen]='\0'; changed=true;
         }
       }
-      if(ks.del && gScanPassLen>0){ gScanPass[--gScanPassLen]='\0'; if(gScanPassLen==0){ /* stay */ } }
-      else if(ks.del && gScanPassLen==0){ st=PICK; }
+      if(changed) menu_needs_redraw = true;
+      if(ks.del && gScanPassLen>0){ gScanPass[--gScanPassLen]='\0'; menu_needs_redraw = true; }
+      else if(ks.del && gScanPassLen==0){ st=PICK; menu_needs_redraw = true; }
       if(ks.enter){
-        M5Cardputer.Display.fillScreen(UI_BG);
-        M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-        M5Cardputer.Display.setCursor(4,40);
-        M5Cardputer.Display.printf("Connecting %s...", gScanSSID[gScanSel]);
+        if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+        canvas.fillScreen(UI_BG);
+        canvas.setTextColor(UI_FG, UI_BG);
+        canvas.setCursor(4,40);
+        canvas.printf("Connecting %s...", gScanSSID[gScanSel]);
+        if(irc_mutex) xSemaphoreGive(irc_mutex);
         WiFi.begin(gScanSSID[gScanSel], gScanPass);
         uint32_t stt=millis();
         while(millis()-stt < 10000){
@@ -2048,25 +2112,31 @@ static void runWifiProvisioning(){
           safeCopy(gCfg.wifiSSID, gScanSSID[gScanSel], sizeof(gCfg.wifiSSID));
           safeCopy(gCfg.wifiPass, gScanPass, sizeof(gCfg.wifiPass));
           saveConfig();
-          M5Cardputer.Display.fillScreen(UI_BG);
-          M5Cardputer.Display.setCursor(4,40);
-          M5Cardputer.Display.print("Connected! Saved.");
+          if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+          canvas.fillScreen(UI_BG);
+          canvas.setCursor(4,40);
+          canvas.print("Connected! Saved.");
+          if(irc_mutex) xSemaphoreGive(irc_mutex);
           delay(1200);
           gInScanner=false;
           gWifiConnecting=false;
           return;
         } else {
-          M5Cardputer.Display.fillScreen(UI_BG);
-          M5Cardputer.Display.setCursor(4,40);
-          M5Cardputer.Display.print("Connect failed");
-          M5Cardputer.Display.setCursor(4,60);
-          M5Cardputer.Display.print("Retry password");
+          if(irc_mutex) xSemaphoreTake(irc_mutex, portMAX_DELAY);
+          canvas.fillScreen(UI_BG);
+          canvas.setCursor(4,40);
+          canvas.print("Connect failed");
+          canvas.setCursor(4,60);
+          canvas.print("Retry password");
+          if(irc_mutex) xSemaphoreGive(irc_mutex);
           delay(1400);
           gScanPassLen=0; gScanPass[0]='\0';
+          menu_needs_redraw = true;
         }
       }
-      if(ks.tab){ st=PICK; }
+      if(ks.tab){ st=PICK; menu_needs_redraw = true; }
     }
+    vTaskDelay(pdMS_TO_TICKS(30));
   }
 }
 
@@ -2361,7 +2431,7 @@ static void serviceKeyboard(){
         logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
         for(int r=0; r<2; ++r){
           neopixelWrite(LED_PIN, 60, 0, 60);
-          uint16_t purp = M5Cardputer.Display.color565(60, 0, 60);
+          uint16_t purp = canvas.color565(60, 0, 60);
           (void)purp;
           vTaskDelay(pdMS_TO_TICKS(100));
           neopixelWrite(LED_PIN, 0, 0, 0);
@@ -2371,13 +2441,13 @@ static void serviceKeyboard(){
         // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
         logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
         for(int b=0; b<=40; b+=4){
-          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
           neopixelWrite(LED_PIN, 0, b, 60);
           (void)col2;
           vTaskDelay(pdMS_TO_TICKS(25));
         }
         for(int b=40; b>=0; b-=4){
-          uint16_t col2 = M5Cardputer.Display.color565(0, b, 60*b/40 + 20);
+          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
           neopixelWrite(LED_PIN, 0, b, 60);
           (void)col2;
           vTaskDelay(pdMS_TO_TICKS(25));
@@ -2386,7 +2456,7 @@ static void serviceKeyboard(){
         // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
         logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
         {
-          uint16_t col3 = M5Cardputer.Display.color565(40, 15, 0);
+          uint16_t col3 = canvas.color565(40, 15, 0);
           (void)col3;
           neopixelWrite(LED_PIN, 40, 15, 0);
         }
@@ -2502,35 +2572,35 @@ void setup(){
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
-  M5Cardputer.Display.setTextSize(1);
-  M5Cardputer.Display.fillScreen(UI_BG);
+  canvas.setTextSize(1);
+  canvas.fillScreen(UI_BG);
 
   // Splash with G0 check window
   uint32_t splashStart = millis();
   while(millis() - splashStart < 800){
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(8,10);
-    M5Cardputer.Display.print("Cardputer IRC 0.4");
-    M5Cardputer.Display.setCursor(8,22);
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.print("Adv ST7789 240x135 NO PSRAM");
-    M5Cardputer.Display.setCursor(8,34);
-    M5Cardputer.Display.print("8-bit 109px canvas 20-ring");
-    M5Cardputer.Display.setCursor(8,46);
-    M5Cardputer.Display.print("Hold G0 for safe WiFi setup");
-    M5Cardputer.Display.setCursor(8,70);
-    M5Cardputer.Display.setTextColor(UI_WARN, UI_BG);
-    if(digitalRead(G0_PIN)==LOW) M5Cardputer.Display.print("[G0 SAFE BOOT]");
+    canvas.fillScreen(UI_BG);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.setCursor(8,10);
+    canvas.print("Cardputer IRC 0.4");
+    canvas.setCursor(8,22);
+    canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.print("Adv ST7789 240x135 NO PSRAM");
+    canvas.setCursor(8,34);
+    canvas.print("8-bit 109px canvas 20-ring");
+    canvas.setCursor(8,46);
+    canvas.print("Hold G0 for safe WiFi setup");
+    canvas.setCursor(8,70);
+    canvas.setTextColor(UI_WARN, UI_BG);
+    if(digitalRead(G0_PIN)==LOW) canvas.print("[G0 SAFE BOOT]");
     delay(50);
     M5Cardputer.update();
     if(digitalRead(G0_PIN)==LOW) gSafeBoot = true;
     if(millis() - splashStart > 400 && gSafeBoot) break;
   }
   if(gSafeBoot){
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setCursor(8,20);
-    M5Cardputer.Display.print("SAFE BOOT - bypass SD");
+    canvas.fillScreen(UI_BG);
+    canvas.setCursor(8,20);
+    canvas.print("SAFE BOOT - bypass SD");
     delay(400);
   }
 
@@ -2592,15 +2662,15 @@ void setup(){
 
   // Short final splash
   if(!gSafeBoot && !isWifiDummy(gCfg)){
-    M5Cardputer.Display.fillScreen(UI_BG);
-    M5Cardputer.Display.setTextColor(UI_FG, UI_BG);
-    M5Cardputer.Display.setCursor(8,18);
-    M5Cardputer.Display.print("IRC Ready");
-    M5Cardputer.Display.setCursor(8,30);
-    M5Cardputer.Display.setTextColor(UI_DIM, UI_BG);
-    M5Cardputer.Display.printf("SSD %s", gSdReady?"OK":"NO SD");
-    M5Cardputer.Display.setCursor(8,42);
-    M5Cardputer.Display.printf("Batt %.2fV", gBattVoltage);
+    canvas.fillScreen(UI_BG);
+    canvas.setTextColor(UI_FG, UI_BG);
+    canvas.setCursor(8,18);
+    canvas.print("IRC Ready");
+    canvas.setCursor(8,30);
+    canvas.setTextColor(UI_DIM, UI_BG);
+    canvas.printf("SSD %s", gSdReady?"OK":"NO SD");
+    canvas.setCursor(8,42);
+    canvas.printf("Batt %.2fV", gBattVoltage);
     delay(700);
   }
 }
