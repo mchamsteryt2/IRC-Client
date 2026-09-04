@@ -906,22 +906,18 @@ static void wakeFromSleep(){
 // ---------------------------------------------------------------------------
 static void initCanvas(){
   if(gCanvasReady) return;
-  // Unified composite canvas per spec: 240x135 8-bit, single heap allocation to prevent black screen from double allocation
+  // Split Sub-Canvas per spec: 240x109 chat viewport only - 26KB at 8-bit, always succeeds
   canvas.setColorDepth(8);
   canvas.setPsram(false);
   canvas.setTextSize(1);
   canvas.setTextWrap(false);
-  if(!canvas.createSprite(240, 135)){
-    canvas.deleteSprite();
-    canvas.setColorDepth(8);
-    if(!canvas.createSprite(240, 135)){
-      gCanvasReady = false;
-      return;
-    }
+  canvas.deleteSprite();
+  if(!canvas.createSprite(240, 109)){
+    gCanvasReady = false;
+    return;
   }
   canvas.fillScreen(UI_BG);
-  gCanvasReady = canvas.width()==240 && canvas.height()==135;
-  // Do not allocate legacy gChatCanvas - saves 26KB heap on 512KB device, prevents allocation failure black screen
+  gCanvasReady = canvas.width()==240 && canvas.height()==109;
 }
 // ZERO-MUTEX INTRO ANIMATION - unshielded direct drawing to physical display glass
 void run_retro_splash_screen(){
@@ -1082,43 +1078,89 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
-  // Top status bar layout - audio bracket tags per spec (clean text, no emojis)
-  if(gCfg.current_audio == 1){
-    // Stealth/LED mode - print [M] or [X] in bright red or yellow
-    const char* audioTag = "[M]"; // alternative [X]
-    uint16_t audioCol = 0xF800; // bright red (yellow 0xFFE0 alternative)
-    (void)audioTag; (void)audioCol;
-  } else {
-    // Loud/Audio mode - print [S] or [+] in solid bright green
-    const char* audioTag = "[S]"; // alternative [+]
-    uint16_t audioCol = 0x07E0; // solid bright green
-    (void)audioTag; (void)audioCol;
-  }
-  if(!gCanvasReady) { initCanvas(); if(!gCanvasReady) return; }
-  canvas.fillScreen(UI_BG);
+  // STEP A (THE LOGS BUFFER): draw strictly within 109px canvas sprite instance
+  canvas.fillSprite(0x0000);
   canvas.setTextSize(1);
   Tab* tab=activeTab();
-  if(!tab){ canvas.pushSprite(0,0); ui_needs_redraw = false; return; }
-  ensureTabLayout(tab);
-  int total=tab->count, vis=CHAT_ROWS, startLogical=total-vis-tab->scroll;
-  if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
-  int y=1;
-  for(int li=startLogical; li<endLogical; ++li){
-    const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
-    canvas.setTextColor(0x8410,UI_BG); canvas.setCursor(2,y+1); canvas.print(cl->stamp);
-    canvas.drawFastVLine(64,y,ROW_H,0x8410);
-    char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
-    char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt=out; bool hasNick=false;
-    if(txt[0]=='<' ){ const char* end=strchr(txt,'>'); if(end){ size_t nlen=end-txt-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt,sizeof(bodyTmp)); }
-    else if(txt[0]=='*'&&txt[1]==' '){ const char* sp=strchr(txt+2,' '); if(sp){ size_t nlen=sp-(txt+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt,sizeof(bodyTmp));}
-    else safeCopy(bodyTmp,txt,sizeof(bodyTmp));
-    if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; canvas.setTextColor(col,UI_BG); canvas.setCursor(xNick,y+1); canvas.print(nickTmp); }
-    canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG),UI_BG);
-    int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
-    canvas.setCursor(70,y+1); canvas.print(bodyTmp);
-    y+=ROW_H;
+  if(tab){
+    ensureTabLayout(tab);
+    int total=tab->count, vis=CHAT_ROWS, startLogical=total-vis-tab->scroll;
+    if(startLogical<0) startLogical=0; int endLogical=startLogical+vis; if(endLogical>total) endLogical=total;
+    int y=1;
+    for(int li=startLogical; li<endLogical; ++li){
+      const ChatLine* cl=ringAt(tab,li); if(!cl) continue;
+      canvas.setTextColor(0x8410, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
+      canvas.drawFastVLine(64, y, ROW_H, 0x8410);
+      char out[MAX_LINE_LEN+1]; safeCopy(out,cl->text,sizeof(out)); sanitizeGlyphs(out);
+      char nickTmp[32]={0}, bodyTmp[MAX_LINE_LEN+1]={0}; const char* txt2=out; bool hasNick=false;
+      if(txt2[0]=='<' ){ const char* end=strchr(txt2,'>'); if(end){ size_t nlen=end-txt2-1; if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+1,nlen); nickTmp[nlen]='\0'; hasNick=true;} const char* body=end+1; while(*body==' ') body++; safeCopy(bodyTmp,body,sizeof(bodyTmp)); } else safeCopy(bodyTmp,txt2,sizeof(bodyTmp)); }
+      else if(txt2[0]=='*'&&txt2[1]==' '){ const char* sp=strchr(txt2+2,' '); if(sp){ size_t nlen=sp-(txt2+2); if(nlen<sizeof(nickTmp)){memcpy(nickTmp,txt2+2,nlen); nickTmp[nlen]='\0'; hasNick=true;} safeCopy(bodyTmp,sp+1,sizeof(bodyTmp));} else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));}
+      else safeCopy(bodyTmp,txt2,sizeof(bodyTmp));
+      if(hasNick&&nickTmp[0]){ uint16_t col=nickHashColor(nickTmp); int nickW=strlen(nickTmp)*CHAR_W; int xNick=64-nickW-4; if(xNick<32) xNick=32; canvas.setTextColor(col, 0x0000); canvas.setCursor(xNick, y+1); canvas.print(nickTmp); }
+      canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG), 0x0000);
+      int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
+      canvas.setCursor(70, y+1); canvas.print(bodyTmp);
+      y+=ROW_H;
+    }
   }
-  canvas.pushSprite(0,0);
+  // STEP B (THE DIRECT HARDWARE BLIT): push middle chat viewport first, offset by 12px past top bar
+  canvas.pushSprite(0, 12);
+  // STEP C (THE FIXED HEADER & FOOTER OVERLAYS): draw top 12px and bottom 14px straight to glass with zero flicker
+  // Top 12px status bar - fixed anchors, no shifting
+  {
+    auto &d = M5Cardputer.Display;
+    d.fillRect(0,0,SCREEN_W,12, UI_BG);
+    d.drawFastHLine(0,11,SCREEN_W, UI_DIM);
+    d.setTextSize(1);
+    // Channel title truncated at X=130
+    Tab* at=activeTab();
+    char title[32]; if(at) safeCopy(title, at->name, sizeof(title)); else safeCopy(title, "status", sizeof(title));
+    // Truncate to fit X=130 (approx 21 chars at 6px)
+    if(strlen(title)*CHAR_W > 130){ title[21]='\0'; }
+    // Header dividers muted grey, text white
+    int x=2;
+    // Draw truncated title with muted brackets
+    d.setTextColor(0x8410, UI_BG); d.setCursor(x,2); d.print("["); x+=CHAR_W;
+    d.setTextColor(0xFFFF, UI_BG); d.setCursor(x,2); d.print(title); x+=strlen(title)*CHAR_W;
+    d.setTextColor(0x8410, UI_BG); d.setCursor(x,2); d.print("]"); x+=CHAR_W;
+    // Fixed HUD anchors
+    // Mute at X=145
+    char audioTag[7]; uint16_t audioCol;
+    if(gCfg.current_audio==1){ strncpy(audioTag,"[M]",sizeof(audioTag)); audioCol=0xF800; } else { strncpy(audioTag,"[+]",sizeof(audioTag)); audioCol=0x07E0; }
+    d.setTextColor(audioCol, UI_BG); d.setCursor(145,2); d.print(audioTag);
+    // Time Clock at X=175
+    char timeStr[9]; currentStamp(nullptr,0,timeStr,sizeof(timeStr));
+    char timeHHMM[6]; if(strlen(timeStr)>=5){ timeHHMM[0]=timeStr[0]; timeHHMM[1]=timeStr[1]; timeHHMM[2]=':'; timeHHMM[3]=timeStr[3]; timeHHMM[4]=timeStr[4]; timeHHMM[5]='\0'; char loc[6]; localizeTimeHHMM(timeHHMM, loc); safeCopy(timeStr, loc, sizeof(timeStr)); }
+    d.setTextColor(0xFFFF, UI_BG); d.setCursor(175,2); d.print(timeStr);
+    // Battery Percentage at X=212 - integer percentage from voltage math
+    float v = readBatteryVoltage();
+    int pct = (int)((v - 3.2f) / (4.2f - 3.2f) * 100.0f);
+    if(pct<0) pct=0; if(pct>100) pct=100;
+    char bstr[8]; snprintf(bstr,sizeof(bstr),"%d%%", pct);
+    d.setTextColor(0x8410, UI_BG); d.setCursor(212,2); d.print(bstr);
+  }
+  {
+    auto &d = M5Cardputer.Display;
+    d.fillRect(0,INPUT_Y,SCREEN_W,INPUT_H, UI_BG);
+    d.drawFastHLine(0,INPUT_Y,SCREEN_W, UI_DIM);
+    d.setTextSize(1); d.setTextColor(UI_FG, UI_BG);
+    int maxCols=INPUT_VISIBLE_COLS;
+    if(gInputLen<=maxCols) gInputScroll=0;
+    else { if(gInputCursor<gInputScroll) gInputScroll=gInputCursor; else if(gInputCursor>=gInputScroll+maxCols) gInputScroll=gInputCursor-maxCols+1; if(gInputScroll>gInputLen-maxCols) gInputScroll=gInputLen-maxCols; if(gInputScroll<0) gInputScroll=0; }
+    int vlen=gInputLen-gInputScroll; if(vlen>maxCols) vlen=maxCols; if(vlen<0) vlen=0;
+    char visible[INPUT_BUF_SZ]; memcpy(visible,gInput+gInputScroll,vlen); visible[vlen]='\0';
+    d.setCursor(2,INPUT_Y+4); d.print(">"); d.print(visible);
+    if(gInputScroll>0){
+      for(int fx=0;fx<12;++fx){ uint8_t shade=60+fx*10; uint16_t col=d.color565(shade,shade,shade*0.9); d.drawFastVLine(8+fx, INPUT_Y+1, INPUT_H-2, col); }
+      d.drawFastVLine(20, INPUT_Y+1, INPUT_H-2, UI_DIM);
+    }
+    int curPos=gInputCursor-gInputScroll; int curX=2+CHAR_W+curPos*CHAR_W;
+    if(curX>=2 && curX<SCREEN_W-2){
+      float phase=sinf((float)millis()/150.0f); float alpha=(phase+1.0f)*0.5f; uint8_t g=(uint8_t)(alpha*255); uint16_t col=d.color565(0,g,0);
+      d.fillRect(curX, INPUT_Y+2, 2, CHAR_H+2, col);
+    }
+    if(gInputLen==0 && gHistCount>0){ d.setTextColor(UI_DIM, UI_BG); d.setCursor(SCREEN_W-40,INPUT_Y+4); d.print("^v hist"); }
+  }
   ui_needs_redraw = false;
 }
 static void drawChatViewport(){
@@ -2588,11 +2630,14 @@ static void serviceWifi(){
 // Setup - includes safe-boot check, 16MHz SPI, splash, purge, canvas, tasks
 // ---------------------------------------------------------------------------
 void setup(){
-  // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top
-  M5Cardputer.begin();
-  M5Cardputer.Display.begin();
+  // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top per spec
+  auto cfg = M5.config();
+  M5Cardputer.begin(cfg, true);
   M5Cardputer.Display.setRotation(1);
-  // Create global mutex IMMEDIATELY after hardware init - do not touch irc_mutex before this
+  M5Cardputer.Display.setTextSize(1);
+  M5Cardputer.Display.setTextWrap(false);
+  M5Cardputer.Display.fillScreen(UI_BG);
+  // Create global mutex IMMEDIATELY after hardware init
   irc_mutex = xSemaphoreCreateMutex();
   gTabsMutex = irc_mutex;
   gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
@@ -2607,25 +2652,27 @@ void setup(){
   pinMode(LED_PIN, OUTPUT);
   neopixelWrite(LED_PIN,0,0,0);
   gLastInputMs=millis();
+  gSavedBrightness = 10; // default bright before config load to avoid black screen
+  applyBrightness(gSavedBrightness);
+  M5Cardputer.Display.wakeup();
 
   // 2. ZERO-MUTEX INTRO ANIMATION & INITIAL REDRAW
-  run_retro_splash_screen(); // unshielded, no mutex
-  // Initialize 8-bit canvas immediately following splash - correct order setColorDepth before create
+  run_retro_splash_screen(); // unshielded, no mutex - direct to Display glass
+  // Initialize 8-bit canvas immediately following splash - single unified 240x135 8-bit
   canvas.setColorDepth(8);
   canvas.setPsram(false);
   canvas.setTextSize(1);
   canvas.setTextWrap(false);
-  if(!canvas.createSprite(240, 135)){
-    canvas.deleteSprite();
-    canvas.setColorDepth(8);
-    canvas.createSprite(240, 135);
+  canvas.deleteSprite();
+  if(!canvas.createSprite(240, 109)){
+    gCanvasReady = false;
+  } else {
+    canvas.fillScreen(UI_BG);
+    gCanvasReady = canvas.width()==240 && canvas.height()==109;
   }
-  canvas.fillScreen(UI_BG);
-  gCanvasReady = canvas.width()==240 && canvas.height()==135;
-  // Force initial draw before background tasks
+  // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
   draw_chat_view();
-
   // Intermediate init - SPI, SD, config, etc. (all after mutex, before network)
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if(!gSafeBoot){
@@ -2701,18 +2748,15 @@ void loop(){
     if(gInScanner){
       // provision draws itself
     } else {
-      // SPI BUS GAUNTLET: Core 1 canvas flushes wrapped in irc_mutex - Core 0 logging will halt/wait
+      // Single unified draw - draw_chat_view handles Steps A,B,C with zero flicker and single push
       if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
-        drawTopBar();
-        drawChatViewport();
-        drawBottomInput();
+        draw_chat_view();
         xSemaphoreGive(irc_mutex);
       } else {
-        drawTopBar();
-        drawChatViewport();
-        drawBottomInput();
+        draw_chat_view();
       }
     }
   }
   delay(5);
 }
+
