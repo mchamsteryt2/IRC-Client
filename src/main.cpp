@@ -676,7 +676,6 @@ class IrcClientApp {
   void markBodyDirty() { _bodyDirty = true; }
   void markInputDirty() { _inputDirty = true; }
   void markNavDirty() { _navDirty = true; }
-  void drawNavBar();
 
   // Section navigation (bottom bar): 0=Servers,1=Channels,2=Chats,3=Settings
   enum SectionId { SEC_SERVERS = 0, SEC_CHANNELS, SEC_CHATS, SEC_SETTINGS, SEC_COUNT };
