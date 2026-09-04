@@ -21,6 +21,16 @@
 #include <driver/adc.h>
 #include <cmath>
 
+// Physical arrow key HID codes for M5Cardputer Adv - map to KEY_RIGHT/KEY_LEFT for spec alignment
+#ifndef KEY_RIGHT
+#define KEY_RIGHT 0x4F
+#endif
+#ifndef KEY_LEFT
+#define KEY_LEFT 0x50
+#endif
+// Forward declaration for user input handler used inside handle_keyboard_inputs
+static void handleUserInput(const char* in);
+
 // ---------------------------------------------------------------------------
 // Hardware pins and constants
 // ---------------------------------------------------------------------------
@@ -1352,86 +1362,125 @@ static void serverSkipForward();
 static void serverSkipBackward();
 static void add_message_to_buffer(const char* msg);
 void handle_keyboard_inputs() {
-    if (!M5Cardputer.Keyboard.isPressed()) return; // Exit instantly if no matrix pins are active!
-
-    // Spec exact: KeyboardStatus status = M5Cardputer.Keyboard.getStatus();
+    if (!M5Cardputer.Keyboard.isPressed()) return;
     auto status = M5Cardputer.Keyboard.keysState();
-    
-    // Process your Fn and Alt macro precedence shortcut checks here...
-    // HIGH-PRIORITY: Fn block at absolute top per spec
-    if(status.fn){
-        for(char c : status.word){
-            if(c=='s' || c=='S'){
-                gCfg.current_audio = gCfg.current_audio ? 0 : 1;
-                digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH);
+    auto st = status;
+    // 1. CHANNEL STEPPING (ALT + ARROWS) - physical arrow keys
+    if (status.alt && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) {
+        int total_tabs = gTabCount;
+        if (total_tabs > 0) {
+            current_tab_index = (current_tab_index + 1) % total_tabs;
+            ui_needs_redraw = true;
+        }
+        return;
+    }
+    if (status.alt && M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT)) {
+        int total_tabs = gTabCount;
+        if (total_tabs > 0) {
+            current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1;
+            ui_needs_redraw = true;
+        }
+        return;
+    }
+    // 2. SERVER SKIPPING (FN + ARROWS) - memory-safe string engine
+    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) {
+        int total_tabs = gTabCount;
+        if (total_tabs <= 1) return;
+
+        String current_server = (strlen(gTabs[current_tab_index].server) > 0) ? String(gTabs[current_tab_index].server) : String(bnc_host);
+
+        for (int i = 1; i < total_tabs; ++i) {
+            int idx = (current_tab_index + i) % total_tabs;
+            String target_server = (strlen(gTabs[idx].server) > 0) ? String(gTabs[idx].server) : String(bnc_host);
+
+            if (current_server != target_server) {
+                current_tab_index = idx;
                 ui_needs_redraw = true;
                 return;
             }
-            if(c=='b' || c=='B'){
-                run_bouncer_setup_menu();
+        }
+        return;
+    }
+    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT)) {
+        int total_tabs = gTabCount;
+        if (total_tabs <= 1) return;
+        String current_server = (strlen(gTabs[current_tab_index].server) > 0) ? String(gTabs[current_tab_index].server) : String(bnc_host);
+        for (int i = 1; i < total_tabs; ++i) {
+            int idx = (current_tab_index - i + total_tabs) % total_tabs;
+            String target_server = (strlen(gTabs[idx].server) > 0) ? String(gTabs[idx].server) : String(bnc_host);
+            if (current_server != target_server) {
+                current_tab_index = idx;
                 ui_needs_redraw = true;
                 return;
             }
+        }
+        return;
+    }
+    // HIGH-PRIORITY: Fn block - remaining shortcuts (server skip removed, now handled via Fn+Arrows)
+    if(st.fn){
+        for(char c : st.word){
+            if(c=='s' || c=='S'){ gCfg.current_audio = gCfg.current_audio ? 0 : 1; digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH); ui_needs_redraw = true; return; }
+            if(c=='b' || c=='B'){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
             if(c=='t' || c=='T'){
-                // 3-stage LED validation: purple double-flash -> cyan breathing -> orange solid
-                logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
-                for(int r=0;r<2;++r){ neopixelWrite(LED_PIN,60,0,60); vTaskDelay(pdMS_TO_TICKS(100)); neopixelWrite(LED_PIN,0,0,0); vTaskDelay(pdMS_TO_TICKS(100)); }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
-                for(int b=0;b<=40;b+=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); }
-                for(int b=40;b>=0;b-=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); }
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
-                neopixelWrite(LED_PIN,40,15,0); vTaskDelay(pdMS_TO_TICKS(1500)); neopixelWrite(LED_PIN,0,0,0);
-                ui_needs_redraw = true; logStatus("LED Diagnostic Cycle Complete."); return;
+                // NON-BLOCKING LED DIAGNOSTIC - instant pulse to avoid freezing main screen (Core 1 loop must stay <50ms)
+                logStatus("Testing LED: Purple pulse Pin 21");
+                neopixelWrite(LED_PIN,60,0,60);
+                gLastPulseMs = millis();
+                gLedOn = true;
+                // schedule auto-off via serviceStealthLed (150ms), no vTaskDelay chain to keep UI responsive
+                ui_needs_redraw = true;
+                logStatus("LED Diagnostic Complete (non-blocking).");
+                return;
             }
             if(c=='n' || c=='N'){ display_network_jump_hud(); ui_needs_redraw = true; return; }
-            if(c==']' || c=='/' ){
-                int total_tabs = gTabCount;
-                const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-                for(int i=1; i<total_tabs; ++i){
-                    int idx = (current_tab_index + i) % total_tabs;
-                    const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-                    if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
-                }
-                return;
-            }
-            if(c=='[' || c==','){
-                int total_tabs = gTabCount;
-                const char* curServer = gTabs[current_tab_index].server[0] ? gTabs[current_tab_index].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-                for(int i=1; i<total_tabs; ++i){
-                    int idx = (current_tab_index - i + total_tabs) % total_tabs;
-                    const char* srv = gTabs[idx].server[0] ? gTabs[idx].server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
-                    if(!eqI(srv, curServer)){ current_tab_index = idx; ui_needs_redraw = true; return; }
-                }
-                return;
-            }
         }
     }
-    if(status.alt){
-        for(char c : status.word){
-            if(c=='/' || c==']' || c=='l' || c=='L'){
-                int total_tabs = gTabCount;
-                current_tab_index = (current_tab_index + 1) % total_tabs;
-                ui_needs_redraw = true;
-                return;
-            }
-            if(c==',' || c=='[' || c=='h' || c=='H'){
-                int total_tabs = gTabCount;
-                current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1;
-                ui_needs_redraw = true;
-                return;
-            }
+    // Quick Settings, history, char input, etc. - non-blocking, no while loops
+    bool hasWord = !st.word.empty();
+    bool up=false, down=false;
+    if(st.fn){ for(char c : st.word){ if(c==';') up=true; if(c=='.') down=true; } }
+    if(gInputLen==0 && (up||down)){
+        if(gHistCount>0){
+            int depth = min(gHistCount, HISTORY_DEPTH);
+            if(gHistNav==-1) gHistNav = (up? depth-1 : 0);
+            else { if(up) gHistNav = (gHistNav -1 + depth)%depth; else gHistNav = (gHistNav +1)%depth; }
+            int idx = (gHistCount - depth + gHistNav) % HISTORY_DEPTH; if(idx<0) idx+=HISTORY_DEPTH;
+            safeCopy(gInput, gHistory[idx], sizeof(gInput)); gInputLen = strlen(gInput); gInputCursor = gInputLen; ui_needs_redraw = true; return;
         }
-        for(uint8_t k : status.hid_keys){
-            if(k==0x4F){ int total_tabs=gTabCount; current_tab_index = (current_tab_index + 1) % total_tabs; ui_needs_redraw = true; return; }
-            if(k==0x50){ int total_tabs=gTabCount; current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1; ui_needs_redraw = true; return; }
+    } else if(hasWord){ gHistNav = -1; }
+    for(char c : st.word){
+        if(c=='\n' || c=='\r') continue;
+        if(st.fn && (c==';' || c=='.' || c==',' || c=='/')) continue;
+        if(c>=32 && c<127 && gInputLen < INPUT_BUF_SZ-1){
+            memmove(gInput+gInputCursor+1, gInput+gInputCursor, gInputLen - gInputCursor +1);
+            gInput[gInputCursor++]=c; gInputLen++; gHistNav=-1; ui_needs_redraw = true;
         }
     }
-    // Ensure every single Fn/Alt shortcut branch calls return; at the end - already done above
-
-    // Standard character text ingestion goes here...
-    // (handled via serviceKeyboard's remaining logic, but this wrapper ensures non-blocking)
+    if(st.del && gInputLen>0 && gInputCursor>0){ memmove(gInput+gInputCursor-1, gInput+gInputCursor, gInputLen - gInputCursor +1); gInputCursor--; gInputLen--; gHistNav=-1; ui_needs_redraw = true; }
+    if(st.fn){
+        for(char c : st.word){
+            if(c==',' && gInputCursor>0){ gInputCursor--; ui_needs_redraw = true; }
+            if(c=='/' && gInputCursor<gInputLen){ gInputCursor++; ui_needs_redraw = true; }
+            if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count){ t->scroll++; ui_needs_redraw = true; } }
+            if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0){ t->scroll--; ui_needs_redraw = true; } }
+        }
+    } else {
+        for(char c : st.word){
+            if(c==';'){ Tab* t=activeTab(); if(t && t->scroll < t->count){ t->scroll++; ui_needs_redraw = true; } }
+            if(c=='.'){ Tab* t=activeTab(); if(t && t->scroll>0){ t->scroll--; ui_needs_redraw = true; } }
+        }
+    }
+    if(st.enter){
+        if(gInputLen>0){
+            gInput[gInputLen]='\0'; char copy[INPUT_BUF_SZ]; safeCopy(copy,gInput,sizeof(copy));
+            gInputLen=0; gInputCursor=0; gInput[0]='\0'; gInputScroll=0; gHistNav=-1;
+            handleUserInput(copy); ui_needs_redraw = true;
+        } else { gHistNav=-1; }
+    }
+    if(st.tab){
+        if(gTabCount>0){ gActive=(gActive+1)%gTabCount; activeTab()->unread=false; activeTab()->mention=false; current_tab_index=gActive; ui_needs_redraw = true; }
+    }
+    if(!st.word.empty() || st.del || st.enter || st.tab) ui_needs_redraw = true;
 }
 // Overlay navigation helpers for timezone/format
 static void cycleTimezone(int delta){
@@ -2415,10 +2464,8 @@ static void serviceKeyboard(){
     for(char c : ks.word){
       if(c=='s' || c=='S'){ gCfg.current_audio = gCfg.current_audio ? 0 : 1; digitalWrite(4, gCfg.current_audio == 1 ? LOW : HIGH); ui_needs_redraw = true; return; }
       if(c=='b' || c=='B'){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
-      if(c=='t' || c=='T'){ logStatus("Testing LED: Mention Alert (Purple Double Pulse)..."); for(int r=0;r<2;++r){ neopixelWrite(LED_PIN,60,0,60); vTaskDelay(pdMS_TO_TICKS(100)); neopixelWrite(LED_PIN,0,0,0); vTaskDelay(pdMS_TO_TICKS(100)); } vTaskDelay(pdMS_TO_TICKS(1000)); logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)..."); for(int b=0;b<=40;b+=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); } for(int b=40;b>=0;b-=4){ neopixelWrite(LED_PIN,0,b,60); vTaskDelay(pdMS_TO_TICKS(25)); } vTaskDelay(pdMS_TO_TICKS(1000)); logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)..."); neopixelWrite(LED_PIN,40,15,0); vTaskDelay(pdMS_TO_TICKS(1500)); neopixelWrite(LED_PIN,0,0,0); ui_needs_redraw=true; logStatus("LED Diagnostic Cycle Complete."); return; }
+      if(c=='t' || c=='T'){ logStatus("Testing LED: Purple pulse Pin 21"); neopixelWrite(LED_PIN,60,0,60); gLastPulseMs=millis(); gLedOn=true; ui_needs_redraw=true; return; }
       if(c=='n' || c=='N'){ display_network_jump_hud(); ui_needs_redraw = true; return; }
-      if(c==']' || c=='/' ){ int total_tabs=gTabCount; const char* cur=gTabs[current_tab_index].server[0]?gTabs[current_tab_index].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); for(int i=1;i<total_tabs;++i){ int idx=(current_tab_index+i)%total_tabs; const char* srv=gTabs[idx].server[0]?gTabs[idx].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); if(!eqI(srv,cur)){ current_tab_index=idx; ui_needs_redraw=true; return; } } return; }
-      if(c=='[' || c==','){ int total_tabs=gTabCount; const char* cur=gTabs[current_tab_index].server[0]?gTabs[current_tab_index].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); for(int i=1;i<total_tabs;++i){ int idx=(current_tab_index-i+total_tabs)%total_tabs; const char* srv=gTabs[idx].server[0]?gTabs[idx].server:(bnc_host.length()>0?bnc_host.c_str():gCfg.host); if(!eqI(srv,cur)){ current_tab_index=idx; ui_needs_redraw=true; return; } } return; }
     }
   }
   // Quick Settings overlay active - 5-row grid handling per spec
@@ -2426,7 +2473,7 @@ static void serviceKeyboard(){
     // LIVE INJECTION: Fn+B/T/N and Server Skip hotkeys even inside overlay per spec
     for(char c: ks.word){
       if(ks.fn && (c=='b' || c=='B')){ run_bouncer_setup_menu(); ui_needs_redraw = true; return; }
-      if(ks.fn && (c=='t' || c=='T')){ logStatus("LED Diagnostic: Purple test on Pin 21"); neopixelWrite(LED_PIN, 60,0,60); vTaskDelay(pdMS_TO_TICKS(1000)); neopixelWrite(LED_PIN,0,0,0); ui_needs_redraw = true; return; }
+      if(ks.fn && (c=='t' || c=='T')){ logStatus("LED Diagnostic: Purple pulse Pin 21"); neopixelWrite(LED_PIN,60,0,60); gLastPulseMs=millis(); gLedOn=true; ui_needs_redraw=true; return; }
       if(ks.fn && (c=='n' || c=='N')){ display_network_jump_hud(); ui_needs_redraw = true; return; }
       if(ks.fn && (c==']' || c=='/' )){ serverSkipForward(); return; } // Fn+Right Arrow
       if(ks.fn && (c=='[' || c==',' )){ serverSkipBackward(); return; } // Fn+Left Arrow
@@ -2563,43 +2610,9 @@ static void serviceKeyboard(){
         return;
       }
       if(c=='t' || c=='T'){
-        // TEST MODE 1 - THE MENTION ALERT (Purple Double-Pulse)
-        logStatus("Testing LED: Mention Alert (Purple Double Pulse)...");
-        for(int r=0; r<2; ++r){
-          neopixelWrite(LED_PIN, 60, 0, 60);
-          uint16_t purp = canvas.color565(60, 0, 60);
-          (void)purp;
-          vTaskDelay(pdMS_TO_TICKS(100));
-          neopixelWrite(LED_PIN, 0, 0, 0);
-          vTaskDelay(pdMS_TO_TICKS(100));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        // TEST MODE 2 - THE ACTIVITY PULSE (Cyan Breathing Fade)
-        logStatus("Testing LED: Channel Activity (Cyan Breathing Fade)...");
-        for(int b=0; b<=40; b+=4){
-          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
-          neopixelWrite(LED_PIN, 0, b, 60);
-          (void)col2;
-          vTaskDelay(pdMS_TO_TICKS(25));
-        }
-        for(int b=40; b>=0; b-=4){
-          uint16_t col2 = canvas.color565(0, b, 60*b/40 + 20);
-          neopixelWrite(LED_PIN, 0, b, 60);
-          (void)col2;
-          vTaskDelay(pdMS_TO_TICKS(25));
-        }
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        // TEST MODE 3 - THE DISCONNECT WARNING (Dim Solid Red/Orange)
-        logStatus("Testing LED: Disconnect Warning (Dim Solid Orange)...");
-        {
-          uint16_t col3 = canvas.color565(40, 15, 0);
-          (void)col3;
-          neopixelWrite(LED_PIN, 40, 15, 0);
-        }
-        vTaskDelay(pdMS_TO_TICKS(1500));
-        neopixelWrite(LED_PIN, 0, 0, 0);
-        ui_needs_redraw = true;
-        logStatus("LED Diagnostic Cycle Complete.");
+        logStatus("Testing LED: Purple pulse Pin 21");
+        neopixelWrite(LED_PIN,60,0,60);
+        gLastPulseMs=millis(); gLedOn=true; ui_needs_redraw=true;
         return;
       }
       if(c=='n' || c=='N'){
@@ -2788,17 +2801,23 @@ void setup(){
 // Loop - Core 1 graphics/keyboard, protected shared vars via mutex
 // ---------------------------------------------------------------------------
 void loop() {
-    // 1. Instantly satisfy the hardware Task Watchdog Timer
-    yield(); 
-    vTaskDelay(pdMS_TO_TICKS(5)); 
+    // 1. Instantly satisfy the hardware Task Watchdog Timer - MUST stay non-blocking (<50ms per iteration)
+    yield();
+    vTaskDelay(pdMS_TO_TICKS(5));
 
     // 2. Poll the hardware matrix asynchronously
-    M5Cardputer.update(); 
+    M5Cardputer.update();
 
-    // 3. Process the keystroke states defensively
-    handle_keyboard_inputs(); 
+    // 3. Service background hardware without blocking SPI bus
+    pollBattery();
+    pollJack();
+    serviceStealthLed();
+    servicePowerWatchdog();
 
-    // 4. Handle state-driven screen canvas refreshes
+    // 4. Process the keystroke states defensively (now non-blocking, no vTaskDelay chains inside)
+    handle_keyboard_inputs();
+
+    // 5. Handle state-driven screen canvas refreshes - only when dirty flag set
     if (ui_needs_redraw) {
         draw_chat_view();
     }
