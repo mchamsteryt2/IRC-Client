@@ -15,6 +15,9 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 #include <esp_system.h>
+#if __has_include("esp_psram.h")
+#include <esp_psram.h>
+#endif
 
 static constexpr int SD_SCK = 40;
 static constexpr int SD_MISO = 39;
@@ -1069,6 +1072,10 @@ class SimpleTransport {
   TaskHandle_t _bgTaskHandle = nullptr;
   volatile bool _bgTaskRunning = false;
 
+  // Framebuffer sprite for flicker-free rendering (PSRAM if available, else SRAM if heap allows)
+  lgfx::LGFX_Sprite _fb;
+  bool _fbReady = false;
+
   bool _configOpen = false;
   bool _configEditing = false;
   Config _editCfg;
@@ -1759,7 +1766,38 @@ class SimpleTransport {
   }
 
   void initFrameBuffer() {
-    // Framebuffer removed to save 65KB RAM on 512KB device — direct draw is used.
+    if (_fbReady) return;
+    // ADV has no PSRAM (S3FN8) but 240x135x2=64.8KB still fits in 320KB SRAM if heap allows.
+    // Prefer PSRAM when present, otherwise try SRAM with heap guard to avoid OOM reboot.
+    bool hasPsram = false;
+#if defined(CONFIG_SPIRAM_SUPPORT)
+    hasPsram = psramFound() && ESP.getPsramSize() >= 70000;
+#else
+    hasPsram = ESP.getPsramSize() >= 70000;
+#endif
+    auto tryCreate = [&](bool usePsram) -> bool {
+      if (usePsram) _fb.setPsram(true);
+      else {
+        // Need ~75KB free beyond MIN_HEAP to avoid starving WiFi/SD
+        if (ESP.getFreeHeap() < (MIN_HEAP_BYTES + 75000)) return false;
+        _fb.setPsram(false);
+      }
+      _fb.setColorDepth(16);
+      if (_fb.createSprite(SCREEN_W, SCREEN_H)) {
+        _fbReady = true;
+        _fb.fillScreen(UI_BG);
+        _fb.setTextSize(1);
+        _fb.setTextWrap(false);
+        return true;
+      }
+      _fbReady = false;
+      return false;
+    };
+    if (hasPsram) {
+      if (tryCreate(true)) return;
+    }
+    // No PSRAM or PSRAM alloc failed — try SRAM
+    tryCreate(false);
   }
 
   void showBootTitle() {
@@ -1821,16 +1859,23 @@ class SimpleTransport {
   }
 
   lgfx::LovyanGFX& drawTarget() {
+    if (_fbReady) return _fb;
     return static_cast<lgfx::LovyanGFX&>(M5Cardputer.Display);
   }
 
   void presentFrame() {
-    // No-op — direct draw, no sprite to push (saves RAM, subtle partial redraw handles flicker)
+    if (_fbReady) {
+      M5Cardputer.Display.startWrite();
+      _fb.pushSprite(0, 0);
+      M5Cardputer.Display.endWrite();
+    }
   }
 
   void serviceTextScroll() {
     if (_screenSleeping || _configOpen || _channelListOpen || _tabs.empty()) return;
     if (useWrappedText()) return;
+    // Without sprite, marquee forces full body redraw every 350ms → visible flicker on direct ST7789
+    if (!_fbReady) return;
     if (!activeTabNeedsTextScroll()) return;
 
     uint32_t tick = millis() / TEXT_SCROLL_STEP_MS;
@@ -5074,25 +5119,46 @@ class SimpleTransport {
     if (full) { _headerDirty = _bodyDirty = _inputDirty = _navDirty = true; }
     if (!_headerDirty && !_bodyDirty && !_inputDirty && !_navDirty) return;
     auto& gfx = drawTarget();
-    // Even less noticeable: batch SPI transaction and only redraw dirty regions
-    gfx.startWrite();
-    if (_configOpen) {
-      drawConfigPage();
-      drawNavBar();
-    } else if (_serverListOpen) {
-      drawServerListPage();
-      drawNavBar();
-    } else if (_channelListOpen) {
-      drawChannelListPage();
-      drawNavBar();
+    if (_fbReady) {
+      // Sprite mode: composite off-screen then single push — no tearing
+      if (_configOpen) {
+        drawConfigPage();
+        drawNavBar();
+      } else if (_serverListOpen) {
+        drawServerListPage();
+        drawNavBar();
+      } else if (_channelListOpen) {
+        drawChannelListPage();
+        drawNavBar();
+      } else {
+        // Full composite to sprite avoids stale pixels when dirty flags are partial
+        drawHeader();
+        drawBody();
+        drawNavBar();
+        drawInput();
+      }
+      presentFrame();
     } else {
-      if (_headerDirty) drawHeader();
-      if (_bodyDirty) drawBody();
-      if (_navDirty) drawNavBar();
-      if (_inputDirty) drawInput();
+      // Direct mode (no sprite): batch SPI and redraw only dirty regions to minimize flicker
+      gfx.startWrite();
+      if (_configOpen) {
+        drawConfigPage();
+        drawNavBar();
+      } else if (_serverListOpen) {
+        drawServerListPage();
+        drawNavBar();
+      } else if (_channelListOpen) {
+        drawChannelListPage();
+        drawNavBar();
+      } else {
+        if (_headerDirty) drawHeader();
+        if (_bodyDirty) drawBody();
+        if (_navDirty) drawNavBar();
+        if (_inputDirty) drawInput();
+      }
+      gfx.endWrite();
+      presentFrame();
     }
-    gfx.endWrite();
-    presentFrame();
     _dirty = false;
     _headerDirty = _bodyDirty = _inputDirty = _navDirty = false;
   }
