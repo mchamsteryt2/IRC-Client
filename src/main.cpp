@@ -381,8 +381,6 @@ void draw_chat_view() {
 
     // --- MODAL DRAWING RESPONSES: route viewport on current_app_mode ---
     if (current_app_mode == MODE_NAVIGATOR) {
-        canvas.fillSprite(0x0000);
-        
         // --- LEFT COLUMN: NETWORK SERVERS (X=5 TO X=110) ---
         canvas.fillRect(0, 0, 114, 135, 0x0841); // Slate container block
         canvas.setTextColor(0x07E0); canvas.setCursor(6, 6); canvas.print("NETWORKS");
@@ -420,8 +418,12 @@ void draw_chat_view() {
             }
         }
         
+        // Partial Erase Shield: Overwrite ONLY the bottom 15px strip where settings text leaks,
+        // keeping the main network columns intact to completely eliminate screen flicker.
+        canvas.fillRect(0, 120, 240, 15, 0x0000); 
+        
         canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print("Arrows: Nav | Enter: Open Channel");
-        canvas.pushSprite(0, 0);
+        canvas.pushSprite(0, 0); // Push the flicker-free composite frame to the display glass
         ui_needs_redraw = false;
         return;
     }
