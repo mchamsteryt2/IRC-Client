@@ -1201,7 +1201,12 @@ void custom_ui_loop_task(void* pv){
 // ---------------------------------------------------------------------------
 void setup(){
   safe_mode_active = false;
-  M5Cardputer.begin(true, true, false, false); // Display=true, Keyboard=true, Speaker=false, Mic=false
+  auto cfg = M5.config();
+  cfg.clear_display = true; // Display=true
+  cfg.internal_mic = false; // Mic=false
+  cfg.internal_spk = false; // Speaker=false
+  cfg.external_speaker.module_display = false;
+  M5Cardputer.begin(cfg, true); // Keyboard=true, Speaker=false, Mic=false via config
   Wire.setTimeOut(50);
   SPI.begin();
   gSdReady = SD.begin(12, SPI, 10000000); // Enforce strict 10MHz clock speed to stop data cross-talk noise
