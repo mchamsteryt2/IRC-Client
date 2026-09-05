@@ -541,22 +541,23 @@ static void serviceStealthLed(){
   if(gLedOn && millis() - gLastPulseMs > 150) setStealthLed(false);
 }
 // 9-MODE ASYNC LED TELEMETRY DECK - all millis() non-blocking, pure C-string safe, never stall Core1
+// Calibrated colors: color565(0, 45, 20) color565(25, 0, 55) color565(35, 20, 0) color565(0, 30, 0) color565(20, 0, 0) color565(60, 0, 0) color565(45, 45, 45) color565(55, 0, 15) color565(65, 20, 0)
 static void updateLedTelemetry(){
   uint32_t now = millis();
   // MODE9 Disconnect Fault - highest priority solid Orange if socket drops
   if(!gIrcConnected || WiFi.status()!=WL_CONNECTED){
-    neopixelWrite(LED_PIN, 40, 15, 0);
+    neopixelWrite(LED_PIN, 65, 20, 0); // MODE9 calibrated neon industrial orange color565(65,20,0)
     gDisconnectMs = now;
     return;
   }
   // MODE2 Highlight Ping - fast double Purple pulse on mention
   if(gPurpleFlashPhase>0){
     uint32_t elapsed = now - gPurpleFlashMs;
-    if(gPurpleFlashPhase==2 && elapsed<100){ neopixelWrite(LED_PIN, 60,0,60); return; }
+    if(gPurpleFlashPhase==2 && elapsed<100){ neopixelWrite(LED_PIN, 25,0,55); return; }
     if(gPurpleFlashPhase==2 && elapsed<200){ neopixelWrite(LED_PIN, 0,0,0); return; }
-    if(gPurpleFlashPhase==2 && elapsed<300){ neopixelWrite(LED_PIN, 60,0,60); return; }
+    if(gPurpleFlashPhase==2 && elapsed<300){ neopixelWrite(LED_PIN, 25,0,55); return; }
     if(elapsed>400){ gPurpleFlashPhase=0; neopixelWrite(LED_PIN,0,0,0); }
-    else if(elapsed<100 || (elapsed>=200 && elapsed<300)) neopixelWrite(LED_PIN,60,0,60);
+    else if(elapsed<100 || (elapsed>=200 && elapsed<300)) neopixelWrite(LED_PIN,25,0,55);
     else neopixelWrite(LED_PIN,0,0,0);
     if(elapsed>400) gPurpleFlashPhase=0;
     return;
@@ -564,46 +565,41 @@ static void updateLedTelemetry(){
   // MODE6 Power Alert - Crimson breathing if bat <15%
   float v = gBattVoltage; int bat_pct = (int)((v - 3.2f)/(4.2f-3.2f)*100); if(bat_pct<0) bat_pct=0;
   if(bat_pct < 15){
-    uint8_t crimson = (uint8_t)((sin(now/600.0)+1.0)*30); // slow 600ms
-    neopixelWrite(LED_PIN, crimson, 0, 0);
+    neopixelWrite(LED_PIN, 60, 0, 0); // MODE6 calibrated pure laser-red color565(60,0,0)
     return;
   }
   // MODE8 Signal Fade - Magenta tint 100ms if RSSI < -80
   if(now - gMagentaTintMs < 100){
-    neopixelWrite(LED_PIN, 60, 0, 60);
+    neopixelWrite(LED_PIN, 55, 0, 15); // MODE8 calibrated hot pink color565(55,0,15)
     return;
   } else if(WiFi.status()==WL_CONNECTED && WiFi.RSSI() < -80){
     gMagentaTintMs = now;
-    neopixelWrite(LED_PIN, 60, 0, 60);
+    neopixelWrite(LED_PIN, 55, 0, 15); // MODE8 hot pink
     return;
   }
   // MODE4 Storage Sync - Solid Green burst during SD log write
   if(gGreenBurstActive && now - gGreenBurstMs < 200){
-    neopixelWrite(LED_PIN, 0, 40, 0);
+    neopixelWrite(LED_PIN, 0, 30, 0); // MODE4 calibrated low-glare green color565(0,30,0)
     return;
   } else { gGreenBurstActive=false; }
   // MODE5 Boundary Hit - 80ms Red flash (deep crimson via helper)
   if(now - gRedFlashMs < 80){
-    setDeepCrimson();
+    setDeepCrimson(); // color565(60, 0, 0) pure Red
     return;
   }
   // MODE3 Latency Check - 40ms Yellow blip on PONG
   if(now - gYellowBlipMs < 40){
-    neopixelWrite(LED_PIN, 20, 20, 0);
+    neopixelWrite(LED_PIN, 35, 20, 0); // MODE3 calibrated amber-yellow color565(35,20,0)
     return;
   }
   // MODE7 Typing Cadence - 15ms White spark
   if(now - gWhiteSparkMs < 15){
-    neopixelWrite(LED_PIN, 10, 10, 10);
+    neopixelWrite(LED_PIN, 45, 45, 45); // MODE7 calibrated pure white spark color565(45,45,45)
     return;
   }
   // MODE1 Idle Heartbeat - slow Cyan breathing when healthy
   if(gIrcConnected){
-    uint8_t breathe_val = (sin(now / 300.0) + 1.0) * 20;
-    // also check if has general unread for slightly brighter
-    bool hasUnread=false; for(int i=0;i<gTabCount;i++) if(gTabs[i].unread) hasUnread=true;
-    uint8_t b = hasUnread ? 60 : 30;
-    neopixelWrite(LED_PIN, 0, breathe_val, b);
+    neopixelWrite(LED_PIN, 0, 45, 20); // MODE1 calibrated terminal teal color565(0,45,20)
     return;
   }
   // idle off
@@ -1238,7 +1234,21 @@ static void ensureTabLayout(Tab* tab){
 }
 void draw_chat_view(){
   if (!ui_needs_redraw) return;
-  if (gTabCount == 0 || strlen(gTabs[current_tab_index].name) == 0) {
+  if (safe_mode_active) {
+      canvas.fillSprite(0x0000);
+      canvas.setTextColor(0x5AEB);
+      canvas.setCursor(10, 20);
+      canvas.print("[!] SYSTEM INITIALIZATION:");
+      canvas.setTextColor(0xFD20);
+      canvas.setCursor(10, 40);
+      canvas.print("~safemode console active");
+      canvas.setCursor(10, 55);
+      canvas.print("press Alt+Backspace to exit");
+      canvas.pushSprite(0, 12);
+      ui_needs_redraw = false;
+      return;
+  }
+  if (gTabCount == 0) {
       canvas.fillSprite(0x0000);
       canvas.setTextColor(0xF800);
       canvas.setCursor(10, 50);
@@ -3090,16 +3100,12 @@ void setup(){
   if (safe_mode_active) {
       gTabCount = 1;
       current_tab_index = 0;
+      memset(&gTabs, 0, sizeof(Tab));
       strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
       strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
-      gTabs[0].name[sizeof(gTabs[0].name)-1]='\0'; gTabs[0].server[sizeof(gTabs[0].server)-1]='\0';
-      gTabs[0].type = TAB_STATUS;
-      memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
-      strncpy(active_networks[0], "Offline", sizeof(active_networks[0])-1); active_networks_count = 1;
-      add_message_to_buffer("System", "Safe Mode Terminal Active. Press Alt+Backspace to exit.", 0xFD20);
       xSemaphoreGive(irc_mutex);
-      // Asynchronous LED unlock - single-pass deep crimson via helper, no delays
-      setDeepCrimson();
+      ui_needs_redraw = true;
+      neopixelWrite(LED_PIN, 60, 0, 0); // pure Red color565(60,0,0) - no green/blue leakage
       M5Cardputer.Display.setCursor(8, 82); M5Cardputer.Display.print(" SAFE MODE ");
   } else {
     Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
