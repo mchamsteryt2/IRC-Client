@@ -43,9 +43,12 @@ int screen_brightness = 120;
 // ==========================================
 // 🔀 INTERACTIVE APP-MODE STATE MACHINE
 // ==========================================
-enum AppMode { MODE_CHAT, MODE_WIFI, MODE_BOUNCER, MODE_SETTINGS };
+enum AppMode { MODE_CHAT, MODE_WIFI, MODE_BOUNCER, MODE_SETTINGS, MODE_NAVIGATOR };
 volatile AppMode current_app_mode = MODE_CHAT;
 int menu_selection_idx = 0;
+int nav_server_select_idx = 0;
+int nav_channel_select_idx = 0;
+int nav_focus_column = 0; // 0=LEFT server, 1=RIGHT channel - stealth navigator focus
 unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
 
 Tab gTabs[MAX_TABS];
@@ -376,6 +379,40 @@ void draw_chat_view() {
     }
 
     // --- MODAL DRAWING RESPONSES: route viewport on current_app_mode ---
+    if (current_app_mode == MODE_NAVIGATOR) {
+        canvas.fillSprite(0x0000);
+        
+        // --- LEFT COLUMN: NETWORK SERVERS (X=5 TO X=110) ---
+        canvas.fillRect(0, 0, 114, 135, 0x0841); // Slate container block
+        canvas.setTextColor(0x07E0); canvas.setCursor(6, 6); canvas.print("NETWORKS");
+        for (int i = 0; i < discovered_network_count; i++) {
+            uint16_t txt_color = (nav_server_select_idx == i) ? 0xFFFF : 0x7BEF;
+            canvas.setTextColor(txt_color);
+            canvas.setCursor(12, 24 + (i * 14));
+            canvas.printf("%s %s", (nav_server_select_idx == i ? ">" : " "), discovered_networks[i]);
+        }
+        
+        // --- RIGHT COLUMN: CHANNELS LIST ROSTER (X=120 TO X=235) ---
+        canvas.drawFastVLine(116, 0, 135, 0x7BEF); // Split window wire guide line
+        canvas.setTextColor(0xFD20); canvas.setCursor(122, 6); canvas.print("ACTIVE ROOMS");
+        
+        int channel_print_counter = 0;
+        for (int i = 0; i < gTabCount; i++) {
+            // Filter and draw strictly the channels belonging to our selected network node
+            if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) {
+                uint16_t txt_color = (nav_channel_select_idx == channel_print_counter) ? 0xFFFF : 0x7BEF;
+                canvas.setTextColor(txt_color);
+                canvas.setCursor(126, 24 + (channel_print_counter * 14));
+                canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), gTabs[i].name);
+                channel_print_counter++;
+            }
+        }
+        
+        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print("Arrows: Nav | Enter: Open Channel");
+        canvas.pushSprite(0, 0);
+        ui_needs_redraw = false;
+        return;
+    }
     if (current_app_mode != MODE_CHAT) {
         switch (current_app_mode) {
             case MODE_SETTINGS: {
@@ -481,10 +518,17 @@ void draw_chat_view() {
                 canvas.setTextColor(get_nick_palette_color(t.lines[i].nick));
             }
             canvas.setCursor(68, current_y);
-            canvas.printf("<%s>", t.lines[i].nick);
-            
-            canvas.setTextColor(t.lines[i].color);
-            canvas.setCursor(120, current_y);
+            if (current_tab_index == 0) {
+                // Mentions mode layout: Print prefix without brackets formatting, force text column to X=160
+                canvas.printf("%s", t.lines[i].nick);
+                canvas.setTextColor(t.lines[i].color);
+                canvas.setCursor(160, current_y); // <-- Slide text out to prevent multi-network label overlap
+            } else {
+                // Standard mode layout: Print standard bracketed room nickname, leave text column at X=120
+                canvas.printf("<%s>", t.lines[i].nick);
+                canvas.setTextColor(t.lines[i].color);
+                canvas.setCursor(120, current_y);
+            }
             canvas.print(t.lines[i].message); // Core text string payload - full-bleed across complete 240x109 horizontal canvas bounds, zero placeholders
             
             current_y += 12;
@@ -527,14 +571,13 @@ void draw_chat_view() {
         M5Cardputer.Display.print("W"); // Connected Wi-Fi Micro-Indicator
     }
     
-    // Anchor B: Audio Privacy State Flag (X=158)
     M5Cardputer.Display.setCursor(158, 2);
     if (current_audio == 0) {
         M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
-        M5Cardputer.Display.print("M"); // Muted Micro-Indicator
+        M5Cardputer.Display.print("H"); // Stealth Hidden Mode
     } else {
         M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
-        M5Cardputer.Display.print("S"); // Sound Active Micro-Indicator
+        M5Cardputer.Display.print("V"); // Standard Visible Mode
     }
     
     // Anchor C: Local System Digital Clock (X=176)
@@ -593,13 +636,34 @@ void handle_keyboard_inputs() {
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
     
-    // Layer A: Quick Settings, Bouncer Profiles, and Wi-Fi Manager Paging
+    // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P)
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('p')) {
+        current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
+        menu_selection_idx = 0; nav_server_select_idx = 0; nav_channel_select_idx = 0;
+        ui_needs_redraw = true;
+        return;
+    }
+
+    // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O)
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('o')) {
         if (current_app_mode == MODE_CHAT)       { current_app_mode = MODE_SETTINGS; }
         else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
         else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_WIFI; }
         else                                      { current_app_mode = MODE_CHAT; }
         menu_selection_idx = 0;
+        ui_needs_redraw = true;
+        return;
+    }
+
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('s')) {
+        current_audio = (current_audio == 1) ? 0 : 1; // 0 = Stealth Active, 1 = Normal Active
+        
+        if (current_audio == 0) {
+            M5Cardputer.Display.setBrightness(1); // Force drop backlight to absolute minimum
+            neopixelWrite(21, 0, 0, 0);          // Kill the diagnostic LED entirely
+        } else {
+            M5Cardputer.Display.setBrightness(screen_brightness); // Restore full user brightness
+        }
         ui_needs_redraw = true;
         return;
     }
@@ -626,17 +690,74 @@ void handle_keyboard_inputs() {
             return;
         }
     } else {
-        // Menu Form Mode Navigation rules
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Fn+Up Arrow: Move selector up
+        // Navigator Hub override: side-by-side Server & Channel navigation
+        if (current_app_mode == MODE_NAVIGATOR) {
+            // Left/Right switch focus between columns
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn+Left Arrow
+                nav_focus_column = 0;
+                ui_needs_redraw = true;
+                return;
+            }
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Fn+Right Arrow
+                nav_focus_column = 1;
+                ui_needs_redraw = true;
+                return;
+            }
+            // Up/Down increment active column row pointer
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Fn+Up
+                if (nav_focus_column == 0) {
+                    if (nav_server_select_idx > 0) nav_server_select_idx--;
+                } else {
+                    if (nav_channel_select_idx > 0) nav_channel_select_idx--;
+                }
+                ui_needs_redraw = true;
+                return;
+            }
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down
+                if (nav_focus_column == 0) {
+                    if (nav_server_select_idx < (int)discovered_network_count - 1) nav_server_select_idx++;
+                    // clamp channel index when server changes
+                    nav_channel_select_idx = 0;
+                } else {
+                    // count channels for selected server
+                    int ch_cnt = 0;
+                    for (int i = 0; i < gTabCount; i++) if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) ch_cnt++;
+                    if (nav_channel_select_idx < ch_cnt - 1) nav_channel_select_idx++;
+                }
+                ui_needs_redraw = true;
+                return;
+            }
+            // Enter maps to current_tab_index
+            if (status.enter) {
+                int channel_print_counter = 0;
+                for (int i = 0; i < gTabCount; i++) {
+                    if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) {
+                        if (channel_print_counter == nav_channel_select_idx) {
+                            current_tab_index = i;
+                            current_app_mode = MODE_CHAT;
+                            ui_needs_redraw = true;
+                            return;
+                        }
+                        channel_print_counter++;
+                    }
+                }
+                return;
+            }
+        }
+        // Menu Form Mode Variable Selection Controllers
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Fn+Up Arrow
             if (menu_selection_idx > 0) { menu_selection_idx--; ui_needs_redraw = true; }
             return;
         }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down Arrow: Move selector down
-            int maxIdx = 5;
-            if (current_app_mode == MODE_BOUNCER) maxIdx = 4;
-            else if (current_app_mode == MODE_SETTINGS) maxIdx = 5;
-            else if (current_app_mode == MODE_WIFI) maxIdx = 3;
-            if (menu_selection_idx < maxIdx) { menu_selection_idx++; ui_needs_redraw = true; }
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down Arrow
+            int max_limit = 3; // Fallback default for shorter menus
+            if (current_app_mode == MODE_SETTINGS) max_limit = 5; // Allow access to all 6 setup rows (0-5)
+            if (current_app_mode == MODE_BOUNCER)  max_limit = 4;
+            
+            if (menu_selection_idx < max_limit) { 
+                menu_selection_idx++; 
+                ui_needs_redraw = true; 
+            } 
             return;
         }
     }
@@ -893,9 +1014,16 @@ void custom_ui_loop_task(void* pvParameters) {
         M5Cardputer.update(); // Polling matrix registers over un-lockable bus lane
         handle_keyboard_inputs();
         
-        // Non-blocking auto dim screen backlight sleep timer check
-        if (millis() - last_input_time > 60000) { M5Cardputer.Display.setBrightness(10); vTaskDelay(pdMS_TO_TICKS(5)); }
-        else { M5Cardputer.Display.setBrightness(screen_brightness); vTaskDelay(pdMS_TO_TICKS(5)); }
+        if (current_audio == 0) {
+            M5Cardputer.Display.setBrightness(1); // Keep clamped
+            vTaskDelay(pdMS_TO_TICKS(5));
+        } else if (millis() - last_input_time > 60000) {
+            M5Cardputer.Display.setBrightness(10);
+            vTaskDelay(pdMS_TO_TICKS(5));
+        } else {
+            M5Cardputer.Display.setBrightness(screen_brightness);
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
         
         // Drive Stamp-S3A LED modes asynchronously without delay halts
         set_led_mode(safe_mode_active ? 0 : 1);
