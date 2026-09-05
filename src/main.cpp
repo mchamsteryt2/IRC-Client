@@ -271,6 +271,7 @@ static bool gCanvasReady = false;
 static TaskHandle_t gNetTaskHandle = nullptr;
 static char gRxAccum[RX_ACCUM_SZ];
 static int gRxLen = 0;
+char gInlineServerHHMM[6] = {0}; // inline server-time side buffer for zero-allocation extraction
 static bool gIrcConnected = false;
 static bool gIrcRegistered = false;
 static uint32_t gLastRxMs = 0;
@@ -1892,6 +1893,8 @@ static void handleRawIrc(char* line){
   char* tags=nullptr;
   char serverHHMM[6]={0};
   bool hasServerTime=false;
+  // check inline side buffer from Core0 ultra-lean extraction (zero-allocation, tags already stripped)
+  if(gInlineServerHHMM[0] && strlen(gInlineServerHHMM)==5){ safeCopy(serverHHMM, gInlineServerHHMM, sizeof(serverHHMM)); hasServerTime=true; gInlineServerHHMM[0]='\0'; }
   char* p=line;
   if(*p=='@'){
     tags=p+1;
@@ -2464,7 +2467,7 @@ static void netTask(void* arg){
         char line[128];
         // MANDATORY IRCv3 CAP FILE HANDLER: precise capability string per spec
         cl->print("CAP LS 302\r\n");
-        cl->print("CAP REQ :server-time chghost account-notify cap-notify batch labeled-response sasl\r\n");
+        cl->print("CAP REQ :cap-notify server-time away-notify account-notify extended-join\r\n");
         snprintf(line,sizeof(line),"NICK %s\r\n", gCfg.nick); cl->print(line);
         snprintf(line,sizeof(line),"USER %s 0 * :%s\r\n", gCfg.user, gCfg.realname); cl->print(line);
         gLastPingMs=millis();
@@ -2486,6 +2489,48 @@ static void netTask(void* arg){
         if(c=='\r') continue;
         if(c=='\n'){
           gRxAccum[gRxLen]='\0';
+          // ULTRA-LEAN INLINE SERVER-TIME EXTRACTION - zero-allocation pointer match inside Core0 token parser
+          if(gRxLen>0 && gRxAccum[0]=='@'){
+            char* space = strchr(gRxAccum, ' ');
+            // BYPASS OVERHEAD OVERRUNS: immediate pointer offset stride jump for extensive tags
+            if(!space || (space - gRxAccum) > 128 || gRxLen > 512){
+              // discard unrecognized/extensive metadata to protect 26KB canvas registers from page-fault
+              gRxLen=0;
+              if(gRxQueue.size() >= 8) break;
+              continue;
+            }
+            // localized sliding C-string search for 'T' delimiter to extract HH:MM
+            char* tPos = strchr(gRxAccum, 'T');
+            if(tPos && tPos+5 < space && isdigit((unsigned char)tPos[1]) && isdigit((unsigned char)tPos[2]) && tPos[3]==':' && isdigit((unsigned char)tPos[4]) && isdigit((unsigned char)tPos[5])){
+              char serverHHMM[6] = {tPos[1], tPos[2], ':', tPos[4], tPos[5], '\0'};
+              char localized[6]; localizeTimeHHMM(serverHHMM, localized);
+              safeCopy(gInlineServerHHMM, localized, sizeof(gInlineServerHHMM));
+            }
+            // jump past metadata block trailing space to continue standard PRIVMSG parsing
+            size_t tailLen = strlen(space+1);
+            // immediate pointer offset stride jump - discard unrecognized prefix
+            memmove(gRxAccum, space+1, tailLen+1);
+            gRxLen = tailLen;
+            // if tail is empty after strip, skip
+            if(gRxLen==0){
+              if(gRxQueue.size() >= 8) break;
+              continue;
+            }
+          }
+          // CAP NEW/DEL defensiveness: fast pointer break to dump trailing bytes
+          if(gRxLen>0 && (strstr(gRxAccum, "CAP NEW") || strstr(gRxAccum, "CAP DEL"))){
+            // already extracted critical tags above if @ present, now discard unrecognized trailing attributes
+            char* capSpace = strchr(gRxAccum, ' ');
+            if(capSpace){
+              char* nextSpace = strchr(capSpace+1, ' ');
+              if(nextSpace) *nextSpace = '\0';
+              gRxLen = strlen(gRxAccum);
+            }
+            // protect 26KB canvas registers from overflow hangs - discard fully after tag extraction
+            gRxLen=0;
+            if(gRxQueue.size() >= 8) break;
+            continue;
+          }
           if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); ui_needs_redraw = true; }
           gRxLen=0;
           if(gRxQueue.size() >= 8) break;
