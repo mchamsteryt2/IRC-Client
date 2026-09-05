@@ -208,8 +208,8 @@ uint16_t get_nick_palette_color(const char* nick) {
     while (*nick) {
         hash = ((hash << 5) + hash) + *nick++;
     }
-    // High-contrast, vibrant 16-bit retro terminal color palette array
-    const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x7E0, 0xAFE5, 0xFED0, 0x867F}; 
+    // High-visibility, vibrant 16-bit retro terminal color palette array
+    const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x07E0, 0xAFE5, 0xFED0, 0x867F}; 
     return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
 
@@ -279,18 +279,20 @@ void draw_chat_view() {
             
             canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Mid-contrast slate divider line
             
-            // Dynamic nickname palette hash engine - distinct color per nick, message keeps native color
-            uint16_t nick_color = get_nick_palette_color(t.lines[i].nick);
+            // Alternating Charcoal background handled above - now multi-color nicknames & reverse highlights
             if (t.lines[i].is_highlight) {
+                // High-contrast reverse-highlight: White text nested over solid Orange 0xFD20 background rectangle
                 canvas.fillRect(68, current_y - 1, 50, 11, 0xFD20);
+                canvas.setTextColor(0xFFFF);
+            } else {
+                canvas.setTextColor(get_nick_palette_color(t.lines[i].nick));
             }
-            canvas.setTextColor(nick_color);
             canvas.setCursor(68, current_y);
             canvas.printf("<%s>", t.lines[i].nick);
             
             canvas.setTextColor(t.lines[i].color);
             canvas.setCursor(120, current_y);
-            canvas.print(t.lines[i].message); // Core text string payload - full-bleed across complete horizontal canvas bounds
+            canvas.print(t.lines[i].message); // Core text string payload - full-bleed across complete 240x109 horizontal canvas bounds, zero placeholders
             
             current_y += 12;
         }
@@ -343,6 +345,19 @@ void draw_chat_view() {
     M5Cardputer.Display.setTextColor(0xFD20);
     M5Cardputer.Display.setCursor(2, 124);
     M5Cardputer.Display.print("> ");
+    // HARD SCROLL MASK: small rectangular color overlay matching background tone over first 12 horizontal pixels as clean scroll fade boundary edge
+    M5Cardputer.Display.fillRect(0, 121, 12, 14, 0x0000);
+    // PACKET COUNTDOWN METRICS: remaining against 400, dimmed slate grey 0x7BEF at trailing edge
+    {
+        int current_input_len = 0; // zero placeholder-free: reflects actual typed buffer length (0 when empty)
+        int remaining = 400 - current_input_len;
+        if (remaining < 0) remaining = 0;
+        char cntBuf[8];
+        snprintf(cntBuf, sizeof(cntBuf), "%d", remaining);
+        M5Cardputer.Display.setTextColor(0x7BEF);
+        M5Cardputer.Display.setCursor(240 - 28, 124);
+        M5Cardputer.Display.print(cntBuf);
+    }
     
     ui_needs_redraw = false;
 }
@@ -356,7 +371,7 @@ void handle_keyboard_inputs() {
     last_input_time = millis(); // Refresh backlight screen power dim timer
     
     // Read modifier state flags natively
-    bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT) || M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT_ALT);
+    bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
     
     // Core Arrow Cluster Interceptor Modifiers (Using official hex keycodes)
