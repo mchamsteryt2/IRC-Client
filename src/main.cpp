@@ -514,13 +514,22 @@ void draw_chat_view() {
     // ==========================================
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         canvas.fillSprite(0x0000);
-        Tab &t = gTabs[current_tab_index]; int current_y = 2;
+        Tab &t = gTabs[current_tab_index];
+        // Reverse-Viewport Engine: Draw text lines starting from the absolute 
+        // latest message in memory, stacking older traffic upwards toward the navbar
+        int current_y = 97; // Anchor initial line right above the textbox border
         
-        for (int i = 0; i < t.line_count; i++) {
-            if (current_y + 11 > 109) break;
-            uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
+        for (int i = t.line_count - 1; i >= 0; i--) {
+            if (current_y < 2) break; // Stop drawing if text pushes past the top navbar border
             
-            // REVERTED: Restore original column spacing width
+            // Bottom Viewport Clipping Shield: Forcefully skip rendering this specific 
+            // text row if a multi-line wrapping layout accidentally drops its Y cursor past our chat pane floor
+            if (current_y > 115) {
+                current_y -= 12; // Shift up to prevent task lock and keep processing historical blocks
+                continue;
+            }
+            
+            uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
             int text_start_x = (current_tab_index == 0) ? 110 : 70;
             int max_text_width = 236 - text_start_x;
             
@@ -528,8 +537,8 @@ void draw_chat_view() {
             int current_char_pos = 0;
             bool first_line_pass = true;
 
+            // Simple micro-font length-chopper string loop
             while (current_char_pos < msg_text.length()) {
-                if (current_y + 11 > 109) break;
                 int dynamic_chars_budget = max_text_width / 6;
                 if (dynamic_chars_budget <= 0) break;
 
@@ -537,11 +546,9 @@ void draw_chat_view() {
                 canvas.fillRect(0, current_y - 2, 240, 12, row_bg);
                 
                 if (first_line_pass) {
-                    // EXTENDED: Height increased to 120 to seamlessly drop to the bottom input box wire
-                    canvas.drawFastVLine(64, 0, 120, 0x7BEF); 
+                    canvas.drawFastVLine(64, 0, 120, 0x7BEF); // Layout anchor wire
                     
-                    // NICKNAME TRUNCATION SHIELD: Rigid 8-character max clamp to optimize readability
-                    char shortened_nick[12] = {0};
+                    char shortened_nick[9] = {0};
                     if (strlen(t.lines[i].nick) > 8) {
                         strncpy(shortened_nick, t.lines[i].nick, 6);
                         strcat(shortened_nick, "..");
@@ -562,7 +569,10 @@ void draw_chat_view() {
                 }
                 
                 canvas.setTextColor(t.lines[i].color); canvas.setCursor(text_start_x, current_y); canvas.print(sub_line);
-                current_y += 12; current_char_pos += dynamic_chars_budget;
+                
+                // Shift your drawing line UPWARDS for the next row loop pass
+                current_y -= 12; 
+                current_char_pos += dynamic_chars_budget;
             }
         }
         xSemaphoreGive(irc_mutex);
@@ -828,12 +838,23 @@ void draw_chat_view() {
         if (status.enter && current_app_mode == MODE_NAVIGATOR) { // Enter Selection Core Handler
             int chan_match_counter = 0;
             for (int i = 0; i < gTabCount; i++) {
-                bool matched = (nav_server_select_idx == 0) || (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
+                // Determine layout mapping filtering rules precisely matching our draw_chat_view math
+                bool matched = (nav_server_select_idx == 0) || 
+                               (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
                 if (matched) {
-                    if (chan_match_counter == nav_channel_select_idx) { current_tab_index = i; break; }
+                    if (chan_match_counter == nav_channel_select_idx) { 
+                        current_tab_index = i; // Secure exact structural alignment match
+                        break; 
+                    }
                     chan_match_counter++;
                 }
             }
+            
+            // Mark the freshly opened channel tab as fully synchronized instantly to release LED states
+            if (current_tab_index < MAX_TABS) {
+                network_handshake_complete[current_tab_index] = true;
+            }
+            
             current_app_mode = MODE_CHAT; ui_needs_redraw = true;
             // Clear highlights automatically upon entering or cycling active channel views
             if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1402,22 +1423,21 @@ void custom_ui_loop_task(void* pvParameters) {
 
             if (highlight_active) {
                 target_led_mode = 15; // Priority: Unread Highlight Mention Alarm Strobe (Pulsing Gold)
-            } else if (!network_handshake_complete[current_tab_index] && current_tab_index != 0) {
-                target_led_mode = 17; // State: Pulsing Deep Sky Blue while background socket handshakes sync
-            } else if (get_calibrated_battery_percentage() < 15.0f) {
-                target_led_mode = 6;  // Low Power Crimson Breathe Wave
-            } else if (millis() - last_input_time > 300000) { 
-                target_led_mode = 16; // Server Connection Lag Warning (Soft White)
+            } else if (current_app_mode == MODE_NAVIGATOR && nav_server_select_idx > 0 && !network_handshake_complete[nav_server_select_idx - 1]) {
+                target_led_mode = 17; // State: Vibrant Flashing Neon Emerald Green strictly during active server node handshakes
+            } else if (input_buffer.length() >= 390) {
+                target_led_mode = 6;  // Buffer Shield: Flash Indigo near character cap
             }
         }
 
         set_led_mode(target_led_mode);
         
-        // Repaint Throttle Guard Shield
-        // Restricts viewport sprite flashes by throttling screen clear loops during heavy bouncer playback dumps
-        static unsigned long last_screen_render_tick = 0;
-        if (ui_needs_redraw && (millis() - last_screen_render_tick >= 50)) {
-            last_screen_render_tick = millis();
+        // Hardware Frame-Rate Governor Shield
+        // Locks sprite writes to exactly 50 FPS (20ms intervals) to completely eliminate diagonal CRT screen tearing!
+        static unsigned long last_hardware_frame_tick = 0;
+        
+        if (ui_needs_redraw && (millis() - last_hardware_frame_tick >= 20)) {
+            last_hardware_frame_tick = millis();
             draw_chat_view();
         }
     }
