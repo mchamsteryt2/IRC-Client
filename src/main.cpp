@@ -771,10 +771,13 @@ void handle_keyboard_inputs() {
                 return;
             }
         }
-    // Layer F: One-Handed Menu Navigation Pad (Active inside Menu/Navigator modes)
+    // ==========================================
+    // 🎮 THE ONE-HANDED MENU DIRECTIONAL PAD (ACTIVE IN MENUS)
+    // ==========================================
     if (current_app_mode != MODE_CHAT) {
-        // Vertical List Selection Scrolling (Single-press Comma=UP, Period=DOWN)
-        if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Comma = UP Arrow
+        
+        // 1. VERTICAL SCROLLING INTERCEPTS (Comma = UP Arrow | Period = DOWN Arrow)
+        if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Single-press Comma steps UP
             if (current_app_mode == MODE_NAVIGATOR) {
                 if (nav_channel_select_idx > 0) { nav_channel_select_idx--; ui_needs_redraw = true; }
             } else {
@@ -782,9 +785,8 @@ void handle_keyboard_inputs() {
             }
             return;
         }
-        if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Period = DOWN Arrow
+        if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Single-press Period steps DOWN
             if (current_app_mode == MODE_NAVIGATOR) {
-                // Dynamically clamp to active channel size bounds
                 if (nav_channel_select_idx < gTabCount - 1) { nav_channel_select_idx++; ui_needs_redraw = true; }
             } else {
                 int max_limit = (current_app_mode == MODE_SETTINGS) ? 5 : 4;
@@ -793,31 +795,33 @@ void handle_keyboard_inputs() {
             return;
         }
 
-        // Horizontal Column & Value Toggling (Single-press Semicolon=LEFT, Forward Slash=RIGHT)
+        // 2. HORIZONTAL SCROLLING INTERCEPTS (Semicolon = LEFT Value | Forward Slash = RIGHT Value)
         if (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/')) {
             bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
             ui_needs_redraw = true;
             
             if (current_app_mode == MODE_SETTINGS) {
-                if (menu_selection_idx == 0) {
-                    screen_brightness += forward ? 30 : -30;
-                    if (screen_brightness > 255) screen_brightness = 255;
-                    if (screen_brightness < 10)  screen_brightness = 10;
-                    M5Cardputer.Display.setBrightness(screen_brightness);
+                if (menu_selection_idx == 0) { // Brightness Row Step Toggles
+                    if (forward) {
+                        if (screen_brightness == 10) screen_brightness = 60;
+                        else if (screen_brightness == 60) screen_brightness = 120;
+                        else if (screen_brightness == 120) screen_brightness = 200;
+                        else if (screen_brightness == 200) screen_brightness = 255;
+                    } else {
+                        if (screen_brightness == 255) screen_brightness = 200;
+                        else if (screen_brightness == 200) screen_brightness = 120;
+                        else if (screen_brightness == 120) screen_brightness = 60;
+                        else if (screen_brightness == 60) screen_brightness = 10;
+                    }
+                    analogWrite(38, screen_brightness); // Force instant hardware panel modulation update
                 }
-                else if (menu_selection_idx == 1) {
+                else if (menu_selection_idx == 1) { // Timezone Index Offsets
                     current_tz_idx += forward ? 1 : -1;
                     if (current_tz_idx > 14) current_tz_idx = -12;
                     if (current_tz_idx < -12) current_tz_idx = 14;
                 }
                 else if (menu_selection_idx == 2) { use_12_hour_format = !use_12_hour_format; }
                 else if (menu_selection_idx == 3) { channel_log_enabled = !channel_log_enabled; }
-            }
-            else if (current_app_mode == MODE_BOUNCER) {
-                if (menu_selection_idx == 1) { // Interactive Port Adjuster Row
-                    bnc_port += forward ? 1 : -1;
-                    if (bnc_port < 0) bnc_port = 0;
-                }
             }
             return;
         }
@@ -1251,15 +1255,13 @@ void custom_ui_loop_task(void* pvParameters) {
         M5Cardputer.update(); // Polling matrix registers over un-lockable bus lane
         handle_keyboard_inputs();
         
+        // Bare-Metal Backlight Modulation Controller (GPIO Pin 38)
         if (current_audio == 0) {
-            M5Cardputer.Display.setBrightness(1); // Keep clamped
-            vTaskDelay(pdMS_TO_TICKS(5));
+            analogWrite(38, 0); // Privacy Stealth Mode: Kill the panel current completely
         } else if (millis() - last_input_time > 60000) {
-            M5Cardputer.Display.setBrightness(10);
-            vTaskDelay(pdMS_TO_TICKS(5));
+            analogWrite(38, 8); // Ambient Sleep Dim Mode: Drop to low trace current level
         } else {
-            M5Cardputer.Display.setBrightness(screen_brightness);
-            vTaskDelay(pdMS_TO_TICKS(5));
+            analogWrite(38, screen_brightness); // Normal Mode: Drive matching custom preference
         }
         
         // Drive Stamp-S3A LED modes asynchronously without delay halts
