@@ -48,6 +48,7 @@ int menu_selection_idx = 0; // Tracks active cursor line choices inside setup sc
 
 Tab gTabs[MAX_TABS];
 SemaphoreHandle_t irc_mutex = NULL;
+SemaphoreHandle_t sd_mutex = NULL;
 QueueHandle_t gLogQueue = NULL;
 M5Canvas canvas(&M5Cardputer.Display);
 
@@ -124,32 +125,48 @@ void load_settings_from_sd() {
         return;
     }
     
+    char lineBuf[128];
     while (file.available()) {
         yield(); // Crucial hardware watchdog protection inside file read loop
-        String line = file.readStringUntil('\n');
-        line.trim();
-        if (line.length() == 0 || line.startsWith("#")) continue;
-        
-        int sep_idx = line.indexOf('=');
-        if (sep_idx == -1) continue;
-        
-        String key = line.substring(0, sep_idx);
-        String value = line.substring(sep_idx + 1);
-        key.trim();
-        value.trim();
-        
-        // Exact Token Matching Pipeline
-        if (key == "wifi_ssid") strncpy(wifi_ssid, value.c_str(), sizeof(wifi_ssid) - 1);
-        else if (key == "wifi_pass") strncpy(wifi_pass, value.c_str(), sizeof(wifi_pass) - 1);
-        else if (key == "irc_nick")  strncpy(irc_nick, value.c_str(), sizeof(irc_nick) - 1);
-        else if (key == "bnc_host")  strncpy(bnc_host, value.c_str(), sizeof(bnc_host) - 1);
-        else if (key == "bnc_port") { bnc_port = value.toInt(); }
-        else if (key == "bnc_user")  strncpy(bnc_user, value.c_str(), sizeof(bnc_user) - 1);
-        else if (key == "bnc_pass")  strncpy(bnc_pass, value.c_str(), sizeof(bnc_pass) - 1);
-        else if (key == "channel_log_enabled") channel_log_enabled = value.toInt();
-        else if (key == "screen_brightness")   screen_brightness = value.toInt();
-        else if (key == "current_tz_idx")      current_tz_idx = value.toInt();
-        else if (key == "use_12_hour_format")  use_12_hour_format = value.toInt();
+        int len = file.readBytesUntil('\n', lineBuf, sizeof(lineBuf)-1);
+        if (len <= 0) {
+            // consume single byte if readBytesUntil failed on empty line
+            if (file.available()) file.read();
+            continue;
+        }
+        lineBuf[len] = '\0';
+        // strip trailing \r
+        if (len > 0 && lineBuf[len-1] == '\r') lineBuf[len-1] = '\0';
+        // trim leading whitespace
+        char *start = lineBuf;
+        while (*start==' '||*start=='\t') start++;
+        if (*start=='\0' || *start=='#') continue;
+        // trim trailing whitespace
+        char *end = start + strlen(start) - 1;
+        while (end > start && (*end==' '||*end=='\t')) { *end='\0'; end--; }
+        char *eq = strchr(start, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = start;
+        char *value = eq + 1;
+        while (*key==' '||*key=='\t') key++;
+        char *ke = key + strlen(key) - 1;
+        while (ke >= key && (*ke==' '||*ke=='\t')) { *ke='\0'; ke--; }
+        while (*value==' '||*value=='\t') value++;
+        char *ve = value + strlen(value) - 1;
+        while (ve >= value && (*ve==' '||*ve=='\t')) { *ve='\0'; ve--; }
+        // Exact Token Matching Pipeline (no String heap)
+        if (strcmp(key, "wifi_ssid")==0) strncpy(wifi_ssid, value, sizeof(wifi_ssid) - 1);
+        else if (strcmp(key, "wifi_pass")==0) strncpy(wifi_pass, value, sizeof(wifi_pass) - 1);
+        else if (strcmp(key, "irc_nick")==0) strncpy(irc_nick, value, sizeof(irc_nick) - 1);
+        else if (strcmp(key, "bnc_host")==0) strncpy(bnc_host, value, sizeof(bnc_host) - 1);
+        else if (strcmp(key, "bnc_port")==0) { bnc_port = atoi(value); }
+        else if (strcmp(key, "bnc_user")==0) strncpy(bnc_user, value, sizeof(bnc_user) - 1);
+        else if (strcmp(key, "bnc_pass")==0) strncpy(bnc_pass, value, sizeof(bnc_pass) - 1);
+        else if (strcmp(key, "channel_log_enabled")==0) channel_log_enabled = atoi(value);
+        else if (strcmp(key, "screen_brightness")==0) screen_brightness = atoi(value);
+        else if (strcmp(key, "current_tz_idx")==0) current_tz_idx = atoi(value);
+        else if (strcmp(key, "use_12_hour_format")==0) use_12_hour_format = atoi(value);
     }
     file.close();
     Serial.println("[STORAGE] Configuration fields successfully streamed and parsed from SD.");
@@ -158,13 +175,18 @@ void load_settings_from_sd() {
 void sync_new_nick_to_sd(const char* new_nick) {
     if (safe_mode_active) return;
     strncpy(irc_nick, new_nick, sizeof(irc_nick) - 1);
+    bool sd_locked = false;
+    if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(100)) == pdTRUE);
+    else sd_locked = true;
+    if (!sd_locked) return;
     File file = SD.open("/irc/config.txt", FILE_WRITE);
-    if (!file) return;
+    if (!file) { if (sd_mutex) xSemaphoreGive(sd_mutex); return; }
     file.printf("wifi_ssid=%s\nwifi_pass=%s\nirc_nick=%s\n", wifi_ssid, wifi_pass, irc_nick);
     file.printf("channel_log_enabled=%d\ncurrent_audio=%d\nscreen_brightness=%d\n", channel_log_enabled, current_audio, screen_brightness);
     file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\nbnc_host=%s\n", current_tz_idx, use_12_hour_format, bnc_host);
     file.printf("bnc_port=%d\nbnc_user=%s\nbnc_pass=%s\n", bnc_port, bnc_user, bnc_pass);
     file.close();
+    if (sd_mutex) xSemaphoreGive(sd_mutex);
     Serial.println("[STORAGE-SYNC] New nick permanently synchronized to micro-SD config.");
 }
 
@@ -221,65 +243,59 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color) 
         xSemaphoreGive(irc_mutex);
         ui_needs_redraw = true;
     }
-    // --- THREAD-SAFE LOCAL LOG WRITING ENGINE ---
-    // If channel_log_enabled == 1, check for private query DM ('>') or critical server alert ('~system')
+    // --- DECOUPLED LOG WRITING (SD I/O NOT UNDER irc_mutex to avoid UI freeze/crash) ---
     if (channel_log_enabled == 1) {
-        // Determine target channel name snapshot (need mutex for safe read)
         char logChannel[32] = {0};
         if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
             int idx = 0;
             if (gTabCount > 0 && current_tab_index < gTabCount) idx = current_tab_index;
             strncpy(logChannel, gTabs[idx].name, sizeof(logChannel)-1);
             xSemaphoreGive(irc_mutex);
+        } else {
+            if (gTabCount > 0 && current_tab_index < gTabCount) strncpy(logChannel, gTabs[current_tab_index].name, sizeof(logChannel)-1);
         }
-        bool isQuery = (logChannel[0] == '>');
-        bool isSystem = (strcmp(logChannel, "~system") == 0);
-        // Validate query or system; also log normal channels when enabled for completeness
-        if (isQuery || isSystem) {
-            // Claim file-system lock, construct storage file path matching channel param
-            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                char logPath[64];
-                if (isSystem) snprintf(logPath, sizeof(logPath), "/irc/logs/system.log");
-                else if (isQuery) snprintf(logPath, sizeof(logPath), "/irc/logs/query.log");
-                else snprintf(logPath, sizeof(logPath), "/irc/logs/%s.log", logChannel);
-                // Ensure directory exists briefly
-                if (!SD.exists("/irc")) SD.mkdir("/irc");
-                if (!SD.exists("/irc/logs")) SD.mkdir("/irc/logs");
-                File f = SD.open(logPath, FILE_APPEND);
-                if (f) {
-                    f.printf("%s %s: %s\n", logChannel, source, msg);
-                    f.close();
-                }
-                xSemaphoreGive(irc_mutex);
-            }
-        } else if (channel_log_enabled == 1) {
-            // General channel logging (still thread-safe, brief isolated lock pass)
-            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                char logPath2[64];
-                // Sanitize channel name for filesystem
+        if (logChannel[0] == 0) return;
+        bool sd_locked = false;
+        if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE);
+        else sd_locked = true;
+        if (sd_locked) {
+            char logPath[64];
+            bool isQuery = (logChannel[0] == '>');
+            bool isSystem = (strcmp(logChannel, "~system") == 0);
+            if (isSystem) snprintf(logPath, sizeof(logPath), "/irc/logs/system.log");
+            else if (isQuery) snprintf(logPath, sizeof(logPath), "/irc/logs/query.log");
+            else {
                 char safeChan[32];
                 strncpy(safeChan, logChannel, sizeof(safeChan)-1);
                 for (char* p=safeChan; *p; ++p) if (*p=='/' || *p=='\\') *p='_';
-                snprintf(logPath2, sizeof(logPath2), "/irc/logs/%s.log", safeChan[0]?safeChan:"system");
-                if (!SD.exists("/irc")) SD.mkdir("/irc");
-                if (!SD.exists("/irc/logs")) SD.mkdir("/irc/logs");
-                File f2 = SD.open(logPath2, FILE_APPEND);
-                if (f2) {
-                    f2.printf("%s\n", msg);
-                    f2.close();
-                }
-                xSemaphoreGive(irc_mutex);
+                snprintf(logPath, sizeof(logPath), "/irc/logs/%s.log", safeChan[0]?safeChan:"system");
             }
+            if (!SD.exists("/irc")) SD.mkdir("/irc");
+            if (!SD.exists("/irc/logs")) SD.mkdir("/irc/logs");
+            File f = SD.open(logPath, FILE_APPEND);
+            if (f) {
+                if (isSystem || isQuery) f.printf("%s %s: %s\n", logChannel, source, msg);
+                else f.printf("%s\n", msg);
+                f.close();
+            }
+            if (sd_mutex) xSemaphoreGive(sd_mutex);
         }
     }
 }
 
 float get_calibrated_battery_percentage() {
-    float raw_volt = M5Cardputer.Power.getBatteryVoltage(); 
+    static unsigned long last_read = 0;
+    static float smoothed_pct = 50.0f;
+    static float last_raw = 3.9f;
+    // Throttle I2C PMIC reads to every 5s to avoid bus contention / crashes after boot
+    if (millis() - last_read > 5000 || last_read == 0) {
+        last_raw = M5Cardputer.Power.getBatteryVoltage();
+        last_read = millis();
+    }
+    float raw_volt = last_raw;
     if (raw_volt > 4.2f) raw_volt = 4.2f;
     if (raw_volt < 3.3f) raw_volt = 3.3f;
     float percentage = ((raw_volt - 3.3f) / (4.2f - 3.3f)) * 100.0f;
-    static float smoothed_pct = percentage;
     smoothed_pct = (smoothed_pct * 0.95f) + (percentage * 0.05f); // Exponential Moving Average Filter
     return smoothed_pct;
 }
@@ -288,7 +304,7 @@ uint16_t get_nick_palette_color(const char* nick) {
     uint32_t hash = 5381;
     while (*nick) { hash = ((hash << 5) + hash) + *nick++; }
     const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x07E0, 0xAFE5, 0xFED0, 0x867F}; 
-    return palette[hash % (sizeof(palette) / sizeof(palette))];
+    return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
 
 // ==========================================
@@ -451,13 +467,27 @@ void draw_chat_view() {
     // 4. HARDWARE DISPLAY GLASS DIRECT REFRESH RENDER OVERLAYS
     canvas.pushSprite(0, 12);
     
+    // Snapshot tab names under mutex to avoid race with irc_network_task tab discovery
+    char snap_server[32] = {0}, snap_name[32] = {0};
+    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (gTabCount > 0 && current_tab_index < gTabCount) {
+            strncpy(snap_server, gTabs[current_tab_index].server, sizeof(snap_server)-1);
+            strncpy(snap_name, gTabs[current_tab_index].name, sizeof(snap_name)-1);
+        }
+        xSemaphoreGive(irc_mutex);
+    } else {
+        if (gTabCount > 0 && current_tab_index < gTabCount) {
+            strncpy(snap_server, gTabs[current_tab_index].server, sizeof(snap_server)-1);
+            strncpy(snap_name, gTabs[current_tab_index].name, sizeof(snap_name)-1);
+        }
+    }
     // Header Navbar Row (Top 12px Glass) - Server-prefixed tab tags
     M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
     M5Cardputer.Display.setTextColor(0x7BEF);
     M5Cardputer.Display.setCursor(2, 2);
     M5Cardputer.Display.print("[");
     M5Cardputer.Display.setTextColor(0xFFFF);
-    if (strcmp(gTabs[current_tab_index].name, "~mentions") == 0) {
+    if (strcmp(snap_name, "~mentions") == 0) {
         // Dedicated pings collector tab natively rendered as [ClientCore/~mentions]
         M5Cardputer.Display.print("ClientCore");
         M5Cardputer.Display.setTextColor(0x7BEF);
@@ -466,11 +496,11 @@ void draw_chat_view() {
         M5Cardputer.Display.print("~mentions");
     } else {
         // Format: [ServerName/ChannelName] with low-contrast terminal grey divider
-        M5Cardputer.Display.print(gTabs[current_tab_index].server);
+        M5Cardputer.Display.print(snap_server);
         M5Cardputer.Display.setTextColor(0x7BEF);
         M5Cardputer.Display.print("/");
         M5Cardputer.Display.setTextColor(0xFFFF);
-        M5Cardputer.Display.print(gTabs[current_tab_index].name);
+        M5Cardputer.Display.print(snap_name);
     }
     M5Cardputer.Display.setTextColor(0x7BEF);
     M5Cardputer.Display.print("]");
@@ -591,19 +621,23 @@ void handle_keyboard_inputs() {
     }
     if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAC)) { // Alt + Left Arrow (0xAC) Jump Server Left (Whole Network Skip Backward)
         if (gTabCount <= 1) return;
-        String cur_srv = String(gTabs[current_tab_index].server);
+        char cur_srv[32];
+        strncpy(cur_srv, gTabs[current_tab_index].server, sizeof(cur_srv)-1);
+        cur_srv[sizeof(cur_srv)-1]='\0';
         for (int i = 1; i < gTabCount; i++) {
             int idx = (current_tab_index - i + gTabCount) % gTabCount;
-            if (String(gTabs[idx].server) != cur_srv) { current_tab_index = idx; ui_needs_redraw = true; return; }
+            if (strcmp(gTabs[idx].server, cur_srv) != 0) { current_tab_index = idx; ui_needs_redraw = true; return; }
         }
         return;
     }
     if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAF)) { // Alt + Right Arrow (0xAF) Jump Server Right (Whole Network Skip Forward)
         if (gTabCount <= 1) return;
-        String cur_srv = String(gTabs[current_tab_index].server);
+        char cur_srv2[32];
+        strncpy(cur_srv2, gTabs[current_tab_index].server, sizeof(cur_srv2)-1);
+        cur_srv2[sizeof(cur_srv2)-1]='\0';
         for (int i = 1; i < gTabCount; i++) {
             int idx = (current_tab_index + i) % gTabCount;
-            if (String(gTabs[idx].server) != cur_srv) { current_tab_index = idx; ui_needs_redraw = true; return; }
+            if (strcmp(gTabs[idx].server, cur_srv2) != 0) { current_tab_index = idx; ui_needs_redraw = true; return; }
         }
         return;
     }
@@ -783,8 +817,10 @@ void irc_network_task(void* pvParameters) {
         }
 
         if (client.connected()) {
-            // Read available data and feed queue with overflow protection
+            // Read available data with cooperative yields to avoid WDT / UI starvation on burst
+            int processed = 0;
             while (client.available()) {
+                if (++processed % 32 == 0) { yield(); vTaskDelay(pdMS_TO_TICKS(1)); }
                 last_server_activity = millis();
                 char c = client.read();
                 if (c == '\r') continue;
@@ -963,6 +999,7 @@ void setup() {
     SD.begin(12, SPI, 10000000);
     
     irc_mutex = xSemaphoreCreateMutex();
+    sd_mutex = xSemaphoreCreateMutex();
     gLogQueue = xQueueCreate(20, sizeof(char) * 128);
     
     // Paint intro splash logo horizontally
@@ -1004,7 +1041,7 @@ void setup() {
     strncpy(gTabs[1].server, "Bouncer", sizeof(gTabs[1].server)-1);
     
     // SPAWN CONCURRENT COOPERATIVE WORKERS STRATEGIC CORES
-    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 8192, NULL, 1, NULL, 0); // Socket operations on Core 0
+    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 12288, NULL, 1, NULL, 0); // Socket operations on Core 0 - 12K for TLS handshake
     xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 16384, NULL, 1, NULL, 1); // Matrix UI updates on Core 1
 }
 
