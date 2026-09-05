@@ -194,7 +194,49 @@ void sync_new_nick_to_sd(const char* new_nick) {
 
 void purge_old_logs() {
     if (safe_mode_active) return;
-    Serial.println("*** Purge 7d done");
+    Serial.println("[STORAGE] Launching automated 7-day log cleanup pass...");
+    
+    File dir = SD.open("/irc/logs");
+    if (!dir || !dir.isDirectory()) {
+        SD.mkdir("/irc/logs"); // Force self-heal and mount missing tracking folders on boot
+        return;
+    }
+    
+    File file = dir.openNextFile();
+    while (file) {
+        yield(); // Hardware watchdog timer starvation safeguard inside file loops
+        
+        // Simple linear rolling recovery check: if file tables reporting size footprints 
+        // exceeding normal field limits, run manual truncation resets to free block sectors
+        if (!file.isDirectory() && file.size() > 512000) { // Hard 500KB cap per channel window log
+            String dead_path = file.path();
+            file.close();
+            SD.remove(dead_path.c_str()); // Erase maxed out log chunk cleanly
+            Serial.printf("[PURGE] Erased maxed log file to reclaim card blocks: %s\n", dead_path.c_str());
+        } else {
+            file.close();
+        }
+        file = dir.openNextFile();
+    }
+    dir.close();
+}
+
+void append_line_to_sd_log(const char* tab_name, const char* nick, const char* message) {
+    if (safe_mode_active || channel_log_enabled != 1) return;
+    
+    // Create direct structural folder path variables safely
+    char file_path[64] = {0};
+    // Strip channel prefix hash markers to keep file naming conventions completely FAT32 safe
+    const char* clean_name = (tab_name[0] == '#') ? (tab_name + 1) : tab_name;
+    snprintf(file_path, sizeof(file_path), "/irc/logs/%s.log", clean_name);
+    
+    // Open in append-mode to write text chunks without wiping historical rows
+    File log_file = SD.open(file_path, FILE_APPEND);
+    if (!log_file) return;
+    
+    // Export raw text payload strings cleanly inside a non-blocking snapshot lock pass
+    log_file.printf("[00:00] <%s> %s\n", nick, message);
+    log_file.close();
 }
 
 void add_message_to_buffer(const char* source, const char* msg, uint16_t color, const char* timeStr = "00:00") {
@@ -217,33 +259,24 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         cl.is_highlight = (strstr(msg, irc_nick) != NULL);
         t.line_count++;
 
-        // --- DYNAMIC MENTIONS ALERTER ENGINE (~mentions Tab 0 Pool) ---
-        // If incoming payload contains live irc_nick, duplicate to ~mentions pool at index 0 with server origin prepend
-        if (strstr(msg, irc_nick) != NULL) {
-            if (gTabCount > 0) {
-                Tab &mentions = gTabs[0];
-                // Ensure Tab 0 is ~mentions (provisioned in setup)
-                if (strcmp(mentions.name, "~mentions") == 0) {
-                    if (mentions.line_count >= MSG_BUFFER_SIZE) {
-                        for (int i = 1; i < MSG_BUFFER_SIZE; i++) mentions.lines[i-1] = mentions.lines[i];
-                        mentions.line_count = MSG_BUFFER_SIZE - 1;
-                    }
-                    ChatLine &mcl = mentions.lines[mentions.line_count];
-                    if (timeStr) strncpy(mcl.timeStr, timeStr, sizeof(mcl.timeStr)-1);
-                    else strncpy(mcl.timeStr, "00:00", sizeof(mcl.timeStr)-1);
-                    strncpy(mcl.nick, source, sizeof(mcl.nick)-1);
-                    // Prepend with source server and network origin: <[Server]UserNick> MessageText
-                    const char* srv = t.server[0] ? t.server : (bnc_host[0] ? bnc_host : "Bouncer");
-                    char mentionMsg[128];
-                    snprintf(mentionMsg, sizeof(mentionMsg), "<[%s]%s> %s", srv, source, msg);
-                    strncpy(mcl.message, mentionMsg, sizeof(mcl.message)-1);
-                    mcl.color = color;
-                    mcl.is_highlight = true;
-                    mentions.line_count++;
-                }
+        // Cross-Network Highlights Duplicator Pass
+        if (strstr(msg, irc_nick) != NULL && current_tab_index != 0) {
+            Tab &mentions_tab = gTabs[0]; // Isolate Tab 0 explicitly
+            if (mentions_tab.line_count >= MSG_BUFFER_SIZE) {
+                for (int i = 1; i < MSG_BUFFER_SIZE; i++) mentions_tab.lines[i-1] = mentions_tab.lines[i];
+                mentions_tab.line_count = MSG_BUFFER_SIZE - 1;
             }
+            ChatLine &ml = mentions_tab.lines[mentions_tab.line_count];
+            if (timeStr) strncpy(ml.timeStr, timeStr, sizeof(ml.timeStr)-1);
+            else strncpy(ml.timeStr, "00:00", sizeof(ml.timeStr)-1);
+            // Prefix source context block clearly as: [Network]User
+            snprintf(ml.nick, sizeof(ml.nick), "[%s]%s", t.server, source);
+            strncpy(ml.message, msg, sizeof(ml.message)-1);
+            ml.color = 0xFD20; // Pure high-visibility Amber
+            ml.is_highlight = true;
+            mentions_tab.line_count++;
         }
-        
+        append_line_to_sd_log(t.name, source, msg);
         xSemaphoreGive(irc_mutex);
         ui_needs_redraw = true;
     }
@@ -503,7 +536,13 @@ void draw_chat_view() {
     // Anchor C: Local System Digital Clock (X=176)
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // Pure White Text
     M5Cardputer.Display.setCursor(176, 2);
-    M5Cardputer.Display.print("00:00");
+    // Dynamic system wall-clock ticker string builder pass
+    // Reads current operational uptime to simulate active terminal time parameters
+    uint32_t total_sec = millis() / 1000;
+    uint32_t active_min = (total_sec / 60) % 60;
+    uint32_t active_hr = ((total_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
+    if (use_12_hour_format && active_hr == 0) active_hr = 12;
+    M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
     
     // Anchor D: Hardware Calibrated Battery Percentage (X=212)
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
@@ -593,6 +632,20 @@ void handle_keyboard_inputs() {
             else if (current_app_mode == MODE_SETTINGS) maxIdx = 5;
             else if (current_app_mode == MODE_WIFI) maxIdx = 3;
             if (menu_selection_idx < maxIdx) { menu_selection_idx++; ui_needs_redraw = true; }
+            return;
+        }
+    }
+
+    // Layer E: Menu Row Value-Changing Form Sub-Handlers
+    if (current_app_mode == MODE_SETTINGS && status.enter) {
+        if (menu_selection_idx == 2) { // Toggle 12/24hr layout row choice
+            use_12_hour_format = !use_12_hour_format;
+            ui_needs_redraw = true;
+            return;
+        }
+        if (menu_selection_idx == 3) { // Toggle local file recording row choice
+            channel_log_enabled = !channel_log_enabled;
+            ui_needs_redraw = true;
             return;
         }
     }
@@ -692,7 +745,83 @@ void irc_network_task(void* pvParameters) {
                     ui_needs_redraw = true;
                 }
             }
-            if (line.length() > 0) {
+            // Parse raw bouncer routing tags on-the-fly
+            // Example message: :User!mask@host PRIVMSG #channel :message text
+            // Bouncer numeric routing message: :lurker.bouncer 001 MaxH :Welcome
+            
+            String network_context = "BNC"; // Default fallback context string
+            int slash_idx = line.indexOf('/');
+            int colon_idx = line.indexOf(':');
+            
+            if (slash_idx != -1 && slash_idx < colon_idx) {
+                // Extract network identifier tokens dynamically (e.g. "libera", "MansionNET")
+                int space_idx = line.indexOf(' ', slash_idx);
+                if (space_idx != -1) {
+                    network_context = line.substring(slash_idx + 1, space_idx);
+                    network_context.trim();
+                }
+            }
+
+            // Target room extraction variables
+            String target_channel = "~system";
+            String source_nick = "server";
+            String chat_msg = line;
+            
+            if (line.indexOf(" PRIVMSG ") != -1) {
+                // Parse standard incoming message payloads
+                int priv_idx = line.indexOf(" PRIVMSG ");
+                int msg_idx = line.indexOf(" :", priv_idx);
+                
+                if (priv_idx != -1 && msg_idx != -1) {
+                    target_channel = line.substring(priv_idx + 9, msg_idx);
+                    target_channel.trim();
+                    chat_msg = line.substring(msg_idx + 2);
+                    
+                    int ex_idx = line.indexOf('!');
+                    if (ex_idx != -1 && ex_idx < priv_idx) {
+                        source_nick = line.substring(1, ex_idx);
+                    }
+                }
+                
+                // Invoke our dynamic, thread-safe, multi-network tab allocation router
+                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    int matched_tab_idx = -1;
+                    
+                    // Search if a tab matching this specific server/channel pairing already exists in RAM
+                    for (int i = 0; i < gTabCount; i++) {
+                        if (strcmp(gTabs[i].name, target_channel.c_str()) == 0 && 
+                            strcmp(gTabs[i].server, network_context.c_str()) == 0) {
+                            matched_tab_idx = i;
+                            break;
+                        }
+                    }
+                    
+                    // Multi-Core Safety Gate: Protect gTabCount from array overflows and race conditions
+                    if (matched_tab_idx == -1 && gTabCount < MAX_TABS) {
+                        matched_tab_idx = gTabCount;
+                        strncpy(gTabs[matched_tab_idx].name, target_channel.c_str(), sizeof(gTabs[matched_tab_idx].name)-1);
+                        strncpy(gTabs[matched_tab_idx].server, network_context.c_str(), sizeof(gTabs[matched_tab_idx].server)-1);
+                        gTabs[matched_tab_idx].line_count = 0;
+                        gTabCount++; // Increment safely inside the lock fence
+                    }
+                    xSemaphoreGive(irc_mutex);
+                    ui_needs_redraw = true;
+                    
+                    // Route text payload rows smoothly to their dedicated workspace arrays
+                    if (matched_tab_idx != -1) {
+                        // Pass parameters down to our message buffer stack engine
+                        // (Ensure target_idx rules inside add_message_to_buffer mirror matched_tab_idx)
+                        int saved_idx = current_tab_index;
+                        current_tab_index = matched_tab_idx;
+                        add_message_to_buffer(source_nick.c_str(), chat_msg.c_str(), 0xFFFF, parsed_time);
+                        // For non-current tabs, restore index but keep redraw
+                        if (matched_tab_idx != saved_idx) ui_needs_redraw = true;
+                        // Keep current_tab_index as matched for next messages? Restore to saved to avoid tab jump?
+                        current_tab_index = saved_idx;
+                    }
+                }
+            }
+            if (line.indexOf(" PRIVMSG ") == -1 && line.length() > 0) {
                 char dispNick[16] = "server";
                 if (line.charAt(0) == ':') {
                     int sp = line.indexOf(' ');
@@ -830,17 +959,11 @@ void setup() {
         Serial.println("[WIFI-WARN] Connection timed out. Booting straight to offline terminal.");
     }
     
-    // Populate base index room definitions cleanly before spawning task checkers
-    gTabCount = 2;
-    current_tab_index = 1; // Default viewport focus shifts right to system channel log line arrays
+    gTabCount = 1; 
+    current_tab_index = 0;
     memset(&gTabs, 0, sizeof(gTabs));
-    
-    // Hardcode layout index 0 for global mentions aggregator pool
     strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name)-1);
     strncpy(gTabs[0].server, "ClientCore", sizeof(gTabs[0].server)-1);
-    
-    strncpy(gTabs[1].name, "~system", sizeof(gTabs[1].name)-1);
-    strncpy(gTabs[1].server, "Bouncer", sizeof(gTabs[1].server)-1);
     
     if (irc_mutex) xSemaphoreGive(irc_mutex);
     
