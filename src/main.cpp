@@ -548,16 +548,22 @@ void draw_chat_view() {
     M5Cardputer.Display.setCursor(142, 2);
     if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
     else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
-    M5Cardputer.Display.setCursor(158, 2);
+    
+    M5Cardputer.Display.setCursor(154, 2);
     if (current_audio == 0) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("H"); }
     else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("V"); }
+
+    // Clean Navbar Logging Status Anchor (L = Logging Active | N = No Logs)
+    M5Cardputer.Display.setCursor(166, 2);
+    if (channel_log_enabled == 1) { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("L"); }
+    else { M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.print("N"); }
     
     unsigned long current_sync_sec = (millis() / 1000) + adj_time;
     uint32_t active_min = (current_sync_sec / 60) % 60;
     uint32_t active_hr  = ((current_sync_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
     if (use_12_hour_format && active_hr == 0) active_hr = 12;
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(176, 2); M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
-    M5Cardputer.Display.setCursor(212, 2); M5Cardputer.Display.printf("%03d", 400 - input_buffer.length());
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(182, 2); M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
+    M5Cardputer.Display.setCursor(212, 2); M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
 
     // LOWER INPUT BOX
     M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
