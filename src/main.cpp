@@ -1176,6 +1176,7 @@ void irc_network_task(void* pv){
     }
     gIrcConnected=false; gIrcRegistered=false; cl->stop();
     vTaskDelay(pdMS_TO_TICKS(2000));
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
