@@ -545,14 +545,17 @@ void draw_chat_view() {
 
             // Simple micro-font length-chopper string loop
             while (current_char_pos < msg_text.length()) {
-                int dynamic_chars_budget = max_text_width / 6;
+                // Calculate cursor offsets dynamically depending on whether this is a trailing row pass
+                int active_render_x = first_line_pass ? text_start_x : (text_start_x + 6);
+                int dynamic_max_width = 236 - active_render_x;
+                int dynamic_chars_budget = dynamic_max_width / 6;
                 if (dynamic_chars_budget <= 0) break;
 
                 String sub_line = msg_text.substring(current_char_pos, current_char_pos + dynamic_chars_budget);
                 canvas.fillRect(0, current_y - 2, 240, 12, row_bg);
                 
                 if (first_line_pass) {
-                    canvas.drawFastVLine(64, 0, 120, 0x7BEF); // Layout anchor wire
+                    canvas.drawFastVLine(64, 0, 120, 0x7BEF); 
                     
                     char shortened_nick[9] = {0};
                     if (strlen(t.lines[i].nick) > 8) {
@@ -574,7 +577,9 @@ void draw_chat_view() {
                     first_line_pass = false;
                 }
                 
-                canvas.setTextColor(t.lines[i].color); canvas.setCursor(text_start_x, current_y); canvas.print(sub_line);
+                canvas.setTextColor(t.lines[i].color); 
+                canvas.setCursor(active_render_x, current_y); // Render line with smart column layout padding
+                canvas.print(sub_line);
                 
                 // Shift your drawing line UPWARDS for the next row loop pass
                 current_y -= 12; 
@@ -732,6 +737,24 @@ void draw_chat_view() {
         if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
             scrollback_offset_idx = 0; // Escape key sequence instantly snaps viewport right back to live chat
             ui_needs_redraw = true;
+        }
+
+        // Horizontal Quick-Tab Swapper (Fn + Comma = Previous Tab | Fn + Slash = Next Tab)
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) {
+            if (gTabCount > 1) {
+                current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount;
+                scrollback_offset_idx = 0; // Reset scrollback view context instantly
+                ui_needs_redraw = true;
+            }
+            return;
+        }
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) {
+            if (gTabCount > 1) {
+                current_tab_index = (current_tab_index + 1) % gTabCount;
+                scrollback_offset_idx = 0; // Reset scrollback view context instantly
+                ui_needs_redraw = true;
+            }
+            return;
         }
     } else {
         // Navigator Hub override: side-by-side Server & Channel navigation
