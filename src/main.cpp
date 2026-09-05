@@ -33,6 +33,7 @@ struct Tab {
 // 🔏 REGISTERS (EXPLICIT VOLATILE STATE METRICS)
 // ==========================================
 volatile bool safe_mode_active = false;
+volatile bool system_booted = false;
 volatile bool ui_needs_redraw = true;
 volatile uint8_t current_tab_index = 0;
 volatile uint8_t gTabCount = 0;
@@ -952,7 +953,10 @@ void custom_ui_loop_task(void* pvParameters) {
     ui_needs_redraw = true;
     while (true) {
         yield();
-        vTaskDelay(pdMS_TO_TICKS(5)); // High speed core loop throttle
+        vTaskDelay(pdMS_TO_TICKS(10));
+        
+        // Sit idle and yield if the core setup sequence hasn't finished initializing memory
+        if (!system_booted) continue; 
         
         M5Cardputer.update(); // Polling matrix registers over un-lockable bus lane
         handle_keyboard_inputs();
@@ -1040,9 +1044,13 @@ void setup() {
     strncpy(gTabs[1].name, "~system", sizeof(gTabs[1].name)-1);
     strncpy(gTabs[1].server, "Bouncer", sizeof(gTabs[1].server)-1);
     
-    // SPAWN CONCURRENT COOPERATIVE WORKERS STRATEGIC CORES
-    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 12288, NULL, 1, NULL, 0); // Socket operations on Core 0 - 12K for TLS handshake
-    xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 16384, NULL, 1, NULL, 1); // Matrix UI updates on Core 1
+    if (irc_mutex) xSemaphoreGive(irc_mutex);
+    
+    // Memory allocation and initialization complete. Lower the barrier safely.
+    system_booted = true; 
+    
+    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 8192, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 16384, NULL, 1, NULL, 1);
 }
 
 void loop() {
