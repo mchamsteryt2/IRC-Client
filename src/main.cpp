@@ -324,6 +324,7 @@ static uint32_t gMagentaTintMs = 0; // MODE8 RSSI < -80 100ms
 static uint32_t gPurpleFlashMs = 0; static uint8_t gPurpleFlashPhase = 0; // MODE2 double purple
 static uint32_t gCrimsonLastMs = 0; // MODE6 <15% breathing
 static uint32_t gDisconnectMs = 0; // MODE9 solid orange timeout
+inline void setDeepCrimson(){ neopixelWrite(LED_PIN, 20, 0, 0); } // deduplicated helper for MODE5 boundary + safe-mode unlock
 
 // Jack and battery
 static bool gJackPlugged = false;
@@ -581,9 +582,9 @@ static void updateLedTelemetry(){
     neopixelWrite(LED_PIN, 0, 40, 0);
     return;
   } else { gGreenBurstActive=false; }
-  // MODE5 Boundary Hit - 80ms Red flash
+  // MODE5 Boundary Hit - 80ms Red flash (deep crimson via helper)
   if(now - gRedFlashMs < 80){
-    neopixelWrite(LED_PIN, 20, 0, 0);
+    setDeepCrimson();
     return;
   }
   // MODE3 Latency Check - 40ms Yellow blip on PONG
@@ -1239,10 +1240,10 @@ void draw_chat_view(){
   if (!ui_needs_redraw) return;
   if (gTabCount == 0 || strlen(gTabs[current_tab_index].name) == 0) {
       canvas.fillSprite(0x0000);
-      canvas.setTextColor(0xFD20);
-      canvas.setCursor(10, 45);
-      canvas.print("SAFE MODE TERMINAL ACTIVE");
-      if(gCanvasReady) canvas.pushSprite(0, 12);
+      canvas.setTextColor(0xF800);
+      canvas.setCursor(10, 50);
+      canvas.print("CRITICAL LOGICAL UNALIGNED ERROR");
+      canvas.pushSprite(0, 12);
       ui_needs_redraw = false;
       return;
   }
@@ -3042,8 +3043,7 @@ void setup(){
   // Do not sample GPIO0 here - floating strapping causes spurious safe mode; decision after splash with visual hold prompt
   // Execution MUST flow through cleanly past this block immediately!
 
-  // Hardware pin setup after mutex creation (does not touch irc_mutex)
-  pinMode(G0_PIN, INPUT_PULLUP);
+  // Hardware pin setup after mutex creation (does not touch irc_mutex) - G0 banned, use keyboard matrix
   analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
   pinMode(BATTERY_PIN, INPUT);
   pinMode(JACK_DETECT_PIN, INPUT_PULLUP);
@@ -3074,43 +3074,38 @@ void setup(){
   // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
   draw_chat_view();
-  // Safe Mode hold prompt - require intentional 1s hold of G0/BtnA after splash, not floating GPIO at boot
-  {
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
-    M5Cardputer.Display.setCursor(8, 70);
-    M5Cardputer.Display.print("Hold G0 1s for SafeMode");
-    // sample BtnA for 1s with visual feedback, feed WDT
-    int holdConfirm = 0;
-    for(int i=0;i<10;i++){ vTaskDelay(pdMS_TO_TICKS(100)); yield(); M5Cardputer.update(); Wire.setTimeOut(50);
-      bool isHeld = M5Cardputer.BtnA.isPressed(); // only TCA8418 BtnA, ignore floating GPIO0 strapping
-      if(isHeld) holdConfirm++; else holdConfirm = 0;
-      // visual tick
-      M5Cardputer.Display.setCursor(8+ i*6, 82); M5Cardputer.Display.print(isHeld?".":" ");
-      if(holdConfirm >= 8){ // 800ms continuous hold
-        Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
-        safe_mode_active = true; gSafeBoot = true;
-        gTabCount = 1; current_tab_index = 0;
-        memset(&gTabs[0], 0, sizeof(gTabs[0]));
-        memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
-        strncpy(active_networks[0], "None", sizeof(active_networks[0])-1); active_networks_count = 1;
-        strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
-        strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
-        gTabs[0].type = TAB_STATUS;
-        add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
-        xSemaphoreGive(irc_mutex);
-        break;
+  // Safe, delayed matrix scan window - allow TCA8418 to cleanly initialize before sampling
+  unsigned long boot_scan_start = millis();
+  safe_mode_active = false;
+  while (millis() - boot_scan_start < 1500) {
+      yield();
+      vTaskDelay(pdMS_TO_TICKS(10));
+      M5Cardputer.update(); // Poll the I2C matrix registers cleanly
+      // Check if the user is holding down the native Backspace key during the splash screen
+      if (M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed('\b')) {
+          safe_mode_active = true;
       }
-    }
-    if(!safe_mode_active){
-      Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
-      safe_mode_active = false; gSafeBoot = false;
-      // clear prompt
-      M5Cardputer.Display.fillRect(8,70, 180, 20, 0x0000);
-      ui_needs_redraw = true; draw_chat_view();
-    } else {
-      // keep SafeMode prompt visible
+  }
+  xSemaphoreGive(irc_mutex);
+  if (safe_mode_active) {
+      gTabCount = 1;
+      current_tab_index = 0;
+      strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
+      strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
+      gTabs[0].name[sizeof(gTabs[0].name)-1]='\0'; gTabs[0].server[sizeof(gTabs[0].server)-1]='\0';
+      gTabs[0].type = TAB_STATUS;
+      memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
+      strncpy(active_networks[0], "Offline", sizeof(active_networks[0])-1); active_networks_count = 1;
+      add_message_to_buffer("System", "Safe Mode Terminal Active. Press Alt+Backspace to exit.", 0xFD20);
+      xSemaphoreGive(irc_mutex);
+      // Asynchronous LED unlock - single-pass deep crimson via helper, no delays
+      setDeepCrimson();
       M5Cardputer.Display.setCursor(8, 82); M5Cardputer.Display.print(" SAFE MODE ");
-    }
+  } else {
+    Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
+    gSafeBoot = false;
+    M5Cardputer.Display.fillRect(8,70, 180, 20, 0x0000);
+    ui_needs_redraw = true; draw_chat_view();
   }
   // Intermediate init - SPI, SD, config, etc. (all after mutex, before network) - guarded in safe mode to avoid SPI bus contention with ST7789
   if(!gSafeBoot){
