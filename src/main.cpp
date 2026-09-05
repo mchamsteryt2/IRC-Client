@@ -1477,7 +1477,7 @@ void irc_network_task(void* pvParameters) {
                                     set_led_mode(23); 
                                     
                                     // Transmit a custom, sanitized identification string back down the secure socket
-                                    net_client.printf("NOTICE %s :\x01VERSION Cardputer-Adv Cyberdeck Terminal v2.4 (ESP32-S3/FreeRTOS)\x01\r\n", sender_nick.c_str());
+                                    net_client.printf("NOTICE %s :\x01VERSION Cardputer ADV IRC (ESP32-S3FN8)\x01\r\n", sender_nick.c_str());
                                     net_client.flush(); // Force immediate packet delivery down the wire
                                     
                                     continue; // Drop the packet out of processing execution so it never clutters chat logs
