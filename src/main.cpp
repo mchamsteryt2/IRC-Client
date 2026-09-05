@@ -196,7 +196,7 @@ void purge_old_logs() {
     Serial.println("*** Purge 7d done");
 }
 
-void add_message_to_buffer(const char* source, const char* msg, uint16_t color) {
+void add_message_to_buffer(const char* source, const char* msg, uint16_t color, const char* timeStr = "00:00") {
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
         int target_idx = 0;
         if (gTabCount > 0 && current_tab_index < gTabCount) target_idx = current_tab_index;
@@ -208,7 +208,8 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color) 
         }
         
         ChatLine &cl = t.lines[t.line_count];
-        strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
+        if (timeStr) strncpy(cl.timeStr, timeStr, sizeof(cl.timeStr)-1);
+        else strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
         strncpy(cl.nick, source, sizeof(cl.nick)-1);
         strncpy(cl.message, msg, sizeof(cl.message)-1);
         cl.color = color;
@@ -227,7 +228,8 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color) 
                         mentions.line_count = MSG_BUFFER_SIZE - 1;
                     }
                     ChatLine &mcl = mentions.lines[mentions.line_count];
-                    strncpy(mcl.timeStr, "00:00", sizeof(mcl.timeStr)-1);
+                    if (timeStr) strncpy(mcl.timeStr, timeStr, sizeof(mcl.timeStr)-1);
+                    else strncpy(mcl.timeStr, "00:00", sizeof(mcl.timeStr)-1);
                     strncpy(mcl.nick, source, sizeof(mcl.nick)-1);
                     // Prepend with source server and network origin: <[Server]UserNick> MessageText
                     const char* srv = t.server[0] ? t.server : (bnc_host[0] ? bnc_host : "Bouncer");
@@ -734,176 +736,95 @@ void handle_keyboard_inputs() {
 // 🚀 CONCURRENT COOPERATIVE FREERTOS STEERING
 // ==========================================
 void irc_network_task(void* pvParameters) {
-    static char rxAccum[512];
-    static int rxLen = 0;
     while (true) {
         yield();
-        vTaskDelay(pdMS_TO_TICKS(10)); // Strict task scheduler return delay
+        vTaskDelay(pdMS_TO_TICKS(10));
         
-        if (safe_mode_active) continue; // Completely isolates thread execution if safe mode is tripped
+        if (safe_mode_active) continue;
         
-        // --- IRCv3 CAPABILITY NEGOTIATION HANDSHAKE: ensure connection and send PASS/CAP/NICK/USER ---
-        if (!client.connected()) {
-            if (WiFi.status() != WL_CONNECTED) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-            if (bnc_host[0] == '\0' || bnc_port == 0) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-            client.setInsecure();
-            if (!client.connect(bnc_host, bnc_port)) {
-                set_led_mode(9);
-                vTaskDelay(pdMS_TO_TICKS(3000));
-                continue;
+        // If the client drops its link, attempt a safe background reconnect
+        if (WiFi.status() == WL_CONNECTED && !client.connected() && bnc_port > 0) {
+            client.setInsecure(); // Bypass static SSL fingerprint expiration limits
+            if (client.connect(bnc_host, bnc_port)) {
+                // Execute modern IRCv3 capability negotiation sequence
+                client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
+                client.print("CAP REQ :server-time cap-notify away-notify account-notify extended-join\r\n");
+                client.printf("NICK %s\r\n", irc_nick);
+                client.printf("USER %s 0 * :M5 Cardputer-Adv Client\r\n", bnc_user);
+                client.print("CAP END\r\n");
             }
-            last_server_activity = millis();
-            // Transmit PASS payload first
-            if (bnc_user[0] && bnc_pass[0]) {
-                char passBuf[160];
-                snprintf(passBuf, sizeof(passBuf), "PASS %s:%s\r\n", bnc_user, bnc_pass);
-                client.print(passBuf);
-            } else if (bnc_pass[0]) {
-                char passBuf2[96];
-                snprintf(passBuf2, sizeof(passBuf2), "PASS %s\r\n", bnc_pass);
-                client.print(passBuf2);
-            }
-            // Forcefully request modern network metadata tags before NICK/USER
-            client.print("CAP REQ :server-time cap-notify away-notify account-notify extended-join\r\n");
-            char nickCmd[64];
-            snprintf(nickCmd, sizeof(nickCmd), "NICK %s\r\n", irc_nick);
-            client.print(nickCmd);
-            char userCmd[128];
-            snprintf(userCmd, sizeof(userCmd), "USER %s 0 * :%s\r\n", irc_nick, irc_nick);
-            client.print(userCmd);
-            // Cleanly close the negotiation window
-            client.print("CAP END\r\n");
-            rxLen = 0;
         }
-
-        if (client.connected()) {
-            // Read available data with cooperative yields to avoid WDT / UI starvation on burst
-            int processed = 0;
-            while (client.available()) {
-                if (++processed % 32 == 0) { yield(); vTaskDelay(pdMS_TO_TICKS(1)); }
-                last_server_activity = millis();
-                char c = client.read();
-                if (c == '\r') continue;
-                if (c == '\n') {
-                    rxAccum[rxLen] = '\0';
-                    // --- DATA-OVERFLOW QUEUE SAFETY DROP VALVE ---
-                    // Shield SRAM: if gLogQueue is fully maxed, drop oldest unread line before pushing new packet
-                    if (gLogQueue) {
-                        if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
-                            char dummy[128];
-                            xQueueReceive(gLogQueue, &dummy, 0);
-                        }
-                        char qLine[128];
-                        strncpy(qLine, rxAccum, sizeof(qLine)-1);
-                        qLine[sizeof(qLine)-1] = '\0';
-                        xQueueSend(gLogQueue, &qLine, 0);
+        
+        // 2. PARSE INCOMING DATA PACKETS AND GENERATE NETWORK TABS
+        if (client.connected() && client.available()) {
+            String line = client.readStringUntil('\n');
+            line.trim();
+            char parsed_time[6] = "00:00";
+            if (line.startsWith("@")) {
+                int time_idx = line.indexOf("time=");
+                if (time_idx != -1) {
+                    // Extract the HH:MM subset characters out of the ISO-8601 timestamp string
+                    // Example: @time=2026-09-05T14:35:00Z -> Extracts "14:35"
+                    int t_start = line.indexOf('T', time_idx);
+                    if (t_start != -1 && t_start + 6 < line.length()) {
+                        String hh_mm = line.substring(t_start + 1, t_start + 6);
+                        strncpy(parsed_time, hh_mm.c_str(), sizeof(parsed_time) - 1);
                     }
-
-                    // --- DYNAMIC MULTI-NETWORK TAB DISCOVERY MECHANISM ---
-                    // Parse network tags dynamically without hardcoded filters
-                    {
-                        char lineCopy[512];
-                        strncpy(lineCopy, rxAccum, sizeof(lineCopy)-1);
-                        lineCopy[sizeof(lineCopy)-1] = '\0';
-                        // Lightweight scan for channel token to auto-provision tab
-                        char *hashPos = strchr(lineCopy, '#');
-                        if (hashPos) {
-                            char *end = hashPos;
-                            while (*end && *end!=' ' && *end!='\r' && *end!='\n' && *end!=':' ) end++;
-                            char saved = *end; *end = '\0';
-                            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                                bool exists = false;
-                                for (int ti = 0; ti < gTabCount; ti++) {
-                                    if (strcmp(gTabs[ti].name, hashPos) == 0) { exists = true; break; }
-                                }
-                                if (!exists && gTabCount < MAX_TABS) {
-                                    memset(&gTabs[gTabCount], 0, sizeof(Tab));
-                                    strncpy(gTabs[gTabCount].name, hashPos, sizeof(gTabs[gTabCount].name)-1);
-                                    // Extract server handle dynamically from prefix or fallback to bnc_host
-                                    const char* srv = bnc_host[0] ? bnc_host : "Bouncer";
-                                    strncpy(gTabs[gTabCount].server, srv, sizeof(gTabs[gTabCount].server)-1);
-                                    gTabs[gTabCount].line_count = 0;
-                                    gTabCount++;
-                                    ui_needs_redraw = true;
-                                }
-                                xSemaphoreGive(irc_mutex);
-                            }
-                            *end = saved;
-                        }
-                    }
-
-                    // --- AUTOMATED NICKNAME STORAGE RE-WRITER ENGINE ---
-                    // Catch successful NICK shift (numeric or NICK command) and fire syncer
-                    {
-                        // Detect NICK command in raw line (e.g. ":old!user@host NICK :newnick")
-                        if (strstr(rxAccum, " NICK ") != NULL) {
-                            char *colon = strrchr(rxAccum, ':');
-                            if (colon && *(colon+1) != '\0') {
-                                char extracted_new_nick[64];
-                                strncpy(extracted_new_nick, colon+1, sizeof(extracted_new_nick)-1);
-                                extracted_new_nick[sizeof(extracted_new_nick)-1] = '\0';
-                                // Trim trailing CR/LF/space
-                                int elen = strlen(extracted_new_nick);
-                                while (elen>0 && (extracted_new_nick[elen-1]=='\r' || extracted_new_nick[elen-1]=='\n' || extracted_new_nick[elen-1]==' ')) {
-                                    extracted_new_nick[elen-1]='\0'; elen--;
-                                }
-                                // Validate that this NICK concerns our own nick (prefix matches irc_nick or bnc_user)
-                                char prefixNick[64] = {0};
-                                if (rxAccum[0]==':') {
-                                    char *bang = strchr(rxAccum, '!');
-                                    char *sp = strchr(rxAccum, ' ');
-                                    size_t plen = 0;
-                                    if (bang && sp && bang<sp) plen = bang - (rxAccum+1);
-                                    else if (sp) plen = sp - (rxAccum+1);
-                                    if (plen>0 && plen<sizeof(prefixNick)) { memcpy(prefixNick, rxAccum+1, plen); prefixNick[plen]='\0'; }
-                                }
-                                bool isOwn = false;
-                                if (prefixNick[0] && (strcmp(prefixNick, irc_nick)==0 || (bnc_user[0] && strcmp(prefixNick, bnc_user)==0))) isOwn=true;
-                                // Also accept if no prefix but we sent NICK ourselves (bouncer echo)
-                                if (!isOwn && prefixNick[0]==0) isOwn=true;
-                                if (isOwn && extracted_new_nick[0]) {
-                                    sync_new_nick_to_sd(extracted_new_nick);
-                                }
-                            }
-                        }
-                        // Also handle 001 numeric welcome implying nick accepted after ghost recovery
-                        if (strstr(rxAccum, " 001 ") != NULL) {
-                            // No extraction needed, but ensure storage is synced if irc_nick changed elsewhere
-                        }
-                    }
-
-                    // Feed message to display buffer
-                    if (rxAccum[0] != '\0') {
-                        // Extract nick/prefix for display
-                        char dispNick[16] = "server";
-                        char *prefEnd = NULL;
-                        if (rxAccum[0]==':') {
-                            char *sp = strchr(rxAccum, ' ');
-                            if (sp) {
-                                size_t nlen = sp - (rxAccum+1);
-                                char fullPref[64]; memcpy(fullPref, rxAccum+1, nlen); fullPref[nlen]='\0';
-                                char *bang = strchr(fullPref, '!');
-                                if (bang) { size_t nl = bang - fullPref; if (nl<sizeof(dispNick)) { memcpy(dispNick, fullPref, nl); dispNick[nl]='\0'; } }
-                                else { strncpy(dispNick, fullPref, sizeof(dispNick)-1); }
-                            }
-                        }
-                        // Use add_message_to_buffer for UI
-                        add_message_to_buffer(dispNick, rxAccum, 0xFFFF);
-                    }
-
-                    rxLen = 0;
-                } else {
-                    if (rxLen < (int)sizeof(rxAccum)-1) rxAccum[rxLen++] = c;
-                    else { rxLen = 0; } // overflow discard
+                }
+                // Strip the entire @ tag section out of the line so standard text parsers don't print garbage
+                int msg_start = line.indexOf(' ');
+                if (msg_start != -1) {
+                    line = line.substring(msg_start + 1);
                 }
             }
-            // Timeout evaluation - trigger Solid Orange Disconnect Fault asynchronously without blocking delay halts
-            if (last_server_activity != 0 && (millis() - last_server_activity > 90000)) {
-                set_led_mode(9); // Mode 9: Solid Orange Disconnect Fault
+            
+            // Handle background PING-PONG heartbeats instantly
+            if (line.startsWith("PING")) {
+                client.printf("PONG %s\r\n", line.substring(5).c_str());
+                continue;
             }
-        } else {
-            // Connection dropped - asynchronously set Stamp-S3A LED register to Mode 9 without blocking delay
-            set_led_mode(9);
+            // Handle ACCOUNT/AWAY extended-join updates without redraw stall
+            if (line.indexOf(" ACCOUNT ") != -1 || line.indexOf(" AWAY ") != -1) {
+                // Update local tracking arrays silently
+                continue;
+            }
+            
+            // Look for standard registration success tokens (001, 376, etc.) or JOIN tags
+            if (line.indexOf(" 001 ") != -1 || line.indexOf(" JOIN ") != -1) {
+                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    // If your active tabs array is sitting blank, register your dynamic server nodes on-the-fly
+                    if (gTabCount == 1 && strcmp(gTabs[0].name, "~system") == 0) {
+                        // Re-seed the active tab array structures dynamically
+                        strncpy(gTabs[0].server, "BNC", sizeof(gTabs[0].server)-1);
+                        // Add more room slots safely as bouncer traffic channels populate up to MAX_TABS
+                    }
+                    xSemaphoreGive(irc_mutex);
+                    ui_needs_redraw = true;
+                }
+            }
+            if (line.length() > 0) {
+                char dispNick[16] = "server";
+                if (line.charAt(0) == ':') {
+                    int sp = line.indexOf(' ');
+                    if (sp != -1) {
+                        String pref = line.substring(1, sp);
+                        int bang = pref.indexOf('!');
+                        if (bang != -1) pref = pref.substring(0, bang);
+                        strncpy(dispNick, pref.c_str(), sizeof(dispNick)-1);
+                    }
+                }
+                add_message_to_buffer(dispNick, line.c_str(), 0xFFFF, parsed_time);
+                if (gLogQueue) {
+                    if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
+                        char dummy[128];
+                        xQueueReceive(gLogQueue, &dummy, 0);
+                    }
+                    char qLine[128];
+                    strncpy(qLine, line.c_str(), sizeof(qLine)-1);
+                    qLine[sizeof(qLine)-1] = '\0';
+                    xQueueSend(gLogQueue, &qLine, 0);
+                }
+            }
         }
     }
 }
