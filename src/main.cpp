@@ -168,6 +168,8 @@ void set_led_mode(uint8_t mode) {
 // ==========================================
 // 💾 FILE SYSTEM AND STREAM CONFIGURATION PARSER
 // ==========================================
+void update_config_string(char* destination, const char* source, size_t max_len);
+
 void load_settings_from_sd() {
     if (safe_mode_active) return;
     
@@ -209,13 +211,13 @@ void load_settings_from_sd() {
         char *ve = value + strlen(value) - 1;
         while (ve >= value && (*ve==' '||*ve=='\t')) { *ve='\0'; ve--; }
         // Exact Token Matching Pipeline (no String heap)
-        if (strcmp(key, "wifi_ssid")==0) strncpy(wifi_ssid, value, sizeof(wifi_ssid) - 1);
-        else if (strcmp(key, "wifi_pass")==0) strncpy(wifi_pass, value, sizeof(wifi_pass) - 1);
-        else if (strcmp(key, "irc_nick")==0) strncpy(irc_nick, value, sizeof(irc_nick) - 1);
-        else if (strcmp(key, "bnc_host")==0) strncpy(bnc_host, value, sizeof(bnc_host) - 1);
+        if (strcmp(key, "wifi_ssid")==0) update_config_string(wifi_ssid, value, sizeof(wifi_ssid));
+        else if (strcmp(key, "wifi_pass")==0) update_config_string(wifi_pass, value, sizeof(wifi_pass));
+        else if (strcmp(key, "irc_nick")==0) update_config_string(irc_nick, value, sizeof(irc_nick));
+        else if (strcmp(key, "bnc_host")==0) update_config_string(bnc_host, value, sizeof(bnc_host));
         else if (strcmp(key, "bnc_port")==0) { bnc_port = atoi(value); }
-        else if (strcmp(key, "bnc_user")==0) strncpy(bnc_user, value, sizeof(bnc_user) - 1);
-        else if (strcmp(key, "bnc_pass")==0) strncpy(bnc_pass, value, sizeof(bnc_pass) - 1);
+        else if (strcmp(key, "bnc_user")==0) update_config_string(bnc_user, value, sizeof(bnc_user));
+        else if (strcmp(key, "bnc_pass")==0) update_config_string(bnc_pass, value, sizeof(bnc_pass));
         else if (strcmp(key, "channel_log_enabled")==0) channel_log_enabled = atoi(value);
         else if (strcmp(key, "screen_brightness")==0) screen_brightness = atoi(value);
         else if (strcmp(key, "current_tz_idx")==0) current_tz_idx = atoi(value);
@@ -317,6 +319,44 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         cl.is_highlight = (strstr(msg, irc_nick) != NULL);
         t.line_count++;
 
+    // Dynamic Session Log Rotator and Auto-Cleaning Engine Pass
+    if (channel_log_enabled == 1 && safe_mode_active == false) {
+        unsigned long current_sync_sec = (millis() / 1000) + adj_time;
+        uint32_t active_yr  = 2026; 
+        uint32_t active_mon = ((current_sync_sec / 2629743) % 12) + 1; 
+        uint32_t active_day = ((current_sync_sec / 86400) % 31) + 1;   
+
+        // Isolate and sanitize server string handles to prevent nested subdirectory errors
+        String safe_server = String(t.server);
+        safe_server.replace("/", "_"); safe_server.replace("\\", "_"); safe_server.trim();
+        
+        String safe_room = String(t.name);
+        safe_room.replace("/", "_"); safe_room.replace("\\", "_"); safe_room.trim();
+
+        char dir_path_buffer[64] = {0};
+        snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server.c_str());
+        
+        // Ensure the clean base server folder exists on the card first
+        if (!SD.exists(dir_path_buffer)) {
+            SD.mkdir(dir_path_buffer);
+        }
+        
+        // Compile the absolute file location block using sanitized string structures
+        char file_path_buffer[128] = {0};
+        snprintf(file_path_buffer, sizeof(file_path_buffer), "/irc/logs/%s/%s_%04d_%02d_%02d.log", 
+                 safe_server.c_str(), safe_room.c_str(), active_yr, active_mon, active_day);
+
+        // Flash our Emerald Green storage indicator (Mode 4) to flag write execution
+        set_led_mode(4);
+        File channel_log_file = SD.open(file_path_buffer, FILE_APPEND);
+        if (channel_log_file) {
+            channel_log_file.printf("[%s] <%s>: %s\r\n", cl.timeStr, cl.nick, cl.message);
+            channel_log_file.close();
+        } else {
+            set_led_mode(28); // Drop into Solid Yellow status if micro-SD write operation fails
+        }
+    }
+
         // Cross-Network Highlights Duplicator Pass
         if (strstr(msg, irc_nick) != NULL && current_tab_index != 0) {
             Tab &mentions_tab = gTabs[0]; // Isolate Tab 0 explicitly
@@ -338,66 +378,35 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         xSemaphoreGive(irc_mutex);
         ui_needs_redraw = true;
     }
-    // --- DECOUPLED LOG WRITING (SD I/O NOT UNDER irc_mutex to avoid UI freeze/crash) ---
-    if (channel_log_enabled == 1) {
-        char logChannel[32] = {0};
-        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            int idx = 0;
-            if (gTabCount > 0 && current_tab_index < gTabCount) idx = current_tab_index;
-            strncpy(logChannel, gTabs[idx].name, sizeof(logChannel)-1);
-            xSemaphoreGive(irc_mutex);
-        } else {
-            if (gTabCount > 0 && current_tab_index < gTabCount) strncpy(logChannel, gTabs[current_tab_index].name, sizeof(logChannel)-1);
-        }
-        if (logChannel[0] == 0) return;
-        bool sd_locked = false;
-        if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE);
-        else sd_locked = true;
-        if (sd_locked) {
-            char logPath[64];
-            bool isQuery = (logChannel[0] == '>');
-            bool isSystem = (strcmp(logChannel, "~system") == 0);
-            if (isSystem) snprintf(logPath, sizeof(logPath), "/irc/logs/system.log");
-            else if (isQuery) snprintf(logPath, sizeof(logPath), "/irc/logs/query.log");
-            else {
-                char safeChan[32];
-                strncpy(safeChan, logChannel, sizeof(safeChan)-1);
-                for (char* p=safeChan; *p; ++p) if (*p=='/' || *p=='\\') *p='_';
-                snprintf(logPath, sizeof(logPath), "/irc/logs/%s.log", safeChan[0]?safeChan:"system");
-            }
-            if (!SD.exists("/irc")) SD.mkdir("/irc");
-            if (!SD.exists("/irc/logs")) SD.mkdir("/irc/logs");
-            File f = SD.open(logPath, FILE_APPEND);
-            if (f) {
-                if (isSystem || isQuery) f.printf("%s %s: %s\n", logChannel, source, msg);
-                else f.printf("%s\n", msg);
-                f.close();
-                set_led_mode(4); // Emerald Green Burst for SD append
-            }
-            if (sd_mutex) xSemaphoreGive(sd_mutex);
-        }
-    }
+
 }
 
 float get_calibrated_battery_percentage() {
-    float raw_volt = M5Cardputer.Power.getBatteryVoltage();
-    if (raw_volt > 4.2f) raw_volt = 4.2f;
-    if (raw_volt < 3.3f) raw_volt = 3.3f;
+    // Hardware API returns values directly in millivolts (e.g. 4200mV = Full, 3700mV = ~50%)
+    int raw_mv = M5Cardputer.Power.getBatteryVoltage(); 
     
-    // Calibrated discharge curve lookup matrix to mirror launcher metrics perfectly
+    if (raw_mv > 4200) raw_mv = 4200;
+    if (raw_mv < 3300) raw_mv = 3300;
+    
+    // Calibrated millivolt discharge curve to perfectly track the Cardputer-Adv capacity parameters
     float percentage = 0.0f;
-    if (raw_volt >= 4.0f) {
-        percentage = 80.0f + ((raw_volt - 4.0f) / (4.2f - 4.0f)) * 20.0f;
-    } else if (raw_volt >= 3.7f) {
-        percentage = 40.0f + ((raw_volt - 3.7f) / (4.0f - 3.7f)) * 40.0f;
-    } else if (raw_volt >= 3.5f) {
-        percentage = 15.0f + ((raw_volt - 3.5f) / (3.7f - 3.5f)) * 25.0f;
+    if (raw_mv >= 4000) {
+        percentage = 80.0f + (((float)(raw_mv - 4000) / (4200.0f - 4000.0f)) * 20.0f);
+    } else if (raw_mv >= 3700) {
+        percentage = 40.0f + (((float)(raw_mv - 3700) / (4000.0f - 3700.0f)) * 40.0f);
+    } else if (raw_mv >= 3500) {
+        percentage = 15.0f + (((float)(raw_mv - 3500) / (3700.0f - 3500.0f)) * 25.0f);
     } else {
-        percentage = ((raw_volt - 3.3f) / (3.5f - 3.3f)) * 15.0f;
+        percentage = ((float)(raw_mv - 3300) / (3500.0f - 3300.0f)) * 15.0f;
     }
     
+    // Smooth out micro-fluctuations over a running alpha-filter to prevent terminal display jitter
     static float smoothed_pct = percentage;
-    smoothed_pct = (smoothed_pct * 0.95f) + (percentage * 0.05f);
+    smoothed_pct = (smoothed_pct * 0.90f) + (percentage * 0.10f);
+    
+    if (smoothed_pct > 100.0f) smoothed_pct = 100.0f;
+    if (smoothed_pct < 0.0f) smoothed_pct = 0.0f;
+    
     return smoothed_pct;
 }
 
@@ -407,6 +416,13 @@ uint16_t get_nick_palette_color(const char* nick) {
     const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x07E0, 0xAFE5, 0xFED0, 0x867F}; 
     return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
+
+        // Explicit configuration safety assignment macro passes
+        void update_config_string(char* destination, const char* source, size_t max_len) {
+            if (destination == nullptr || source == nullptr || max_len == 0) return;
+            strncpy(destination, source, max_len - 1);
+            destination[max_len - 1] = '\0'; // Force a rigid null-terminator boundary safety seal
+        }
 
 // ==========================================
 // 🎬 RETRO-TERMINAL GRAPHICS RENDERING ENGINE
@@ -418,105 +434,78 @@ void draw_chat_view() {
     // STATE 1: WORKSPACE NAVIGATION HUB (Fn + P)
     // ==========================================
     if (current_app_mode == MODE_NAVIGATOR) {
-        // Master Blackout Mask: Completely flush the 240x135 frame buffer to pure black.
-        // This ensures no background text loop remnants can clip anywhere on the glass!
-        canvas.fillSprite(0x0000); 
+        canvas.fillSprite(0x0000); // Wipe frame buffer clean
         
-        // --- LEFT COLUMN: NETWORK SERVERS ---
-        canvas.fillRect(0, 0, 114, 135, 0x0841); // Left Panel
+        // Extended Shield Panel Matrix: Paint layout blocks completely down the full height boundary limits
+        canvas.fillRect(0, 0, 114, 135, 0x0841);   // Slate left panel container block
+        canvas.fillRect(117, 0, 123, 135, 0x0000); // Master deep black right panel layer shield
+        
         canvas.setTextColor(0x07E0); canvas.setCursor(6, 6); canvas.print("NETWORKS");
         
-        // 1. Render Networks Column including virtual Master ALL node at Index 0
+        // Render network column
         canvas.setTextColor(nav_server_select_idx == 0 ? 0xFFFF : 0x7BEF);
         canvas.setCursor(12, 24); canvas.printf("%s [ALL NETS]", (nav_server_select_idx == 0 ? ">" : " "));
-        
         for (int i = 0; i < discovered_network_count; i++) {
             canvas.setTextColor(nav_server_select_idx == (i + 1) ? 0xFFFF : 0x7BEF);
             canvas.setCursor(12, 38 + (i * 14));
             canvas.printf("%s %s", (nav_server_select_idx == (i + 1) ? ">" : " "), discovered_networks[i]);
         }
         
-        canvas.drawFastVLine(116, 0, 135, 0x7BEF); // Visual separator wire
+        canvas.drawFastVLine(116, 0, 135, 0x7BEF); // Layout wire line
         canvas.setTextColor(0xFD20); canvas.setCursor(122, 6); canvas.print("ACTIVE ROOMS");
         
-        // 2. Render Rooms Column (Filter by single server OR display completely flat if ALL selected)
+        // SCROLLABLE WINDOW GRID INDEX LIMITERS
         int channel_print_counter = 0;
+        int active_window_scroll_offset = (nav_channel_select_idx >= 7) ? (nav_channel_select_idx - 6) : 0;
+        
         for (int i = 0; i < gTabCount; i++) {
-            // Check if master ALL node is selected OR if tab context matches our filtered server node string
             bool should_print = (nav_server_select_idx == 0) || 
-                                 (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
+                                 (strcasecmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
             
             if (should_print) {
-                uint16_t txt_color = (nav_channel_select_idx == channel_print_counter) ? 0xFFFF : 0x7BEF;
-                canvas.setCursor(126, 24 + (channel_print_counter * 14));
-                
-                int local_mention_count = 0;
-                for (int l = 0; l < gTabs[i].line_count; l++) {
-                    if (gTabs[i].lines[l].is_highlight) local_mention_count++;
-                }
+                // Constrain row displays tightly to match our vertical viewport row slots budget
+                if (channel_print_counter >= active_window_scroll_offset && channel_print_counter < active_window_scroll_offset + 7) {
+                    int draw_y_row_coordinate = 24 + ((channel_print_counter - active_window_scroll_offset) * 14);
+                    
+                    uint16_t txt_color = (nav_channel_select_idx == channel_print_counter) ? 0xFFFF : 0x7BEF;
+                    canvas.setCursor(126, draw_y_row_coordinate);
+                    
+                    int local_mention_count = 0;
+                    for (int l = 0; l < gTabs[i].line_count; l++) {
+                        if (gTabs[i].lines[l].is_highlight) local_mention_count++;
+                    }
 
-                int max_chars_allowed = (local_mention_count > 0) ? 10 : 16;
-                char truncated_chan_name[20] = {0};
-                if (strlen(gTabs[i].name) > max_chars_allowed) {
-                    strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed - 3);
-                    strcat(truncated_chan_name, "...");
-                } else {
-                    strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed);
-                }
+                    int max_chars_allowed = (local_mention_count > 0) ? 10 : 16;
+                    char truncated_chan_name[20] = {0};
+                    if (strlen(gTabs[i].name) > max_chars_allowed) {
+                        strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed - 3);
+                        strcat(truncated_chan_name, "...");
+                    } else {
+                        strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed);
+                    }
 
-                canvas.setTextColor(txt_color);
-                // If in ALL mode, prepend a clean 3-letter network tag to help identify the room origin context
-                if (nav_server_select_idx == 0 && i > 0) {
-                    char micro_net[4] = {0}; strncpy(micro_net, gTabs[i].server, 3);
-                    canvas.printf("%s [%s]%s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), micro_net, truncated_chan_name);
-                } else {
-                    canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), truncated_chan_name);
-                }
-                
-                if (local_mention_count > 0) {
-                    canvas.setTextColor(0xFD20);
-                    if (local_mention_count > 10) canvas.print(" (10+)");
-                    else canvas.printf(" (%d)", local_mention_count);
+                    canvas.setTextColor(txt_color);
+                    if (nav_server_select_idx == 0 && i > 0) {
+                        char micro_net[4] = {0}; strncpy(micro_net, gTabs[i].server, 3);
+                        canvas.printf("%s [%s]%s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), micro_net, truncated_chan_name);
+                    } else {
+                        canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), truncated_chan_name);
+                    }
+                    
+                    if (local_mention_count > 0) {
+                        canvas.setTextColor(0xFD20);
+                        if (local_mention_count > 10) canvas.print(" (10+)");
+                        else canvas.printf(" (%d)", local_mention_count);
+                    }
                 }
                 channel_print_counter++;
             }
         }
         
-        canvas.fillRect(0, 120, 240, 15, 0x0000); 
-        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print(";/. Scroll | Enter: Open");
-        canvas.pushSprite(0, 0);
-        ui_needs_redraw = false;
-        return; // HARD BARRIER GATING: Stops any chat log loop processing from running!
-    }
-
-    // ==========================================
-    // STATE 2: CONFIGURATION MENUS (Fn + O)
-    // ==========================================
-    if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_WIFI) {
-        canvas.fillSprite(0x0000);
-        canvas.setTextColor(0xFD20); canvas.setCursor(10, 8);
-        if (current_app_mode == MODE_SETTINGS) {
-            canvas.print("--- SYSTEM CONFIGURATIONS ---"); canvas.setTextColor(0xFFFF);
-            canvas.setCursor(10, 26); canvas.printf("%s Brightness Level: %d", (menu_selection_idx == 0 ? ">" : " "), screen_brightness);
-            canvas.setCursor(10, 40); canvas.printf("%s Timezone Index: %d", (menu_selection_idx == 1 ? ">" : " "), current_tz_idx);
-            canvas.setCursor(10, 54); canvas.printf("%s Format Layer: %s", (menu_selection_idx == 2 ? ">" : " "), use_12_hour_format ? "12-HR" : "24-HR");
-            canvas.setCursor(10, 68); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
-        } else if (current_app_mode == MODE_BOUNCER) {
-            canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(0xFFFF);
-            canvas.setCursor(10, 26); canvas.printf("%s Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
-            canvas.setCursor(10, 40); canvas.printf("%s Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
-            canvas.setCursor(10, 54); canvas.printf("%s Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
-        } else {
-            // --- WI-FI CONFIG MANAGER WITH FALLBACK CREDENTIALS ---
-            canvas.print("--- WI-FI CONFIG MANAGER ---"); canvas.setTextColor(0xFFFF);
-            canvas.setCursor(10, 26); canvas.printf("%s Primary SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
-            canvas.setCursor(10, 40); canvas.printf("%s Primary Pass: [ **** ]", (menu_selection_idx == 1 ? ">" : " "));
-            canvas.setCursor(10, 54); canvas.printf("%s Backup Hotspot: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)wifi_ssid2);
-            canvas.setCursor(10, 68); canvas.printf("%s Backup Pass:  [ **** ]", (menu_selection_idx == 3 ? ">" : " "));
-            canvas.setCursor(10, 86); canvas.printf("%s Scan Airwaves: [ RUN ]", (menu_selection_idx == 4 ? ">" : " "));
-        }
-        canvas.fillRect(0, 120, 240, 15, 0x0000);
-        canvas.setCursor(10, 122); canvas.setTextColor(0x7BEF); canvas.print("Esc: Exit | ,/. Adjust Value");
+        // Overlay unified control bar instructions flush across the absolute bottom edge row strip
+        canvas.fillRect(0, 122, 240, 13, 0x0841);
+        canvas.drawFastHLine(0, 121, 240, 0x7BEF);
+        canvas.setCursor(6, 124); canvas.setTextColor(0xFFFF); canvas.print(";/. Scroll List | Enter: Switch Room Context");
         canvas.pushSprite(0, 0); ui_needs_redraw = false; return;
     }
 
@@ -615,8 +604,15 @@ void draw_chat_view() {
     uint32_t active_min = (current_sync_sec / 60) % 60;
     uint32_t active_hr  = ((current_sync_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
     if (use_12_hour_format && active_hr == 0) active_hr = 12;
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(182, 2); M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
-    M5Cardputer.Display.setCursor(212, 2); M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
+    
+    // Shift clock leftward to open up structural spacing slots
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); 
+    M5Cardputer.Display.setCursor(156, 2); 
+    M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
+    
+    // Pull the battery string into its own absolute far-right layout column
+    M5Cardputer.Display.setCursor(208, 2); 
+    M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
 
     // Low-Profile Navbar Activity Indicator Dots Engine
     // Draws tiny 2px tracking dots along the navbar floor to alert your eyes to background channel traffic
@@ -740,19 +736,33 @@ void draw_chat_view() {
         }
 
         // Horizontal Quick-Tab Swapper (Fn + Comma = Previous Tab | Fn + Slash = Next Tab)
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) {
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Previous Tab
             if (gTabCount > 1) {
                 current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount;
-                scrollback_offset_idx = 0; // Reset scrollback view context instantly
+                scrollback_offset_idx = 0;
                 ui_needs_redraw = true;
+                
+                // Trigger auto-cleaning on quick-swapping left
+                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    Tab &current_view_tab = gTabs[current_tab_index];
+                    for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
+                    xSemaphoreGive(irc_mutex);
+                }
             }
             return;
         }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) {
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Next Tab
             if (gTabCount > 1) {
                 current_tab_index = (current_tab_index + 1) % gTabCount;
-                scrollback_offset_idx = 0; // Reset scrollback view context instantly
+                scrollback_offset_idx = 0;
                 ui_needs_redraw = true;
+                
+                // Trigger auto-cleaning on quick-swapping right
+                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    Tab &current_view_tab = gTabs[current_tab_index];
+                    for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
+                    xSemaphoreGive(irc_mutex);
+                }
             }
             return;
         }
@@ -876,35 +886,43 @@ void draw_chat_view() {
             }
             return;
         }
-        if (status.enter && current_app_mode == MODE_NAVIGATOR) { // Enter Selection Core Handler
+                if (status.enter && current_app_mode == MODE_NAVIGATOR) { // Enter Selection Core Handler
             int chan_match_counter = 0;
+            int targeted_index_slot = -1;
+
             for (int i = 0; i < gTabCount; i++) {
-                // Determine layout mapping filtering rules precisely matching our draw_chat_view math
-                bool matched = (nav_server_select_idx == 0) || 
-                               (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
-                if (matched) {
+                // Precision Aligned Evaluation Gate matching our draw_chat_view screen layout rules
+                bool is_room_visible = (nav_server_select_idx == 0) || 
+                                       (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
+                
+                if (is_room_visible) {
                     if (chan_match_counter == nav_channel_select_idx) { 
-                        current_tab_index = i; // Secure exact structural alignment match
+                        targeted_index_slot = i; // Secure our clean absolute structural RAM position match
                         break; 
                     }
                     chan_match_counter++;
                 }
             }
             
-            // Mark the freshly opened channel tab as fully synchronized instantly to release LED states
-            if (current_tab_index < MAX_TABS) {
-                network_handshake_complete[current_tab_index] = true;
+            // Assign the verified index pointer safely if a structural match was secured
+            if (targeted_index_slot != -1 && targeted_index_slot < MAX_TABS) {
+                current_tab_index = targeted_index_slot;
+                scrollback_offset_idx = 0; // Reset scrollback offsets instantly on room swap
+                network_handshake_complete[current_tab_index] = true; // Clear out stuck LED states instantly
+                
+                // AUTOMATIC READ-STATE CLEANUP ENGINE
+                // Forcefully sweep the selected channel tab and wipe out all highlight alerts instantly!
+                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                    Tab &current_view_tab = gTabs[current_tab_index];
+                    for (int l = 0; l < current_view_tab.line_count; l++) {
+                        current_view_tab.lines[l].is_highlight = false; 
+                    }
+                    xSemaphoreGive(irc_mutex);
+                }
             }
             
-            current_app_mode = MODE_CHAT; ui_needs_redraw = true;
-            // Clear highlights automatically upon entering or cycling active channel views
-            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                Tab &current_view_tab = gTabs[current_tab_index];
-                for (int l = 0; l < current_view_tab.line_count; l++) {
-                    current_view_tab.lines[l].is_highlight = false;
-                }
-                xSemaphoreGive(irc_mutex);
-            }
+            current_app_mode = MODE_CHAT; 
+            ui_needs_redraw = true; 
             return;
         }
     }
@@ -932,6 +950,47 @@ void draw_chat_view() {
         ui_needs_redraw = true;
         return;
     }
+
+        if (status.enter) {
+            // --- CORE STATE 1: WORKSPACE NAVIGATION HUB SELECTIONS ---
+            if (current_app_mode == MODE_NAVIGATOR) {
+                int chan_match_counter = 0;
+                int targeted_index_slot = -1;
+                for (int i = 0; i < gTabCount; i++) {
+                    bool is_room_visible = (nav_server_select_idx == 0) || 
+                                           (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0);
+                    if (is_room_visible) {
+                        if (chan_match_counter == nav_channel_select_idx) { targeted_index_slot = i; break; }
+                        chan_match_counter++;
+                    }
+                }
+                if (targeted_index_slot != -1 && targeted_index_slot < MAX_TABS) {
+                    current_tab_index = targeted_index_slot;
+                    scrollback_offset_idx = 0;
+                    network_handshake_complete[current_tab_index] = true;
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                        for (int l = 0; l < gTabs[current_tab_index].line_count; l++) gTabs[current_tab_index].lines[l].is_highlight = false;
+                        xSemaphoreGive(irc_mutex);
+                    }
+                }
+                current_app_mode = MODE_CHAT; ui_needs_redraw = true; return;
+            }
+
+            // --- CORE STATE 2: CONFIGURATION FIELD BUTTON TRIGGERS ---
+            if (current_app_mode == MODE_WIFI || current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER) {
+                if (current_app_mode == MODE_WIFI && menu_selection_idx == 4) { // Target the 'Scan Airwaves [ RUN ]' Row
+                    Serial.println("[WIFI] Initializing non-blocking background async airwaves scan pass...");
+                    
+                    set_led_mode(19); // Flash Lime Green activity burst to confirm action receipt
+                    
+                    // Force an asynchronous, passive spectrum scan to prevent UI freezes and socket timeouts!
+                    WiFi.scanNetworks(true, true); 
+                    
+                    ui_needs_redraw = true;
+                    return;
+                }
+            }
+        }
 
     // ==========================================
     // 💬 CHAT MODE PROCESSING PIPELINE (ONLY RUNS IF MODE_CHAT IS ACTIVE)
@@ -1026,7 +1085,7 @@ void draw_chat_view() {
                     else if (cmd == "NICK" && args.length() > 0) {
                         target_socket->printf("NICK %s\r\n", args.c_str());
                         target_socket->flush();
-                        strncpy(irc_nick, args.c_str(), sizeof(irc_nick) - 1); // Dynamic RAM update
+                        update_config_string(irc_nick, args.c_str(), sizeof(irc_nick)); // Dynamic RAM update
                     }
                     else if (cmd == "MSG" && args.length() > 0) {
                         // Direct Messaging format: /msg Nickname message text...
@@ -1198,48 +1257,66 @@ void irc_network_task(void* pvParameters) {
                 line.trim(); line.replace("\r", "");
                 if (line.length() == 0) continue;
 
-                // --- DYNAMIC CHANNEL SYNC - UNIVERSAL DISCOVERY SCANNER ---
+                // --- ATOMIC DISCOVERY PROTOCOL TOKENIZER ---
                 String discovered_room = "";
+                String isolated_packet_server = String(discovered_networks[i]); // Secure default baseline
 
-                if (line.indexOf(" JOIN ") != -1) {
-                    int join_idx = line.indexOf(" JOIN ");
-                    discovered_room = line.substring(join_idx + 6);
-                } 
-                else if (line.indexOf(" 353 ") != -1) { // Process server NAMES response packets
-                    int equal_idx = line.indexOf(" = ");
-                    if (equal_idx != -1) {
-                        int colon_idx = line.indexOf(" :", equal_idx);
-                        if (colon_idx != -1) discovered_room = line.substring(equal_idx + 3, colon_idx);
-                    }
-                }
-                else if (line.indexOf(" PRIVMSG ") != -1) { // Flexible chat playback scanner
+                if (line.indexOf(" PRIVMSG ") != -1) {
                     int priv_idx = line.indexOf(" PRIVMSG ");
                     int colon_idx = line.indexOf(" :", priv_idx);
                     if (priv_idx != -1 && colon_idx != -1) {
                         String target_recipient = line.substring(priv_idx + 9, colon_idx);
                         target_recipient.trim();
+                        
+                        int slash_idx = target_recipient.indexOf('/');
                         int hash_pos = target_recipient.indexOf('#');
-                        if (hash_pos != -1) discovered_room = target_recipient.substring(hash_pos);
+                        int amp_pos = target_recipient.indexOf('&');
+                        int symbol_pos = (hash_pos != -1) ? hash_pos : amp_pos;
+
+                        // RIGID PROTECTION: Only strip a server prefix if it sits directly in front of a true channel hash symbol
+                        if (slash_idx != -1 && symbol_pos != -1 && slash_idx < symbol_pos) {
+                            isolated_packet_server = target_recipient.substring(0, slash_idx);
+                            discovered_room = target_recipient.substring(symbol_pos);
+                        } else if (symbol_pos != -1) {
+                            discovered_room = target_recipient.substring(symbol_pos);
+                        } else {
+                            // This is a clean Private Query PM!
+                            discovered_room = target_recipient;
+                        }
                     }
+                }
+                isolated_packet_server.trim();
+                discovered_room.trim();
+
+                // Preserve JOIN and 353 handling for backward compatibility (also protected by slash blocker)
+                if (discovered_room.length() == 0) {
+                    if (line.indexOf(" JOIN ") != -1) {
+                        int join_idx = line.indexOf(" JOIN ");
+                        discovered_room = line.substring(join_idx + 6);
+                    } else if (line.indexOf(" 353 ") != -1) {
+                        int equal_idx = line.indexOf(" = ");
+                        if (equal_idx != -1) {
+                            int colon_idx = line.indexOf(" :", equal_idx);
+                            if (colon_idx != -1) discovered_room = line.substring(equal_idx + 3, colon_idx);
+                        }
+                    }
+                    discovered_room.trim();
+                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
                 }
 
                 // If a channel name was isolated, dynamically allocate its space in RAM
                 if (discovered_room.length() > 0) {
-                    discovered_room.trim(); if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
+                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
                     if (discovered_room.startsWith("#") || discovered_room.startsWith("&")) {
                         if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                             bool tab_exists = false;
                             for (int t = 0; t < gTabCount; t++) {
-                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) { tab_exists = true; break; }
+                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && strcmp(gTabs[t].server, isolated_packet_server.c_str()) == 0) { tab_exists = true; break; }
                             }
-                            // Dynamic Tab Provisioning Safety Guardrail
                             if (!tab_exists && gTabCount < MAX_TABS) {
                                 strncpy(gTabs[gTabCount].name, discovered_room.c_str(), sizeof(gTabs[gTabCount].name)-1);
-                                strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
-                                
-                                // CRITICAL RE-ALIGNMENT: ONLY initialize line count to zero 
-                                // for brand new tabs. Never let background updates overwrite an active tab!
-                                gTabs[gTabCount].line_count = 0; 
+                                strncpy(gTabs[gTabCount].server, isolated_packet_server.c_str(), sizeof(gTabs[gTabCount].server)-1);
+                                gTabs[gTabCount].line_count = 0;
                                 gTabCount++;
                             }
                             xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
@@ -1358,29 +1435,67 @@ void irc_network_task(void* pvParameters) {
                         String target_recipient = line.substring(priv_idx + 9, colon_idx);
                         target_recipient.trim();
                         
+                        // EXPLICIT NETWORK EXTRACTOR: Isolate the true upstream bouncer network tag signature
+                        String isolated_packet_server = "";
+                        int network_slash_idx = target_recipient.indexOf('/');
                         int hash_pos = target_recipient.indexOf('#');
-                        String clean_target_room = (hash_pos != -1) ? target_recipient.substring(hash_pos) : target_recipient;
                         
-                        int bang_idx = line.indexOf('!');
-                        String sender_nick = (bang_idx != -1) ? line.substring(1, bang_idx) : "Server";
+                        if (network_slash_idx != -1 && (hash_pos == -1 || network_slash_idx < hash_pos)) {
+                            isolated_packet_server = target_recipient.substring(0, network_slash_idx);
+                        } else {
+                            // Fallback: If no explicit slash exists, default directly to this socket slot's pre-saved name
+                            isolated_packet_server = String(discovered_networks[i]);
+                        }
+                        isolated_packet_server.trim();
+                        
+                        String clean_target_room = (hash_pos != -1) ? target_recipient.substring(hash_pos) : target_recipient;
+                        if (clean_target_room.indexOf('/') != -1 && hash_pos != -1) {
+                            // Strip any trailing network tags trailing behind channel tags
+                            int structural_slash = clean_target_room.indexOf('/');
+                            clean_target_room = clean_target_room.substring(0, structural_slash);
+                        }
+                        clean_target_room.trim();
+                        
+                        int prefix_start_idx = line.lastIndexOf(':', priv_idx);
+                        int bang_idx = line.indexOf('!', prefix_start_idx);
+                        String sender_nick = "Server";
+                        if (prefix_start_idx != -1 && bang_idx != -1 && bang_idx > prefix_start_idx) {
+                            sender_nick = line.substring(prefix_start_idx + 1, bang_idx);
+                        }
+                        sender_nick.trim();
                         String actual_msg = line.substring(colon_idx + 2);
+                            // --- CTCP PROTOCOL INTERCEPT ENGINE ---
+                            // Check if the message string contains hidden CTCP delimiter tags (\x01)
+                            if (actual_msg.startsWith("\x01") && actual_msg.endsWith("\x01")) {
+                                String ctcp_cmd = actual_msg.substring(1, actual_msg.length() - 1);
+                                ctcp_cmd.trim();
 
-                        // Match Context Target FIRST outside of the thread blocking lock window
+                                if (ctcp_cmd.equalsIgnoreCase("VERSION")) {
+                                    Serial.printf("[CTCP] Version query intercepted from user handle: %s\n", sender_nick.c_str());
+                                    
+                                    // Target our 42-mode diagnostic desk to flash a bright Pearl White Strobe (Mode 23)
+                                    set_led_mode(23); 
+                                    
+                                    // Transmit a custom, sanitized identification string back down the secure socket
+                                    net_client.printf("NOTICE %s :\x01VERSION Cardputer-Adv Cyberdeck Terminal v2.4 (ESP32-S3/FreeRTOS)\x01\r\n", sender_nick.c_str());
+                                    net_client.flush(); // Force immediate packet delivery down the wire
+                                    
+                                    continue; // Drop the packet out of processing execution so it never clutters chat logs
+                                }
+                            }
+
+                        // Match Target Context FIRST completely free of loop variable confusion
                         int target_tab_slot = -1;
                         for (int t = 0; t < gTabCount; t++) {
-                            if (strcmp(gTabs[t].name, clean_target_room.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
+                            if (strcmp(gTabs[t].name, clean_target_room.c_str()) == 0 && 
+                                strcasecmp(gTabs[t].server, isolated_packet_server.c_str()) == 0) {
                                 target_tab_slot = t;
                                 break;
                             }
                         }
 
-                        // Direct Message Intercept Shield: If the target does NOT start with '#' or '&', it's a private query!
-                        if (!clean_target_room.startsWith("#") && !clean_target_room.startsWith("&")) {
-                            set_led_mode(0); // Trigger Piercing Flashing Cyan-White instantly for direct messages
-                        }
-
-                        // Claim the mutex strictly for the fractional microsecond required to push strings into RAM
-                        if (target_tab_slot != -1 && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+                        // Claim memory locks strictly to inject data into the verified absolute slot frame
+                        if (target_tab_slot != -1 && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                             Tab &t = gTabs[target_tab_slot];
                             
                             if (t.line_count >= MSG_BUFFER_SIZE) {
@@ -1396,7 +1511,7 @@ void irc_network_task(void* pvParameters) {
                             cl.is_highlight = (actual_msg.indexOf(irc_nick) != -1);
                             t.line_count++;
                             
-                            xSemaphoreGive(irc_mutex); // Release lock immediately!
+                            xSemaphoreGive(irc_mutex);
                             ui_needs_redraw = true;
                         }
                     }
