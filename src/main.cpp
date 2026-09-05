@@ -90,37 +90,63 @@ void set_led_mode(uint8_t mode) {
     static bool flash_state = false;
     
     switch (mode) {
-        case 1: // Mode 1: Healthy Cyan Idle Heartbeat
-            b = (sin(millis() / 300.0) + 1.0) * 15;
-            g = b / 3; // Shift slightly heavier blue to stop wafer color bleed
-            break;
-        case 2: // Mode 2: Highlight Mention Purple Pulse
-            if (millis() - last_toggle > 200) { flash_state = !flash_state; last_toggle = millis(); }
-            if (flash_state) { r = 40; b = 40; }
-            break;
-        case 3: // Mode 3: Latency Yellow Blip (Triggered on server PONG)
-            r = 30; g = 25;
-            break;
-        case 4: // Mode 4: Storage Sync Green Burst
-            g = 40;
-            break;
-        case 5: // Mode 5: Boundary Empty Red Flash
-            r = 80;
-            break;
-        case 6: // Mode 6: Critical Power Crimson Heartbeat
-            r = (sin(millis() / 200.0) + 1.0) * 20;
-            break;
-        case 8: // Mode 8: RSSI Signal Fade Magenta
-            r = 25; b = 25;
-            break;
-        case 9: // Mode 9: Disconnect Fault Orange
-            r = 90; g = 12;
-            break;
-        default: // Safe Mode Override: Pure, High-Saturation Laser Red Alert
-            r = 60;
-            break;
+        case 0:  r = 80; break; // Mode 0: Safe Mode Active Override (Solid Laser Red)
+        case 1:  b = (sin(millis() / 300.0) + 1.0) * 15; g = b / 2; break; // Mode 1: Healthy Idle Cyan Heartbeat Wave
+        case 2:  // Mode 2: Global Real-Time Mention (Purple Double-Flash Trigger)
+            if (millis() - last_toggle > 150) { flash_state = !flash_state; last_toggle = millis(); }
+            if (flash_state) { r = 40; b = 40; } break;
+        case 3:  r = 30; g = 25; break; // Mode 3: Socket Packet Ingestion (Yellow Blip)
+        case 4:  g = 40; break; // Mode 4: SD Storage Sector Append (Emerald Green Burst)
+        case 5:  r = 80; break; // Mode 5: TextBox Underflow Boundary Error (Ruby Red Strobe)
+        case 6:  // Mode 6: Battery Critical Alert (Crimson Breathe Wave)
+            r = (sin(millis() / 200.0) + 1.0) * 20; break;
+        case 7:  // Mode 7: Tab Memory Ceiling Barrier (Bright Magenta Flash)
+            if (millis() - last_toggle > 250) { flash_state = !flash_state; last_toggle = millis(); }
+            if (flash_state) { r = 50; b = 50; } break;
+        case 8:  r = 0; g = 0; b = 0; break; // Mode 8: Empty / Unassigned (Kept Dark)
+        case 9:  r = 90; g = 12; break; // Mode 9: Wi-Fi Disconnect Fault (Solid Sharp Orange)
+        case 10: r = 0; g = 0; b = 0; break; // Mode 10: Privacy Stealth Blackout Mode (Zero Dark Panel)
+        case 11: // Mode 11: SD Card Mount Failure Error
+            if (millis() - last_toggle > 100) { flash_state = !flash_state; last_toggle = millis(); }
+            if (flash_state) { r = 90; } break;
+        case 12: r = 60; b = 60; break; // Mode 12: Bouncer Socket Disconnected State (Solid Magenta)
+        case 13: // Mode 13: Bouncer Identification Sequence (Slow Ice Blue Pulse)
+            b = (sin(millis() / 400.0) + 1.0) * 20; r = b / 4; break;
+        case 14: b = 80; break; // Mode 14: Secure SSL Encryption Handshake (Deep Royal Blue Blip)
+        case 15: // Mode 15: Unread Highlight Mention Alarm Strobe (Vibrant Pulsing Gold)
+            r = (sin(millis() / 150.0) + 1.0) * 40; g = r / 1.5; b = 0; break;
+        case 16: r = 25; g = 25; b = 25; break; // Mode 16: Server Connection Lag Warning (Soft White)
+        case 17: // Mode 17: Active Handshake Channel Synchronization (Pulsing Deep Sky Blue)
+            g = (sin(millis() / 150.0) + 1.0) * 25; b = g * 2; r = 0; break; 
+        case 18: r = 15; g = 30; b = 50; break; // Mode 18: System Mode / App State Tab Change (Sleek Aqua Pulse)
+        case 19: g = 60; b = 20; break; // Mode 19: Configuration Auto-Saver File Trigger (Lime Green Blip)
+        case 20: r = 60; g = 15; break; // Mode 20: Local Slash Command Macro Instruction (Warm Coral Strobe)
+        case 21: r = 20; b = 50; break; // Mode 21: Tab Key Username Autocomplete Success (Cool Indigo Flare)
+        case 22: // Mode 22: Critical RSSI Signal Drop Alert (Urgent Flashing Ruby Red)
+            if (millis() - last_toggle > 120) { flash_state = !flash_state; last_toggle = millis(); }
+            if (flash_state) { r = 95; g = 0; b = 0; } break;
+        case 23: r = 50; g = 50; b = 50; break; // Mode 23: Inbound Server Keep-Alive / CAP Sync Activity (Bright Pearl Strobe)
+        case 24: r = 30; g = 20; b = 40; break; // Mode 24: Reserved Expansion Slot
+        case 25: r = 40; g = 30; b = 20; break; // Mode 25: Reserved Expansion Slot
+        case 26: r = 20; g = 40; b = 30; break; // Mode 26: Reserved Expansion Slot
+        case 27: r = 50; g = 20; b = 20; break; // Mode 27: Reserved Expansion Slot
+        case 28: r = 20; g = 50; b = 20; break; // Mode 28: Reserved Expansion Slot
+        case 29: r = 20; g = 20; b = 50; break; // Mode 29: Reserved Expansion Slot
+        case 30: r = 60; g = 30; b = 0; break; // Mode 30: Reserved Expansion Slot
+        case 31: r = 0; g = 60; b = 30; break; // Mode 31: Reserved Expansion Slot
+        case 32: r = 30; g = 0; b = 60; break; // Mode 32: Reserved Expansion Slot
+        case 33: r = 60; g = 60; b = 0; break; // Mode 33: Reserved Expansion Slot
+        case 34: r = 80; b = 80; g = 0; break; // Mode 34: Heap Memory Fragmentation Warning (Solid Magenta)
+        case 35: r = 90; b = 50; g = 0; break; // Mode 35: Line Input Character Truncation (Bright Pink Flash)
+        
+        case 36: r = 75; g = 55; b = 0; break; // Mode 36: Socket Keep-Alive Dropped / Timeout (Solid Amber-Yellow)
+        case 37: // Mode 37: Configuration Corrupt / Default Restore (Flashing Laser Red/Yellow)
+            if (millis() - last_toggle > 150) { flash_state = !flash_state; last_toggle = millis(); }
+            if (flash_state) { r = 90; g = 0; b = 0; } else { r = 70; g = 70; b = 0; } break;
+            
+        default: r = 30; g = 30; b = 30; break;
     }
-    neopixelWrite(21, r, g, b);
+    neopixelWrite(21, r, g, b); // Deliver bits down to physical Pin 21
 }
 
 // ==========================================
@@ -131,6 +157,7 @@ void load_settings_from_sd() {
     
     File file = SD.open("/irc/config.txt", FILE_READ);
     if (!file) {
+        set_led_mode(37); // Flash Red/Yellow immediately to warn of missing or unreadable micro-SD configuration tables
         Serial.println("[ERROR] /irc/config.txt not found. Falling back to default flags.");
         return;
     }
@@ -177,6 +204,10 @@ void load_settings_from_sd() {
         else if (strcmp(key, "screen_brightness")==0) screen_brightness = atoi(value);
         else if (strcmp(key, "current_tz_idx")==0) current_tz_idx = atoi(value);
         else if (strcmp(key, "use_12_hour_format")==0) use_12_hour_format = atoi(value);
+    }
+    // Critical parameters validation – fire Mode 37 if bouncer host/port or wifi remains unassigned
+    if (strlen(wifi_ssid) == 0 || strlen(bnc_host) == 0 || bnc_port == 0) {
+        set_led_mode(37); // Configuration corrupt / default restore alarm
     }
     file.close();
     Serial.println("[STORAGE] Configuration fields successfully streamed and parsed from SD.");
@@ -322,6 +353,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
                 if (isSystem || isQuery) f.printf("%s %s: %s\n", logChannel, source, msg);
                 else f.printf("%s\n", msg);
                 f.close();
+                set_led_mode(4); // Emerald Green Burst for SD append
             }
             if (sd_mutex) xSemaphoreGive(sd_mutex);
         }
@@ -418,14 +450,12 @@ void draw_chat_view() {
             }
         }
         
-        // Partial Erase Shield to mask out dead settings rows
         canvas.fillRect(0, 120, 240, 15, 0x0000); 
-        
-        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print("Arrows: Nav | Enter: Open Channel");
-        canvas.pushSprite(0, 0); // Push the flicker-free composite frame to the display glass
+        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print(",/. Scroll | Enter: Open");
+        canvas.pushSprite(0, 0);
         
         ui_needs_redraw = false;
-        return; // <-- CRITICAL: Halt function execution instantly to stop chat logs from drawing!
+        return; // <-- CRITICAL BALANCING SHIELD: Halt execution to prevent chat text overlapping!
     }
     if (current_app_mode != MODE_CHAT) {
         switch (current_app_mode) {
@@ -674,6 +704,7 @@ void handle_keyboard_inputs() {
         current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
         menu_selection_idx = 0; nav_server_select_idx = 0; nav_channel_select_idx = 0;
         ui_needs_redraw = true;
+        set_led_mode(18);
         return;
     }
 
@@ -685,6 +716,7 @@ void handle_keyboard_inputs() {
         else                                      { current_app_mode = MODE_CHAT; }
         menu_selection_idx = 0;
         ui_needs_redraw = true;
+        set_led_mode(18);
         return;
     }
 
@@ -715,6 +747,7 @@ void handle_keyboard_inputs() {
                     file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\n", current_tz_idx, use_12_hour_format);
                     file.close();
                     Serial.println("[STORAGE-SYNC] Configuration parameters permanently synchronized to micro-SD card.");
+                    set_led_mode(19); // Lime Green Blip for auto-saver
                 }
                 xSemaphoreGive(irc_mutex);
             }
@@ -730,11 +763,11 @@ void handle_keyboard_inputs() {
     // Fn+Left = ';' | Fn+Right = '/' | Fn+Up = ',' | Fn+Down = '.'
     if (current_app_mode == MODE_CHAT) {
         if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn+Left Arrow shortcut intercepted
-            if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; }
+            if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; set_led_mode(18); }
             return;
         }
         if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Fn+Right Arrow shortcut intercepted
-            if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; }
+            if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; set_led_mode(18); }
             return;
         }
     } else {
@@ -784,6 +817,7 @@ void handle_keyboard_inputs() {
                             current_tab_index = i;
                             current_app_mode = MODE_CHAT;
                             ui_needs_redraw = true;
+                            set_led_mode(18);
                             return;
                         }
                         channel_print_counter++;
@@ -793,12 +827,12 @@ void handle_keyboard_inputs() {
             }
         }
     // ==========================================
-    // 🎮 THE ONE-HANDED MENU DIRECTIONAL PAD (ACTIVE IN MENUS)
+    // 🎮 TRUE HARDWARE PHYSICAL D-PAD LAYER (ACTIVE IN MENUS)
     // ==========================================
     if (current_app_mode != MODE_CHAT) {
         
-        // 1. VERTICAL SCROLLING INTERCEPTS (Comma = UP Arrow | Period = DOWN Arrow)
-        if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Single-press Comma steps UP
+        // 1. VERTICAL SCROLLING AXIS (Semicolon = UP | Period = DOWN)
+        if (M5Cardputer.Keyboard.isKeyPressed(';')) { // Physical UP Key
             if (current_app_mode == MODE_NAVIGATOR) {
                 if (nav_channel_select_idx > 0) { nav_channel_select_idx--; ui_needs_redraw = true; }
             } else {
@@ -806,37 +840,38 @@ void handle_keyboard_inputs() {
             }
             return;
         }
-        if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Single-press Period steps DOWN
+        if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Physical DOWN Key
             if (current_app_mode == MODE_NAVIGATOR) {
-                if (nav_channel_select_idx < gTabCount - 1) { nav_channel_select_idx++; ui_needs_redraw = true; }
+                int total_chans = 0;
+                for (int i = 0; i < gTabCount; i++) {
+                    if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) total_chans++;
+                }
+                if (nav_channel_select_idx < total_chans - 1) { nav_channel_select_idx++; ui_needs_redraw = true; }
             } else {
-                int max_limit = (current_app_mode == MODE_SETTINGS) ? 5 : 4;
+                int max_limit = (current_app_mode == MODE_SETTINGS) ? 3 : 2;
                 if (menu_selection_idx < max_limit) { menu_selection_idx++; ui_needs_redraw = true; }
             }
             return;
         }
 
-        // 2. HORIZONTAL SCROLLING INTERCEPTS (Semicolon = LEFT Value | Forward Slash = RIGHT Value)
-        if (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/')) {
-            bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
+        // 2. HORIZONTAL ADJUSTMENT AXIS (Comma = LEFT / DECREMENT | Forward Slash = RIGHT / INCREMENT)
+        if (M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/')) {
+            bool forward = M5Cardputer.Keyboard.isKeyPressed('/'); // Right = True, Left = False
             ui_needs_redraw = true;
             
-            if (current_app_mode == MODE_SETTINGS) {
-                if (menu_selection_idx == 0) { // Brightness Row Step Toggles
-                    if (forward) {
-                        if (screen_brightness <= 15)   screen_brightness = 60;
-                        else if (screen_brightness == 60)  screen_brightness = 120;
-                        else if (screen_brightness == 120) screen_brightness = 200;
-                        else if (screen_brightness == 200) screen_brightness = 255;
-                    } else {
-                        if (screen_brightness == 255)      screen_brightness = 200;
-                        else if (screen_brightness == 200) screen_brightness = 120;
-                        else if (screen_brightness == 120) screen_brightness = 60;
-                        else if (screen_brightness == 60)  screen_brightness = 15;
-                    }
-                    M5Cardputer.Display.setBrightness(screen_brightness); // Secure instant hardware update
+            if (current_app_mode == MODE_NAVIGATOR) {
+                nav_server_select_idx += forward ? 1 : -1;
+                if (nav_server_select_idx >= discovered_network_count) nav_server_select_idx = 0;
+                if (nav_server_select_idx < 0) nav_server_select_idx = discovered_network_count - 1;
+                nav_channel_select_idx = 0; // Cleanly reset row cursor on server node swap
+            }
+            else if (current_app_mode == MODE_SETTINGS) {
+                if (menu_selection_idx == 0) { // Screen Backlight Scaler
+                    screen_brightness += forward ? 30 : -30;
+                    if (screen_brightness > 255) screen_brightness = 255;
+                    if (screen_brightness < 15)  screen_brightness = 15;
                 }
-                else if (menu_selection_idx == 1) { // Timezone Index Offsets
+                else if (menu_selection_idx == 1) { // Timezone Offset Index
                     current_tz_idx += forward ? 1 : -1;
                     if (current_tz_idx > 14) current_tz_idx = -12;
                     if (current_tz_idx < -12) current_tz_idx = 14;
@@ -906,6 +941,7 @@ void handle_keyboard_inputs() {
                     input_buffer = input_buffer.substring(0, last_space + 1) + discovered_match + ": ";
                 }
                 ui_needs_redraw = true;
+                set_led_mode(21); // Cool Indigo Flare for autocomplete success
                 return;
             }
         }
@@ -981,6 +1017,7 @@ void handle_keyboard_inputs() {
                     else {
                         add_message_to_buffer("ClientCore", "Unknown local slash command protocol instruction.", 0xF800);
                     }
+                    set_led_mode(20); // Warm Coral Strobe for slash macro
                 } else {
                     // --- STANDARD CHAT TEXT TRANSMISSION PATH ---
                     target_socket->printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
@@ -1043,17 +1080,22 @@ void irc_network_task(void* pvParameters) {
                     
                     // Tokenize the server's text stream comma-by-comma on the fly
                     int start_pos = 0;
-                    while (start_pos < net_list.length() && discovered_network_count < MAX_NETWORKS) {
+                    while (start_pos < net_list.length()) {
+                        // Overflow Shield: Prevent bouncer from spilling past our MAX_NETWORKS memory boundaries
+                        if (discovered_network_count >= MAX_NETWORKS) {
+                            Serial.println("[WARN] Bouncer roster exceeds MAX_NETWORKS. Truncating allocations safely.");
+                            break;
+                        }
+                        
                         int comma_idx = net_list.indexOf(',', start_pos);
                         String net_name = (comma_idx == -1) ? net_list.substring(start_pos) : net_list.substring(start_pos, comma_idx);
                         net_name.trim();
-
-                        if (net_name.length() > 0) {
-                            // Store the discovered network cleanly in a blank RAM cell
-                            strncpy(discovered_networks[discovered_network_count], net_name.c_str(), 31);
-                            discovered_network_count++;
+                        
+                        if (net_name.length() > 0) { 
+                            strncpy(discovered_networks[discovered_network_count], net_name.c_str(), 31); 
+                            discovered_network_count++; 
                         }
-                        if (comma_idx == -1) break;
+                        if (comma_idx == -1) break; 
                         start_pos = comma_idx + 1;
                     }
                     master_client.stop(); // Close the discovery probe safely
@@ -1108,6 +1150,7 @@ void irc_network_task(void* pvParameters) {
                 
                 if (line.startsWith("PING")) { 
                     net_client.printf("PONG %s\r\n", line.substring(5).c_str()); 
+                    set_led_mode(23); // Bright Pearl Strobe for keep-alive
                     continue; 
                 }
 
@@ -1324,8 +1367,42 @@ void custom_ui_loop_task(void* pvParameters) {
             M5Cardputer.Display.setBrightness(screen_brightness);
         }
         
-        // Drive Stamp-S3A LED modes asynchronously without delay halts
-        set_led_mode(safe_mode_active ? 0 : 1);
+        // Hierarchical 24-Mode Diagnostic LED Status Selector Matrix
+        uint8_t target_led_mode = 1; // Default fallback to Mode 1 (Cyan Idle Heartbeat)
+
+        if (safe_mode_active) {
+            target_led_mode = 0;
+        } else if (current_audio == 0) {
+            target_led_mode = 10; // Privacy Stealth Blackout Override
+        } else if (WiFi.status() != WL_CONNECTED) {
+            target_led_mode = 9;  // Wi-Fi Disconnect Fault (Solid Sharp Orange)
+        } else if (WiFi.status() == WL_CONNECTED && WiFi.RSSI() <= -85) {
+            target_led_mode = 22; // Antenna Alert: Urgent Flashing Ruby Red if signal drops below -85dBm
+        } else if (gTabCount >= MAX_TABS) {
+            target_led_mode = 7;  // Memory Buffer Ceiling Fault (Flash Magenta)
+        } else {
+            bool highlight_active = false;
+            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
+                for (int t = 0; t < gTabCount; t++) {
+                    if (gTabs[t].line_count > 0 && gTabs[t].lines[gTabs[t].line_count - 1].is_highlight) {
+                        highlight_active = true; break;
+                    }
+                }
+                xSemaphoreGive(irc_mutex);
+            }
+
+            if (highlight_active) {
+                target_led_mode = 15; // Priority: Unread Highlight Mention Alarm Strobe (Pulsing Gold)
+            } else if (!network_handshake_complete[current_tab_index] && current_tab_index != 0) {
+                target_led_mode = 17; // State: Pulsing Deep Sky Blue while background socket handshakes sync
+            } else if (get_calibrated_battery_percentage() < 15.0f) {
+                target_led_mode = 6;  // Low Power Crimson Breathe Wave
+            } else if (millis() - last_input_time > 300000) { 
+                target_led_mode = 16; // Server Connection Lag Warning (Soft White)
+            }
+        }
+
+        set_led_mode(target_led_mode);
         
         if (ui_needs_redraw) {
             draw_chat_view();
