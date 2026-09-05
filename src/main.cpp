@@ -28,6 +28,12 @@
 #ifndef KEY_LEFT
 #define KEY_LEFT 0x50
 #endif
+#ifndef KEY_DOWN
+#define KEY_DOWN 0x51
+#endif
+#ifndef KEY_UP
+#define KEY_UP 0x52
+#endif
 // Forward declaration for user input handler used inside handle_keyboard_inputs
 static void handleUserInput(const char* in);
 
@@ -622,8 +628,10 @@ static Tab* getOrCreateTab(const char* name, TabType t){
   Tab* f=findTab(name);
   if(f) return f;
   if(gTabCount>=MAX_TABS){
-    for(int i=0;i<gTabCount;++i) if(gTabs[i].type==TAB_STATUS) return &gTabs[i];
-    return &gTabs[0];
+    for(int i=1;i<gTabCount;++i) if(gTabs[i].type==TAB_STATUS && !eqI(gTabs[i].name, "~mentions")) return &gTabs[i];
+    // never overwrite permanent ~mentions at index 0
+    for(int i=1;i<gTabCount;++i) if(!eqI(gTabs[i].name, "~mentions")) return &gTabs[i];
+    return nullptr;
   }
   Tab* nb=&gTabs[gTabCount++];
   memset(nb,0,sizeof(Tab));
@@ -642,12 +650,31 @@ static void ensureStatus(){
   if(gTabCount==0){
     Tab* t=&gTabs[gTabCount++];
     memset(t,0,sizeof(Tab));
-    safeCopy(t->name,"status",sizeof(t->name));
-    t->type=TAB_STATUS;
-    const char* srv = bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host;
-    safeCopy(t->server, srv, sizeof(t->server));
-    if(active_networks_count<4){ safeCopy(active_networks[active_networks_count++], t->server, sizeof(active_networks[0])); }
+    strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name) - 1);
+    strncpy(gTabs[0].server, "ClientCore", sizeof(gTabs[0].server) - 1);
+    gTabs[0].name[sizeof(gTabs[0].name)-1]='\0'; gTabs[0].server[sizeof(gTabs[0].server)-1]='\0';
+    gTabs[0].type=TAB_STATUS;
+    // keep legacy status name for compatibility, but primary index 0 is ~mentions
+    // ensure active_networks cache consistent
+    if(active_networks_count<4){ safeCopy(active_networks[active_networks_count++], gTabs[0].server, sizeof(active_networks[0])); }
     gActive=0;
+    // protect from overwrite: ensure second slot is status if needed
+    if(gTabCount==1){
+      Tab* s=&gTabs[gTabCount++];
+      memset(s,0,sizeof(Tab));
+      safeCopy(s->name,"status",sizeof(s->name));
+      s->type=TAB_STATUS;
+      const char* srv2 = bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host;
+      safeCopy(s->server, srv2, sizeof(s->server));
+    }
+  } else {
+    // protect existing ~mentions at index 0 from being overwritten by dynamic discovery
+    if(gTabs[0].name[0]=='\0' || !eqI(gTabs[0].name, "~mentions")){
+      // repair if corrupted
+      strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name) - 1);
+      strncpy(gTabs[0].server, "ClientCore", sizeof(gTabs[0].server) - 1);
+      gTabs[0].type=TAB_STATUS;
+    }
   }
 }
 static void ringPush(Tab* tab, const char* txt, uint8_t flags, const char* serverHHMM=nullptr){
@@ -702,6 +729,36 @@ static void appendLog(Tab* tab, const char* raw, const char* serverHHMM=nullptr)
   ringPush(tab,raw,fl,serverHHMM);
   // stealth trigger: highlight while stealth mode active
   if(fl & 0x01){ gPurpleFlashMs=millis(); gPurpleFlashPhase=2; }
+  // DYNAMIC MULTI-NETWORK HIGHLIGHT INTERCEPTOR - dual-write to ~mentions under irc_mutex
+  if(fl & 0x01){
+    if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
+      Tab* mentionTab = findTab("~mentions");
+      if(!mentionTab) mentionTab = &gTabs[0];
+      if(mentionTab && eqI(mentionTab->name, "~mentions")){
+        char prefixed[MAX_LINE_LEN+1];
+        const char* origin = tab->server[0] ? tab->server : (bnc_host.length()>0 ? bnc_host.c_str() : gCfg.host);
+        // prefix with origin network name: [Libera] <alice> ...
+        char cleanOrigin[32]; safeCopy(cleanOrigin, origin, sizeof(cleanOrigin));
+        // strip possible port or extra
+        char* colonPos = strchr(cleanOrigin, ':');
+        if(colonPos) *colonPos='\0';
+        snprintf(prefixed, sizeof(prefixed), "[%s] %s", cleanOrigin, raw);
+        // direct ringPush to ~mentions to avoid recursion via appendLog
+        ChatLine* mslot=&mentionTab->lines[mentionTab->head];
+        char hhmm2[6]; if(serverHHMM && serverHHMM[0]) safeCopy(hhmm2, serverHHMM, sizeof(hhmm2)); else currentStamp(hhmm2,sizeof(hhmm2),nullptr,0);
+        safeCopy(mslot->stamp,hhmm2,sizeof(mslot->stamp));
+        char sanitized2[MAX_LINE_LEN+1]; safeCopy(sanitized2, prefixed, sizeof(sanitized2)); sanitizeGlyphs(sanitized2);
+        safeCopy(mslot->text,sanitized2,sizeof(mslot->text));
+        mslot->flags=fl; mslot->is_highlight=true;
+        mentionTab->head=(mentionTab->head+1)%MAX_LINES_PER_TAB;
+        if(mentionTab->count<MAX_LINES_PER_TAB) mentionTab->count++;
+        if(mentionTab->scroll>0) mentionTab->scroll++;
+        mentionTab->unread=true; mentionTab->mention=true;
+        ui_needs_redraw=true;
+      }
+      xSemaphoreGive(irc_mutex);
+    }
+  }
   if((fl & 0x01) && gCfg.current_audio == 1){
     // mute speaker entirely
     M5Cardputer.Speaker.stop();
@@ -1274,12 +1331,13 @@ void draw_chat_view(){
     char timeStr[9]; currentStamp(nullptr,0,timeStr,sizeof(timeStr));
     char timeHHMM[6]; if(strlen(timeStr)>=5){ timeHHMM[0]=timeStr[0]; timeHHMM[1]=timeStr[1]; timeHHMM[2]=':'; timeHHMM[3]=timeStr[3]; timeHHMM[4]=timeStr[4]; timeHHMM[5]='\0'; char loc[6]; localizeTimeHHMM(timeHHMM, loc); safeCopy(timeStr, loc, sizeof(timeStr)); }
     d.setTextColor(0xFFFF, UI_BG); d.setCursor(175,2); d.print(timeStr);
-    // Battery Percentage at X=212 - integer percentage from voltage math
+    // Battery Percentage at X=212 - integer percentage from voltage math - legible text percentage
     float v = readBatteryVoltage();
-    int pct = (int)((v - 3.2f) / (4.2f - 3.2f) * 100.0f);
-    if(pct<0) pct=0; if(pct>100) pct=100;
-    char bstr[8]; snprintf(bstr,sizeof(bstr),"%d%%", pct);
-    d.setTextColor(0x8410, UI_BG); d.setCursor(212,2); d.print(bstr);
+    int bat_pct = (int)((v - 3.2f) / (4.2f - 3.2f) * 100.0f);
+    if(bat_pct<0) bat_pct=0; if(bat_pct>100) bat_pct=100;
+    d.setTextColor(0xFFFF, UI_BG);
+    d.setCursor(212, 2);
+    M5Cardputer.Display.printf("[%d%%]", bat_pct);
   }
   {
     auto &d = M5Cardputer.Display;
@@ -1599,8 +1657,8 @@ void handle_keyboard_inputs() {
             handleUserInput(copy); ui_needs_redraw = true;
         } else { gHistNav=-1; }
     }
-    if(st.tab){
-        // HARDWARE TAB NICK COMPLETION ENGINE - scan backwards for partial word, prefix match nick index
+    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_DOWN)){
+        // SAFE NICKNAME COMPLETION KEYBINDING - strictly Fn+DOWN, pure C-string
         Tab* curTab = activeTab();
         if(curTab && curTab->nickCount>0 && gInputLen>0){
             int end = gInputCursor;
@@ -1630,6 +1688,11 @@ void handle_keyboard_inputs() {
                 }
             }
         }
+        // no match found, still consume key and redraw
+        ui_needs_redraw = true;
+        return;
+    }
+    if(st.tab){
         if(gTabCount>0){ gActive=(gActive+1)%gTabCount; activeTab()->unread=false; activeTab()->mention=false; current_tab_index=gActive; ui_needs_redraw = true; }
     }
     if(!st.word.empty() || st.del || st.enter || st.tab) ui_needs_redraw = true;
@@ -2191,7 +2254,7 @@ static void handleUserInput(const char* in){
   if(strcmp(cmd,"close")==0){
     Tab* at=activeTab();
     if(!at){ logStatus("Nothing to close"); return; }
-    if(at->type==TAB_STATUS){ logStatus("Cannot close status"); return; }
+    if(eqI(at->name, "~mentions") || at->type==TAB_STATUS){ logStatus("Cannot close ~mentions/status"); return; }
     int idx = (int)(at - gTabs);
     for(int i=idx;i<gTabCount-1;++i) gTabs[i]=gTabs[i+1];
     gTabCount--; if(gActive>=gTabCount) gActive=gTabCount-1;
