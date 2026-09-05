@@ -834,43 +834,67 @@ void handle_keyboard_inputs() {
         return;
     }
 
-    // Layer D: Standard Character Stream Buffer Appender
+    // ==========================================
+    // 💬 CHAT MODE PROCESSING PIPELINE (ONLY RUNS IF MODE_CHAT IS ACTIVE)
+    // ==========================================
     if (current_app_mode == MODE_CHAT) {
-        if (status.del && input_buffer.length() > 0) {
-            input_buffer.remove(input_buffer.length() - 1);
-            ui_needs_redraw = true; // <-- Force unlock redraw
+        // Handle Backspace deletions safely
+        if (status.del && input_buffer.length() > 0) { 
+            input_buffer.remove(input_buffer.length() - 1); 
+            ui_needs_redraw = true; 
         }
+        
+        // Append standard printable characters into the buffer
         for (auto c : status.word) {
-            // Hard gate to block Fn punctuation bleeding artifacts into your string line
-            if (is_fn && (c == ';' || c == '/' || c == ',' || c == '.' || c == 'p')) continue;
-            if (input_buffer.length() < 400) {
-                input_buffer += c;
-                ui_needs_redraw = true; // <-- Force unlock redraw on every keystroke
+            if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
+            if (input_buffer.length() < 400) { 
+                input_buffer += c; 
+                ui_needs_redraw = true; 
             }
         }
+        
+        // Route and transmit typed entries out of the active socket handle
         if (status.enter && input_buffer.length() > 0) {
             const char* active_net = gTabs[current_tab_index].server;
             for (int i = 0; i < discovered_network_count; i++) {
                 if (strcmp(discovered_networks[i], active_net) == 0 && clients[i].connected()) {
                     clients[i].printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
-                    add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF);
+                    add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF); 
                     break;
                 }
             }
-            input_buffer = "";
+            input_buffer = ""; 
             ui_needs_redraw = true;
         }
     }
 }
 
 void irc_network_task(void* pvParameters) {
+    static bool wifi_initialized = false;
     static bool master_scan_complete = false;
     static WiFiClientSecure master_client;
 
     while (true) {
-        yield(); 
-        vTaskDelay(pdMS_TO_TICKS(20)); // Prevent core starvation
-        if (safe_mode_active || bnc_port == 0 || WiFi.status() != WL_CONNECTED) continue;
+        yield(); vTaskDelay(pdMS_TO_TICKS(50)); // Prevent core starvation
+        if (safe_mode_active || bnc_port == 0) continue;
+
+        // STEP 0: ASYNCHRONOUS BACKGROUND WI-FI INITIALIZATION
+        if (!wifi_initialized) {
+            WiFi.disconnect(true); vTaskDelay(pdMS_TO_TICKS(100)); 
+            WiFi.mode(WIFI_STA);
+            if (strlen(wifi_ssid) > 0) {
+                WiFi.begin((const char*)wifi_ssid, (const char*)wifi_pass);
+                Serial.printf("[NET-INIT] Background wireless radio launched for SSID: %s\n", wifi_ssid);
+            }
+            wifi_initialized = true;
+            continue;
+        }
+
+        // Keep cycling if the radio chip is still negotiating access point authentication
+        if (WiFi.status() != WL_CONNECTED) {
+            set_led_mode(9); // Animate Orange to indicate background connection tuning
+            continue;
+        }
 
         // STEP 1: INITIAL PASS - EXTRACT NETWORKS DYNAMICALLY FROM THE BOUNCER
         if (!master_scan_complete) {
@@ -1120,10 +1144,6 @@ void setup() {
     SPI.begin(40, 39, 14, 12);
     SD.begin(12, SPI, 10000000);
     
-    irc_mutex = xSemaphoreCreateMutex();
-    sd_mutex = xSemaphoreCreateMutex();
-    gLogQueue = xQueueCreate(20, sizeof(char) * 128);
-    
     // Paint intro splash logo horizontally
     M5Cardputer.Display.fillScreen(0x0000);
     M5Cardputer.Display.setTextColor(0xFD20);
@@ -1143,50 +1163,18 @@ void setup() {
         }
     }
     
-    if (safe_mode_active) {
-        Serial.println("*** Safe Mode: net tasks bypassed");
-    } else {
-        purge_old_logs();
-        load_settings_from_sd(); // Dynamically parse configuration on normal boots
-    }
-    
-    // 1. Initialize the physical ESP32 radio chip
-    WiFi.disconnect(true); // Force wipe any old, hung wireless states
-    vTaskDelay(pdMS_TO_TICKS(100));
-    WiFi.mode(WIFI_STA);   // Set to standard Station mode
-    
-    // Only attempt connection if your SD card settings successfully filled the buffers
-    if (strlen(wifi_ssid) > 0) {
-        Serial.printf("[WIFI] Connecting to target SSID: %s\n", wifi_ssid);
-        WiFi.begin((const char*)wifi_ssid, (const char*)wifi_pass);
-        
-        // Wait up to 10 seconds for a clean local IP assignment
-        int timeout_counter = 0;
-        while (WiFi.status() != WL_CONNECTED && timeout_counter < 20) {
-            yield();
-            vTaskDelay(pdMS_TO_TICKS(500));
-            timeout_counter++;
-            
-            // Toggle your top-right Stamp-S3A LED to Mode 9 (Orange) to show active network tuning
-            set_led_mode(9); 
-        }
-    }
-    
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.printf("[WIFI] Connected cleanly! Assigned IP: %s\n", WiFi.localIP().toString().c_str());
-    } else {
-        Serial.println("[WIFI-WARN] Connection timed out. Booting straight to offline terminal.");
-    }
-    
-    gTabCount = 1; 
-    current_tab_index = 0;
-    memset(&gTabs, 0, sizeof(gTabs));
+    load_settings_from_sd();
+    if (!safe_mode_active) purge_old_logs();
+
+    irc_mutex = xSemaphoreCreateMutex();
+    sd_mutex = xSemaphoreCreateMutex();
+    gLogQueue = xQueueCreate(20, sizeof(char) * 128);
+    gTabCount = 1; current_tab_index = 0; memset(&gTabs, 0, sizeof(gTabs));
     strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name)-1);
     strncpy(gTabs[0].server, "ClientCore", sizeof(gTabs[0].server)-1);
-    
     if (irc_mutex) xSemaphoreGive(irc_mutex);
-    
-    // Memory allocation and initialization complete. Lower the barrier safely.
+
+    // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
     
     xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 8192, NULL, 1, NULL, 0);
