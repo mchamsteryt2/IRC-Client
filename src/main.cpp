@@ -66,7 +66,11 @@ int channel_log_enabled = 1;
 int current_tz_idx      = 2;
 int use_12_hour_format  = 1;
 
-WiFiClientSecure client;
+#define MAX_NETWORKS 5
+char discovered_networks[MAX_NETWORKS][32] = {{0}};
+volatile uint8_t discovered_network_count = 0;
+WiFiClientSecure clients[MAX_NETWORKS];
+bool network_authenticated[MAX_NETWORKS] = {false};
 unsigned long last_input_time = 0;
 unsigned long last_server_activity = 0;
 String input_buffer;
@@ -600,10 +604,11 @@ void handle_keyboard_inputs() {
         return;
     }
     
-    // Layer B: Master Emergency Escape Back to Main Chat Workspace (Alt + Backspace)
-    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) {
+    // Layer B: Master Emergency Escape Back to Main Chat Workspace
+    // Triggers instantly on either (Alt + Backspace [0x08]) OR a single tap of the physical Esc key (0x1B)
+    if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed(0x1B)) {
         current_app_mode = MODE_CHAT;
-        input_buffer = ""; // Cleanly flush stray artifacts
+        input_buffer = ""; // Cleanly flush any stray menu layout characters out of RAM
         ui_needs_redraw = true;
         return;
     }
@@ -665,9 +670,13 @@ void handle_keyboard_inputs() {
             }
         }
         if (status.enter && input_buffer.length() > 0) {
-            if (client.connected()) {
-                client.printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
-                add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF);
+            const char* active_net = gTabs[current_tab_index].server;
+            for (int i = 0; i < discovered_network_count; i++) {
+                if (strcmp(discovered_networks[i], active_net) == 0 && clients[i].connected()) {
+                    clients[i].printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
+                    add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF);
+                    break;
+                }
             }
             input_buffer = "";
             ui_needs_redraw = true;
@@ -675,173 +684,197 @@ void handle_keyboard_inputs() {
     }
 }
 
-// ==========================================
-// 🚀 CONCURRENT COOPERATIVE FREERTOS STEERING
-// ==========================================
 void irc_network_task(void* pvParameters) {
+    static bool master_scan_complete = false;
+    static WiFiClientSecure master_client;
+
     while (true) {
-        yield();
-        vTaskDelay(pdMS_TO_TICKS(10));
-        
-        if (safe_mode_active) continue;
-        
-        // If the client drops its link, attempt a safe background reconnect
-        if (WiFi.status() == WL_CONNECTED && !client.connected() && bnc_port > 0) {
-            client.setInsecure(); // Bypass static SSL fingerprint expiration limits
-            if (client.connect(bnc_host, bnc_port)) {
-                // Execute modern IRCv3 capability negotiation sequence
-                client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
-                client.print("CAP REQ :server-time cap-notify away-notify account-notify extended-join\r\n");
-                client.printf("NICK %s\r\n", irc_nick);
-                client.printf("USER %s 0 * :M5 Cardputer-Adv Client\r\n", bnc_user);
-                client.print("CAP END\r\n");
-            }
-        }
-        
-        // 2. PARSE INCOMING DATA PACKETS AND GENERATE NETWORK TABS
-        if (client.connected() && client.available()) {
-            String line = client.readStringUntil('\n');
-            line.trim();
-            char parsed_time[6] = "00:00";
-            if (line.startsWith("@")) {
-                int time_idx = line.indexOf("time=");
-                if (time_idx != -1) {
-                    // Extract the HH:MM subset characters out of the ISO-8601 timestamp string
-                    // Example: @time=2026-09-05T14:35:00Z -> Extracts "14:35"
-                    int t_start = line.indexOf('T', time_idx);
-                    if (t_start != -1 && t_start + 6 < line.length()) {
-                        String hh_mm = line.substring(t_start + 1, t_start + 6);
-                        strncpy(parsed_time, hh_mm.c_str(), sizeof(parsed_time) - 1);
-                    }
-                }
-                // Strip the entire @ tag section out of the line so standard text parsers don't print garbage
-                int msg_start = line.indexOf(' ');
-                if (msg_start != -1) {
-                    line = line.substring(msg_start + 1);
-                }
-            }
-            
-            // Handle background PING-PONG heartbeats instantly
-            if (line.startsWith("PING")) {
-                client.printf("PONG %s\r\n", line.substring(5).c_str());
-                continue;
-            }
-            // Handle ACCOUNT/AWAY extended-join updates without redraw stall
-            if (line.indexOf(" ACCOUNT ") != -1 || line.indexOf(" AWAY ") != -1) {
-                // Update local tracking arrays silently
-                continue;
-            }
-            
-            // Look for standard registration success tokens (001, 376, etc.) or JOIN tags
-            if (line.indexOf(" 001 ") != -1 || line.indexOf(" JOIN ") != -1) {
-                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    // If your active tabs array is sitting blank, register your dynamic server nodes on-the-fly
-                    if (gTabCount == 1 && strcmp(gTabs[0].name, "~system") == 0) {
-                        // Re-seed the active tab array structures dynamically
-                        strncpy(gTabs[0].server, "BNC", sizeof(gTabs[0].server)-1);
-                        // Add more room slots safely as bouncer traffic channels populate up to MAX_TABS
-                    }
-                    xSemaphoreGive(irc_mutex);
-                    ui_needs_redraw = true;
-                }
-            }
-            // Parse raw bouncer routing tags on-the-fly
-            // Example message: :User!mask@host PRIVMSG #channel :message text
-            // Bouncer numeric routing message: :lurker.bouncer 001 MaxH :Welcome
-            
-            String network_context = "BNC"; // Default fallback context string
-            int slash_idx = line.indexOf('/');
-            int colon_idx = line.indexOf(':');
-            
-            if (slash_idx != -1 && slash_idx < colon_idx) {
-                // Extract network identifier tokens dynamically (e.g. "libera", "MansionNET")
-                int space_idx = line.indexOf(' ', slash_idx);
-                if (space_idx != -1) {
-                    network_context = line.substring(slash_idx + 1, space_idx);
-                    network_context.trim();
+        yield(); 
+        vTaskDelay(pdMS_TO_TICKS(20)); // Prevent core starvation
+        if (safe_mode_active || bnc_port == 0 || WiFi.status() != WL_CONNECTED) continue;
+
+        // STEP 1: INITIAL PASS - EXTRACT NETWORKS DYNAMICALLY FROM THE BOUNCER
+        if (!master_scan_complete) {
+            if (!master_client.connected()) {
+                master_client.setInsecure();
+                if (master_client.connect(bnc_host, bnc_port)) {
+                    // Send raw root credentials to trigger the bouncer's available network notice
+                    master_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
+                    master_client.printf("NICK %s\r\n", irc_nick);
+                    master_client.printf("USER %s 0 * :M5 Discovery\r\n", bnc_user);
                 }
             }
 
-            // Target room extraction variables
-            String target_channel = "~system";
-            String source_nick = "server";
-            String chat_msg = line;
-            
-            if (line.indexOf(" PRIVMSG ") != -1) {
-                // Parse standard incoming message payloads
-                int priv_idx = line.indexOf(" PRIVMSG ");
-                int msg_idx = line.indexOf(" :", priv_idx);
-                
-                if (priv_idx != -1 && msg_idx != -1) {
-                    target_channel = line.substring(priv_idx + 9, msg_idx);
-                    target_channel.trim();
-                    chat_msg = line.substring(msg_idx + 2);
+            if (master_client.connected() && master_client.available()) {
+                String line = master_client.readStringUntil('\n');
+                line.trim(); line.replace("\r", "");
+
+                // Intercept the bouncer's active listing notification string at runtime
+                int avail_idx = line.indexOf("Available: ");
+                if (avail_idx != -1) {
+                    String net_list = line.substring(avail_idx + 11);
                     
-                    int ex_idx = line.indexOf('!');
-                    if (ex_idx != -1 && ex_idx < priv_idx) {
-                        source_nick = line.substring(1, ex_idx);
-                    }
-                }
-                
-                // Invoke our dynamic, thread-safe, multi-network tab allocation router
-                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    int matched_tab_idx = -1;
-                    
-                    // Search if a tab matching this specific server/channel pairing already exists in RAM
-                    for (int i = 0; i < gTabCount; i++) {
-                        if (strcmp(gTabs[i].name, target_channel.c_str()) == 0 && 
-                            strcmp(gTabs[i].server, network_context.c_str()) == 0) {
-                            matched_tab_idx = i;
-                            break;
+                    // Tokenize the server's text stream comma-by-comma on the fly
+                    int start_pos = 0;
+                    while (start_pos < net_list.length() && discovered_network_count < MAX_NETWORKS) {
+                        int comma_idx = net_list.indexOf(',', start_pos);
+                        String net_name = (comma_idx == -1) ? net_list.substring(start_pos) : net_list.substring(start_pos, comma_idx);
+                        net_name.trim();
+
+                        if (net_name.length() > 0) {
+                            // Store the discovered network cleanly in a blank RAM cell
+                            strncpy(discovered_networks[discovered_network_count], net_name.c_str(), 31);
+                            discovered_network_count++;
                         }
+                        if (comma_idx == -1) break;
+                        start_pos = comma_idx + 1;
                     }
-                    
-                    // Multi-Core Safety Gate: Protect gTabCount from array overflows and race conditions
-                    if (matched_tab_idx == -1 && gTabCount < MAX_TABS) {
-                        matched_tab_idx = gTabCount;
-                        strncpy(gTabs[matched_tab_idx].name, target_channel.c_str(), sizeof(gTabs[matched_tab_idx].name)-1);
-                        strncpy(gTabs[matched_tab_idx].server, network_context.c_str(), sizeof(gTabs[matched_tab_idx].server)-1);
-                        gTabs[matched_tab_idx].line_count = 0;
-                        gTabCount++; // Increment safely inside the lock fence
-                    }
-                    xSemaphoreGive(irc_mutex);
-                    ui_needs_redraw = true;
-                    
-                    // Route text payload rows smoothly to their dedicated workspace arrays
-                    if (matched_tab_idx != -1) {
-                        // Pass parameters down to our message buffer stack engine
-                        // (Ensure target_idx rules inside add_message_to_buffer mirror matched_tab_idx)
-                        int saved_idx = current_tab_index;
-                        current_tab_index = matched_tab_idx;
-                        add_message_to_buffer(source_nick.c_str(), chat_msg.c_str(), 0xFFFF, parsed_time);
-                        // For non-current tabs, restore index but keep redraw
-                        if (matched_tab_idx != saved_idx) ui_needs_redraw = true;
-                        // Keep current_tab_index as matched for next messages? Restore to saved to avoid tab jump?
-                        current_tab_index = saved_idx;
-                    }
+                    master_client.stop(); // Close the discovery probe safely
+                    master_scan_complete = true;
+                    Serial.printf("[NET] Dynamic discovery complete. Isolated %d networks from bouncer.\n", discovered_network_count);
                 }
             }
-            if (line.indexOf(" PRIVMSG ") == -1 && line.length() > 0) {
-                char dispNick[16] = "server";
-                if (line.charAt(0) == ':') {
-                    int sp = line.indexOf(' ');
-                    if (sp != -1) {
-                        String pref = line.substring(1, sp);
-                        int bang = pref.indexOf('!');
-                        if (bang != -1) pref = pref.substring(0, bang);
-                        strncpy(dispNick, pref.c_str(), sizeof(dispNick)-1);
+            continue;
+        }
+
+        // STEP 2: CONCURRENT PARALLEL SOCKETS ENGINE
+        for (int i = 0; i < discovered_network_count; i++) {
+            yield();
+            WiFiClientSecure &net_client = clients[i];
+
+            if (!net_client.connected()) {
+                network_authenticated[i] = false;
+                net_client.setInsecure();
+                if (net_client.connect(bnc_host, bnc_port)) {
+                    net_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
+                    net_client.print("CAP REQ :server-time cap-notify away-notify account-notify extended-join\r\n");
+                    net_client.printf("NICK %s\r\n", irc_nick);
+                    
+                    // Inline Route Injection: Appends the discovered network string on-the-fly
+                    net_client.printf("USER %s/%s 0 * :M5 Cardputer-Adv Client\r\n", bnc_user, discovered_networks[i]);
+                    net_client.print("CAP END\r\n");
+                    network_authenticated[i] = true;
+                }
+            }
+
+            if (net_client.connected() && net_client.available()) {
+                String line = net_client.readStringUntil('\n');
+                line.trim(); line.replace("\r", "");
+                // Recommended alternative: zero-init + explicit null guarantee (fixes char parsed_time[6]="00:00" truncation risk)
+                char parsed_time[6] = {0};
+                strncpy(parsed_time, "00:00", sizeof(parsed_time)-1);
+                parsed_time[sizeof(parsed_time)-1] = '\0';
+                if (line.startsWith("@")) {
+                    int time_idx = line.indexOf("time=");
+                    if (time_idx != -1) {
+                        int t_start = line.indexOf('T', time_idx);
+                        if (t_start != -1 && t_start + 6 < line.length()) {
+                            String hh_mm = line.substring(t_start + 1, t_start + 6);
+                            strncpy(parsed_time, hh_mm.c_str(), sizeof(parsed_time) - 1);
+                            parsed_time[sizeof(parsed_time)-1] = '\0';
+                        }
+                    }
+                    int msg_start = line.indexOf(' ');
+                    if (msg_start != -1) {
+                        line = line.substring(msg_start + 1);
                     }
                 }
-                add_message_to_buffer(dispNick, line.c_str(), 0xFFFF, parsed_time);
-                if (gLogQueue) {
-                    if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
-                        char dummy[128];
-                        xQueueReceive(gLogQueue, &dummy, 0);
+                
+                if (line.startsWith("PING")) {
+                    net_client.printf("PONG %s\r\n", line.substring(5).c_str());
+                    continue;
+                }
+                if (line.indexOf(" ACCOUNT ") != -1 || line.indexOf(" AWAY ") != -1) {
+                    continue;
+                }
+                
+                if (line.indexOf(" 001 ") != -1 || line.indexOf(" JOIN ") != -1) {
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        if (gTabCount == 1 && strcmp(gTabs[0].name, "~system") == 0) {
+                            strncpy(gTabs[0].server, "BNC", sizeof(gTabs[0].server)-1);
+                        }
+                        xSemaphoreGive(irc_mutex);
+                        ui_needs_redraw = true;
                     }
-                    char qLine[128];
-                    strncpy(qLine, line.c_str(), sizeof(qLine)-1);
-                    qLine[sizeof(qLine)-1] = '\0';
-                    xQueueSend(gLogQueue, &qLine, 0);
+                }
+                String network_context = String(discovered_networks[i]);
+                if (network_context.length() == 0) network_context = "BNC";
+                int slash_idx = line.indexOf('/');
+                int colon_idx = line.indexOf(':');
+                if (slash_idx != -1 && slash_idx < colon_idx) {
+                    int space_idx = line.indexOf(' ', slash_idx);
+                    if (space_idx != -1) {
+                        network_context = line.substring(slash_idx + 1, space_idx);
+                        network_context.trim();
+                    }
+                }
+
+                String target_channel = "~system";
+                String source_nick = "server";
+                String chat_msg = line;
+                
+                if (line.indexOf(" PRIVMSG ") != -1) {
+                    int priv_idx = line.indexOf(" PRIVMSG ");
+                    int msg_idx = line.indexOf(" :", priv_idx);
+                    if (priv_idx != -1 && msg_idx != -1) {
+                        target_channel = line.substring(priv_idx + 9, msg_idx);
+                        target_channel.trim();
+                        chat_msg = line.substring(msg_idx + 2);
+                        int ex_idx = line.indexOf('!');
+                        if (ex_idx != -1 && ex_idx < priv_idx) {
+                            source_nick = line.substring(1, ex_idx);
+                        }
+                    }
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        int matched_tab_idx = -1;
+                        for (int ti = 0; ti < gTabCount; ti++) {
+                            if (strcmp(gTabs[ti].name, target_channel.c_str()) == 0 && 
+                                strcmp(gTabs[ti].server, network_context.c_str()) == 0) {
+                                matched_tab_idx = ti;
+                                break;
+                            }
+                        }
+                        if (matched_tab_idx == -1 && gTabCount < MAX_TABS) {
+                            matched_tab_idx = gTabCount;
+                            strncpy(gTabs[matched_tab_idx].name, target_channel.c_str(), sizeof(gTabs[matched_tab_idx].name)-1);
+                            strncpy(gTabs[matched_tab_idx].server, network_context.c_str(), sizeof(gTabs[matched_tab_idx].server)-1);
+                            gTabs[matched_tab_idx].line_count = 0;
+                            gTabCount++;
+                        }
+                        xSemaphoreGive(irc_mutex);
+                        ui_needs_redraw = true;
+                        if (matched_tab_idx != -1) {
+                            int saved_idx = current_tab_index;
+                            current_tab_index = matched_tab_idx;
+                            add_message_to_buffer(source_nick.c_str(), chat_msg.c_str(), 0xFFFF, parsed_time);
+                            if (matched_tab_idx != saved_idx) ui_needs_redraw = true;
+                            current_tab_index = saved_idx;
+                        }
+                    }
+                }
+                if (line.indexOf(" PRIVMSG ") == -1 && line.length() > 0) {
+                    char dispNick[16] = "server";
+                    if (line.charAt(0) == ':') {
+                        int sp = line.indexOf(' ');
+                        if (sp != -1) {
+                            String pref = line.substring(1, sp);
+                            int bang = pref.indexOf('!');
+                            if (bang != -1) pref = pref.substring(0, bang);
+                            strncpy(dispNick, pref.c_str(), sizeof(dispNick)-1);
+                            dispNick[sizeof(dispNick)-1] = '\0';
+                        }
+                    }
+                    add_message_to_buffer(dispNick, line.c_str(), 0xFFFF, parsed_time);
+                    if (gLogQueue) {
+                        if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
+                            char dummy[128];
+                            xQueueReceive(gLogQueue, &dummy, 0);
+                        }
+                        char qLine[128];
+                        strncpy(qLine, line.c_str(), sizeof(qLine)-1);
+                        qLine[sizeof(qLine)-1] = '\0';
+                        xQueueSend(gLogQueue, &qLine, 0);
+                    }
                 }
             }
         }
