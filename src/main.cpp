@@ -418,14 +418,14 @@ void draw_chat_view() {
             }
         }
         
-        // Partial Erase Shield: Overwrite ONLY the bottom 15px strip where settings text leaks,
-        // keeping the main network columns intact to completely eliminate screen flicker.
+        // Partial Erase Shield to mask out dead settings rows
         canvas.fillRect(0, 120, 240, 15, 0x0000); 
         
         canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print("Arrows: Nav | Enter: Open Channel");
         canvas.pushSprite(0, 0); // Push the flicker-free composite frame to the display glass
+        
         ui_needs_redraw = false;
-        return;
+        return; // <-- CRITICAL: Halt function execution instantly to stop chat logs from drawing!
     }
     if (current_app_mode != MODE_CHAT) {
         switch (current_app_mode) {
@@ -528,6 +528,13 @@ void draw_chat_view() {
 
                 // 6px per character base resolution math
                 int dynamic_chars_budget = max_text_width / 6;
+                
+                // Safety Guardrail Shield: Force immediate loop break if character budget 
+                // drops to zero to permanently kill core processing freeze glitches
+                if (dynamic_chars_budget <= 0) {
+                    break;
+                }
+                
                 String sub_line = msg_text.substring(current_char_pos, current_char_pos + dynamic_chars_budget);
                 
                 // Draw row background bar
