@@ -74,6 +74,7 @@ char discovered_networks[MAX_NETWORKS][32] = {{0}};
 volatile uint8_t discovered_network_count = 0;
 WiFiClientSecure clients[MAX_NETWORKS];
 bool network_authenticated[MAX_NETWORKS] = {false};
+bool network_handshake_complete[MAX_NETWORKS] = {false};
 unsigned long last_input_time = 0;
 unsigned long last_server_activity = 0;
 String input_buffer;
@@ -403,7 +404,18 @@ void draw_chat_view() {
                 uint16_t txt_color = (nav_channel_select_idx == channel_print_counter) ? 0xFFFF : 0x7BEF;
                 canvas.setTextColor(txt_color);
                 canvas.setCursor(126, 24 + (channel_print_counter * 14));
-                canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), gTabs[i].name);
+                
+                // Truncation Shield: Force a maximum limit of 16 characters 
+                // to completely block layout overflows on our 240px wide viewport glass
+                char truncated_chan_name[18] = {0};
+                if (strlen(gTabs[i].name) > 16) {
+                    strncpy(truncated_chan_name, gTabs[i].name, 13);
+                    strcat(truncated_chan_name, "..."); // Append dot signifiers cleanly
+                } else {
+                    strncpy(truncated_chan_name, gTabs[i].name, 16);
+                }
+                
+                canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), truncated_chan_name);
                 channel_print_counter++;
             }
         }
@@ -1045,20 +1057,19 @@ void irc_network_task(void* pvParameters) {
 
         // STEP 2: CONCURRENT PARALLEL SOCKETS ENGINE
         for (int i = 0; i < discovered_network_count; i++) {
-            yield();
-            WiFiClientSecure &net_client = clients[i];
-
+            yield(); WiFiClientSecure &net_client = clients[i];
+            
             if (!net_client.connected()) {
                 network_authenticated[i] = false;
+                network_handshake_complete[i] = false;
                 net_client.setInsecure();
+                
                 if (net_client.connect(bnc_host, bnc_port)) {
                     net_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
-                    net_client.print("CAP REQ :server-time cap-notify away-notify account-notify extended-join\r\n");
+                    net_client.print("CAP REQ :server-time\r\n");
                     net_client.printf("NICK %s\r\n", irc_nick);
-                    
-                    // Inline Route Injection: Appends the discovered network string on-the-fly
-                    net_client.printf("USER %s/%s 0 * :M5 Cardputer-Adv Client\r\n", bnc_user, discovered_networks[i]);
-                    net_client.print("CAP END\r\n");
+                    net_client.printf("USER %s/%s 0 * :M5 Client\r\n", bnc_user, discovered_networks[i]);
+                    // DO NOT send CAP END here. Let the bouncer handle the cap request negotiation.
                     network_authenticated[i] = true;
                 }
             }
@@ -1086,11 +1097,20 @@ void irc_network_task(void* pvParameters) {
                     }
                 }
                 
-                if (line.startsWith("PING")) {
-                    net_client.printf("PONG %s\r\n", line.substring(5).c_str());
+                if (line.startsWith("PING")) { 
+                    net_client.printf("PONG %s\r\n", line.substring(5).c_str()); 
+                    continue; 
+                }
+
+                // Intercept the Welcome token (001) or End of MOTD (376) to fire CAP END safely
+                if (!network_handshake_complete[i] && (line.indexOf(" 001 ") != -1 || line.indexOf(" 376 ") != -1 || line.indexOf("CAP * ACK") != -1)) {
+                    net_client.print("CAP END\r\n");
+                    network_handshake_complete[i] = true;
+                    Serial.printf("[NET-SYNC] Handshake finalized for network: %s. Releasing channels.\n", discovered_networks[i]);
                     continue;
                 }
-                // LAYER A: DYNAMIC CHANNEL SYNC - JOIN EVENT EXTRACTION
+
+                // --- LIVE CHANNEL SYNC - JOIN EVENT EXTRACTION
                 if (line.indexOf(" JOIN ") != -1) {
                     int join_idx = line.indexOf(" JOIN ");
                     String disc_chan = line.substring(join_idx + 6);
@@ -1328,7 +1348,7 @@ void setup() {
     gLogQueue = xQueueCreate(20, sizeof(char) * 128);
     gTabCount = 1; current_tab_index = 0; memset(&gTabs, 0, sizeof(gTabs));
     strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name)-1);
-    strncpy(gTabs[0].server, "ClientCore", sizeof(gTabs[0].server)-1);
+    strncpy(gTabs[0].server, "CC", sizeof(gTabs[0].server)-1); // Clean local system node identifier
     if (irc_mutex) xSemaphoreGive(irc_mutex);
 
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
