@@ -68,7 +68,7 @@ int use_12_hour_format  = 1;
 WiFiClientSecure client;
 unsigned long last_input_time = 0;
 unsigned long last_server_activity = 0;
-char input_buffer[256] = {0};
+String input_buffer;
 int input_buffer_len = 0;
 int input_buffer_cursor = 0;
 
@@ -468,89 +468,70 @@ void draw_chat_view() {
     // 4. HARDWARE DISPLAY GLASS DIRECT REFRESH RENDER OVERLAYS
     canvas.pushSprite(0, 12);
     
-    // Snapshot tab names under mutex to avoid race with irc_network_task tab discovery
-    char snap_server[32] = {0}, snap_name[32] = {0};
-    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-        if (gTabCount > 0 && current_tab_index < gTabCount) {
-            strncpy(snap_server, gTabs[current_tab_index].server, sizeof(snap_server)-1);
-            strncpy(snap_name, gTabs[current_tab_index].name, sizeof(snap_name)-1);
-        }
-        xSemaphoreGive(irc_mutex);
-    } else {
-        if (gTabCount > 0 && current_tab_index < gTabCount) {
-            strncpy(snap_server, gTabs[current_tab_index].server, sizeof(snap_server)-1);
-            strncpy(snap_name, gTabs[current_tab_index].name, sizeof(snap_name)-1);
-        }
-    }
-    // Header Navbar Row (Top 12px Glass) - Server-prefixed tab tags
+    // 1. CLEAR AND DRAW BACKGROUND HEADER BAR (Y=0 TO Y=12)
     M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
-    M5Cardputer.Display.setTextColor(0x7BEF);
+    
+    // 2. LEFT SIDE SYSTEM ROOM ANCHORS
+    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); // Slate grey brackets
     M5Cardputer.Display.setCursor(2, 2);
-    M5Cardputer.Display.print("[");
-    M5Cardputer.Display.setTextColor(0xFFFF);
-    if (strcmp(snap_name, "~mentions") == 0) {
-        // Dedicated pings collector tab natively rendered as [ClientCore/~mentions]
-        M5Cardputer.Display.print("ClientCore");
-        M5Cardputer.Display.setTextColor(0x7BEF);
-        M5Cardputer.Display.print("/");
-        M5Cardputer.Display.setTextColor(0xFFFF);
-        M5Cardputer.Display.print("~mentions");
-    } else {
-        // Format: [ServerName/ChannelName] with low-contrast terminal grey divider
-        M5Cardputer.Display.print(snap_server);
-        M5Cardputer.Display.setTextColor(0x7BEF);
-        M5Cardputer.Display.print("/");
-        M5Cardputer.Display.setTextColor(0xFFFF);
-        M5Cardputer.Display.print(snap_name);
-    }
-    M5Cardputer.Display.setTextColor(0x7BEF);
-    M5Cardputer.Display.print("]");
+    M5Cardputer.Display.printf("[%s]", gTabs[current_tab_index].server);
     
-    // Right-Aligned Telemetry Layout Hud Block Anchors
-    M5Cardputer.Display.setCursor(145, 2);
-    if (current_audio == 0) { M5Cardputer.Display.setTextColor(0xF800); M5Cardputer.Display.print("[MUTE]"); }
-    else { M5Cardputer.Display.setTextColor(0x07E0); M5Cardputer.Display.print("[+]"); }
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // Crisp white channel titles
+    M5Cardputer.Display.setCursor(68, 2);              // Aligns with the middle log vertical line
+    M5Cardputer.Display.print(gTabs[current_tab_index].name);
     
-    // Dynamic Wireless HUD Status Indicators at anchor X=165
-    M5Cardputer.Display.setCursor(165, 2);
+    // 3. RIGHT SIDE TELEMETRY HUD ANCHORS (STRICT HORIZONTAL SEPARATION)
+    
+    // Anchor A: Wireless Network Link Status (X=135)
+    M5Cardputer.Display.setCursor(135, 2);
     if (WiFi.status() != WL_CONNECTED) {
-        M5Cardputer.Display.setTextColor(0xF800);
+        M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
         M5Cardputer.Display.print("[DISC]");
-        set_led_mode(9);
     } else {
-        int32_t rssi = WiFi.RSSI();
-        M5Cardputer.Display.setTextColor(0x07E0);
+        M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
         M5Cardputer.Display.print("[WIFI]");
-        if (rssi < -80) set_led_mode(8);
     }
     
-    M5Cardputer.Display.setTextColor(0xFFFF);
-    M5Cardputer.Display.setCursor(180, 2);
+    // Anchor B: Audio Privacy State Flag (X=168)
+    M5Cardputer.Display.setCursor(168, 2);
+    if (current_audio == 0) {
+        M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
+        M5Cardputer.Display.print("[MUTE]");
+    } else {
+        M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
+        M5Cardputer.Display.print("[+]");
+    }
+    
+    // Anchor C: Local System Digital Clock (X=195)
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // High-visibility White
+    M5Cardputer.Display.setCursor(195, 2);
     M5Cardputer.Display.print("00:00");
     
+    // Anchor D: Hardware Calibrated Battery Percentage (X=212)
     M5Cardputer.Display.setCursor(212, 2);
-    int display_bat = (int)get_calibrated_battery_percentage();
-    M5Cardputer.Display.printf("[%d%%]", display_bat); // Clean text-driven whole percents
+    int active_bat = (int)get_calibrated_battery_percentage();
+    M5Cardputer.Display.printf("[%d%%]", active_bat);
     
-    // Footer Typing Input Row (Bottom 14px Glass)
+    // Draw flat black footer background bar (from Y=121 to screen edge Y=135)
     M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
-    M5Cardputer.Display.drawFastHLine(0, 121, 240, 0x7BEF);
-    M5Cardputer.Display.setTextColor(0xFD20);
-    M5Cardputer.Display.setCursor(2, 124);
+    M5Cardputer.Display.drawFastHLine(0, 121, 240, 0x7BEF); // Mid-contrast slate divider
+    
+    // Draw the bright amber/orange command prompt indicator tag
+    M5Cardputer.Display.setTextColor(0xFD20, 0x0000); // Enforce clear Amber on Black back-color
+    M5Cardputer.Display.setCursor(4, 124);            // Shift slightly out from the screen glass bezel wall
     M5Cardputer.Display.print("> ");
-    // HARD SCROLL MASK: small rectangular color overlay matching background tone over first 12 horizontal pixels as clean scroll fade boundary edge
-    M5Cardputer.Display.fillRect(0, 121, 12, 14, 0x0000);
-    // PACKET COUNTDOWN METRICS: remaining against 400, dimmed slate grey 0x7BEF at trailing edge
-    {
-        int current_input_len = 0; // zero placeholder-free: reflects actual typed buffer length (0 when empty)
-        int remaining = 400 - current_input_len;
-        if (remaining < 0) remaining = 0;
-        char cntBuf[8];
-        snprintf(cntBuf, sizeof(cntBuf), "%d", remaining);
-        M5Cardputer.Display.setTextColor(0x7BEF);
-        M5Cardputer.Display.setCursor(240 - 28, 124);
-        M5Cardputer.Display.print(cntBuf);
-    }
+    
+    // Print the live interactive user typing input string characters
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0000); // Crisp White text
+    M5Cardputer.Display.print(input_buffer.c_str());
+    
+    // Place a small rectangular background overlay color mask to serve as a clean text scroll fade boundary edge
+    M5Cardputer.Display.fillRect(215, 122, 25, 13, 0x0000);
+    
+    // Draw the remaining numerical characters indicator budget using micro-fonts
+    M5Cardputer.Display.setTextColor(0x7BEF); // Dimmed slate grey
+    M5Cardputer.Display.setCursor(218, 124);
+    M5Cardputer.Display.printf("%03d", 400 - input_buffer.length());
     
     ui_needs_redraw = false;
 }
@@ -564,6 +545,16 @@ void handle_keyboard_inputs() {
 
     // --- FORM INPUT HOTKEY INTERCEPTORS: menu active check at absolute top ---
     auto status = M5Cardputer.Keyboard.keysState();
+    if (status.del && input_buffer.length() > 0) {
+        input_buffer.remove(input_buffer.length() - 1);
+        ui_needs_redraw = true; // <-- Force unlock redraw
+    }
+    for (auto c : status.word) {
+        if (input_buffer.length() < 400) {
+            input_buffer += c;
+            ui_needs_redraw = true; // <-- Force unlock redraw on every keystroke
+        }
+    }
     if (status.fn && M5Cardputer.Keyboard.isKeyPressed('p')) { current_app_mode = MODE_SETTINGS; menu_selection_idx = 0; ui_needs_redraw = true; return; }
     if (current_app_mode != MODE_CHAT) {
         bool is_alt_menu = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
@@ -655,31 +646,22 @@ void handle_keyboard_inputs() {
         return;
     }
     if (M5Cardputer.Keyboard.isKeyPressed(0xB9)) { // Physical native Tab key row intercept (0xB9) - Inline Nickname Autocomplete Tracker
-        // Backup strings parser: look backward from cursor to capture partial word fragment
-        int frag_start = input_buffer_cursor;
-        while (frag_start > 0 && input_buffer[frag_start-1] != ' ' && input_buffer[frag_start-1] != ':') frag_start--;
-        int frag_len = input_buffer_cursor - frag_start;
+        int frag_start = input_buffer.length();
+        while (frag_start > 0 && input_buffer.charAt(frag_start-1) != ' ' && input_buffer.charAt(frag_start-1) != ':') frag_start--;
+        int frag_len = input_buffer.length() - frag_start;
         if (frag_len > 0) {
-            char fragment[32] = {0};
-            memcpy(fragment, &input_buffer[frag_start], frag_len);
-            fragment[frag_len] = '\0';
-            // Sweep current tab's active message list structures to collect nicknames
-            // Search gTabs[current_tab_index].lines for prefix matches
+            String fragment = input_buffer.substring(frag_start);
             for (int li = 0; li < gTabs[current_tab_index].line_count; li++) {
                 const char* cand = gTabs[current_tab_index].lines[li].nick;
                 if (cand[0]==0) continue;
-                if (strncasecmp(cand, fragment, frag_len)==0) {
-                    // Expand inline inside input_buffer vector array automatically
+                if (strncasecmp(cand, fragment.c_str(), frag_len)==0) {
                     int cand_len = strlen(cand);
-                    int tail_len = input_buffer_len - input_buffer_cursor;
                     bool at_start = (frag_start==0);
-                    int extra = at_start ? 2 : 0; // ": " accent if at absolute start
-                    if (input_buffer_len + (cand_len - frag_len) + extra < (int)sizeof(input_buffer)) {
-                        memmove(&input_buffer[frag_start + cand_len + extra], &input_buffer[input_buffer_cursor], tail_len+1);
-                        memcpy(&input_buffer[frag_start], cand, cand_len);
-                        if (at_start) { input_buffer[frag_start+cand_len]=':'; input_buffer[frag_start+cand_len+1]=' '; }
-                        input_buffer_len += (cand_len - frag_len) + extra;
-                        input_buffer_cursor = frag_start + cand_len + extra;
+                    String before = input_buffer.substring(0, frag_start);
+                    String replacement = String(cand);
+                    if (at_start) replacement += ": ";
+                    if (before.length() + replacement.length() < 400) {
+                        input_buffer = before + replacement;
                     }
                     break;
                 }
@@ -690,13 +672,11 @@ void handle_keyboard_inputs() {
     }
     // --- ADVANCED SLASH COMMAND INTERPRETER: check status.enter to process input line ---
     if (status.enter) {
-        // Ensure input_buffer is null-terminated at len
-        input_buffer[input_buffer_len] = '\0';
-        if (input_buffer_len > 0) {
+        if (input_buffer.length() > 0) {
             // Robust C-string parser block to check if input_buffer begins with '/'
-            if (input_buffer[0] == '/') {
+            if (input_buffer.charAt(0) == '/') {
                 char cmdCopy[256];
-                strncpy(cmdCopy, input_buffer, sizeof(cmdCopy)-1);
+                strncpy(cmdCopy, input_buffer.c_str(), sizeof(cmdCopy)-1);
                 cmdCopy[sizeof(cmdCopy)-1]='\0';
                 char* sp = strchr(cmdCopy, ' ');
                 char* args = NULL;
@@ -731,7 +711,7 @@ void handle_keyboard_inputs() {
                     client.printf("NICK %s\r\n", new_nick_string);
                 } else {
                     // Unknown slash -> send raw without slash
-                    client.printf("%s\r\n", input_buffer+1);
+                    client.printf("%s\r\n", input_buffer.c_str()+1);
                 }
             } else {
                 // Normal chat: send as PRIVMSG to current tab channel
@@ -739,34 +719,13 @@ void handle_keyboard_inputs() {
                     char current_tab_name[32];
                     strncpy(current_tab_name, gTabs[current_tab_index].name, sizeof(current_tab_name)-1);
                     // Avoid sending to system mentions as target; fallback to PRIVMSG
-                    client.printf("PRIVMSG %s :%s\r\n", current_tab_name, input_buffer);
+                    client.printf("PRIVMSG %s :%s\r\n", current_tab_name, input_buffer.c_str());
                 }
             }
             // Clear input buffer after send
-            input_buffer[0]='\0'; input_buffer_len=0; input_buffer_cursor=0;
+            input_buffer = "";
             ui_needs_redraw = true;
         }
-        return;
-    }
-    // Regular character input assembly for input_buffer (when in MODE_CHAT)
-    if (current_app_mode == MODE_CHAT && status.word.size() > 0) {
-        for (size_t ci=0; ci<status.word.size(); ci++) {
-            char ch = status.word[ci];
-            if (ch=='\n' || ch=='\r') continue;
-            if (ch=='\b' || ch==127) {
-                if (input_buffer_len>0 && input_buffer_cursor>0) {
-                    memmove(&input_buffer[input_buffer_cursor-1], &input_buffer[input_buffer_cursor], input_buffer_len - input_buffer_cursor +1);
-                    input_buffer_len--; input_buffer_cursor--;
-                }
-            } else if (input_buffer_len < (int)sizeof(input_buffer)-2 && ch>=32 && ch<=126) {
-                memmove(&input_buffer[input_buffer_cursor+1], &input_buffer[input_buffer_cursor], input_buffer_len - input_buffer_cursor +1);
-                input_buffer[input_buffer_cursor]=ch;
-                input_buffer_len++; input_buffer_cursor++;
-                input_buffer[input_buffer_len]='\0';
-            }
-        }
-        // Handle left/right cursor movement via word navigation if needed
-        ui_needs_redraw = true;
         return;
     }
 }
