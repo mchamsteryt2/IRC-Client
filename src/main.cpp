@@ -359,30 +359,36 @@ void draw_chat_view() {
             }
             case MODE_BOUNCER: {
                 canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x07E0); canvas.setCursor(10, 5); // Emerald Green Tech Header
+                canvas.setTextColor(0x07E0); canvas.setCursor(10, 8);
                 canvas.print("--- BOUNCER CONNECTION SCHEMAS ---");
                 canvas.setTextColor(0xFFFF);
-                canvas.setCursor(10, 24); canvas.printf("%s 1. Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), bnc_host);
-                canvas.setCursor(10, 38); canvas.printf("%s 2. Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
-                canvas.setCursor(10, 52); canvas.printf("%s 3. Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), bnc_user);
-                canvas.setCursor(10, 66); canvas.printf("%s 4. Password Token: *******", (menu_selection_idx == 3 ? ">" : " "));
-                canvas.setCursor(10, 80); canvas.printf("%s 5. Synchronize Now: [ EXPORT ]", (menu_selection_idx == 4 ? ">" : " "));
-                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
-                canvas.pushSprite(0, 12);
+                
+                // Explicitly cast bnc character array structures safely
+                canvas.setCursor(10, 26); canvas.printf("%s 1. Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
+                canvas.setCursor(10, 40); canvas.printf("%s 2. Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
+                canvas.setCursor(10, 54); canvas.printf("%s 3. Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
+                canvas.setCursor(10, 68); canvas.printf("%s 4. Password Token: *******", (menu_selection_idx == 3 ? ">" : " "));
+                canvas.setCursor(10, 82); canvas.printf("%s 5. Synchronize Now: [ EXPORT ]", (menu_selection_idx == 4 ? ">" : " "));
+                
+                canvas.setCursor(10, 120); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Next Page");
+                canvas.pushSprite(0, 0);
                 ui_needs_redraw = false;
                 return;
             }
             case MODE_WIFI: {
                 canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x5A1F); canvas.setCursor(10, 5); // Retro Cyberpunk Violet/Blue Header
+                canvas.setTextColor(0x5A1F); canvas.setCursor(10, 8);
                 canvas.print("--- WI-FI CONFIG MANAGER ---");
                 canvas.setTextColor(0xFFFF);
-                canvas.setCursor(10, 24); canvas.printf("%s 1. Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), wifi_ssid);
-                canvas.setCursor(10, 38); canvas.printf("%s 2. Network Pass: *******", (menu_selection_idx == 1 ? ">" : " "));
-                canvas.setCursor(10, 52); canvas.printf("%s 3. Scan for Airwaves: [ SCAN APs ]", (menu_selection_idx == 2 ? ">" : " "));
-                canvas.setCursor(10, 66); canvas.printf("%s 4. Force Connect: [ INITIALIZE ]", (menu_selection_idx == 3 ? ">" : " "));
-                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
-                canvas.pushSprite(0, 12);
+                
+                // Explicitly cast raw pointers to stable string pointers
+                canvas.setCursor(10, 26); canvas.printf("%s 1. Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
+                canvas.setCursor(10, 40); canvas.printf("%s 2. Network Pass: *******", (menu_selection_idx == 1 ? ">" : " "));
+                canvas.setCursor(10, 54); canvas.printf("%s 3. Scan for Airwaves: [ SCAN APs ]", (menu_selection_idx == 2 ? ">" : " "));
+                canvas.setCursor(10, 68); canvas.printf("%s 4. Force Connect: [ INITIALIZE ]", (menu_selection_idx == 3 ? ">" : " "));
+                
+                canvas.setCursor(10, 120); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
+                canvas.pushSprite(0, 0);
                 ui_needs_redraw = false;
                 return;
             }
@@ -452,22 +458,26 @@ void draw_chat_view() {
     // 4. HARDWARE DISPLAY GLASS DIRECT REFRESH RENDER OVERLAYS
     canvas.pushSprite(0, 12);
     
-    // 1. CLEAR AND DRAW BACKGROUND HEADER BAR (Y=0 TO Y=12)
+    // Draw background header block bar safely across the full width
     M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
     
-    // 2. LEFT SIDE SYSTEM ROOM ANCHORS
-    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); // Slate grey brackets
+    // Draw Server tag context anchor in low-profile slate grey
+    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841);
     M5Cardputer.Display.setCursor(2, 2);
     M5Cardputer.Display.printf("[%s]", gTabs[current_tab_index].server);
     
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // Crisp white channel titles
-    M5Cardputer.Display.setCursor(68, 2);              // Aligns with the middle log vertical line
-    M5Cardputer.Display.print(gTabs[current_tab_index].name);
+    // Draw Channel text title space in crisp high-visibility White
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
+    M5Cardputer.Display.setCursor(54, 2); // Perfectly positioned
     
-    // 3. RIGHT SIDE TELEMETRY HUD ANCHORS (STRICT HORIZONTAL SEPARATION)
+    // Safety Truncation: Copy active room name string up to a strict limit of 10 characters 
+    // to physically block it from ever expanding into the right-side metrics space
+    char truncated_name[12] = {0};
+    strncpy(truncated_name, gTabs[current_tab_index].name, 10);
+    M5Cardputer.Display.print(truncated_name);
     
-    // Anchor A: Wireless Network Link Status (X=135)
-    M5Cardputer.Display.setCursor(135, 2);
+    // Anchor A: Wireless Network Link Status (X=125)
+    M5Cardputer.Display.setCursor(125, 2);
     if (WiFi.status() != WL_CONNECTED) {
         M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
         M5Cardputer.Display.print("[DISC]");
@@ -476,8 +486,8 @@ void draw_chat_view() {
         M5Cardputer.Display.print("[WIFI]");
     }
     
-    // Anchor B: Audio Privacy State Flag (X=168)
-    M5Cardputer.Display.setCursor(168, 2);
+    // Anchor B: Audio Privacy State Flag (X=162)
+    M5Cardputer.Display.setCursor(162, 2);
     if (current_audio == 0) {
         M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
         M5Cardputer.Display.print("[MUTE]");
@@ -486,9 +496,9 @@ void draw_chat_view() {
         M5Cardputer.Display.print("[+]");
     }
     
-    // Anchor C: Local System Digital Clock (X=195)
+    // Anchor C: Local System Digital Clock (X=192)
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // High-visibility White
-    M5Cardputer.Display.setCursor(195, 2);
+    M5Cardputer.Display.setCursor(192, 2);
     M5Cardputer.Display.print("00:00");
     
     // Anchor D: Hardware Calibrated Battery Percentage (X=212)
@@ -785,6 +795,34 @@ void setup() {
     } else {
         purge_old_logs();
         load_settings_from_sd(); // Dynamically parse configuration on normal boots
+    }
+    
+    // 1. Initialize the physical ESP32 radio chip
+    WiFi.disconnect(true); // Force wipe any old, hung wireless states
+    vTaskDelay(pdMS_TO_TICKS(100));
+    WiFi.mode(WIFI_STA);   // Set to standard Station mode
+    
+    // Only attempt connection if your SD card settings successfully filled the buffers
+    if (strlen(wifi_ssid) > 0) {
+        Serial.printf("[WIFI] Connecting to target SSID: %s\n", wifi_ssid);
+        WiFi.begin((const char*)wifi_ssid, (const char*)wifi_pass);
+        
+        // Wait up to 10 seconds for a clean local IP assignment
+        int timeout_counter = 0;
+        while (WiFi.status() != WL_CONNECTED && timeout_counter < 20) {
+            yield();
+            vTaskDelay(pdMS_TO_TICKS(500));
+            timeout_counter++;
+            
+            // Toggle your top-right Stamp-S3A LED to Mode 9 (Orange) to show active network tuning
+            set_led_mode(9); 
+        }
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("[WIFI] Connected cleanly! Assigned IP: %s\n", WiFi.localIP().toString().c_str());
+    } else {
+        Serial.println("[WIFI-WARN] Connection timed out. Booting straight to offline terminal.");
     }
     
     // Populate base index room definitions cleanly before spawning task checkers
