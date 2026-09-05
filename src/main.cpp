@@ -407,7 +407,7 @@ static bool parseServerTimeHHMM(const char* tags, char* out6){
   out6[0]='\0';
   // lightweight loop over ';' separated tags
   const char* p = tags;
-  while(p && *p){
+  while(p && *p){ yield();
     // find next ';'
     const char* semi = strchr(p, ';');
     size_t tokLen = semi ? (size_t)(semi - p) : strlen(p);
@@ -693,7 +693,8 @@ static void loadConfig(){
   if(!f){ xSemaphoreGive(irc_mutex); logStatus("Config open fail"); return; }
   char line[256];
   while(f.available()){
-    int len=0; while(f.available() && len<(int)sizeof(line)-1){ char c=(char)f.read(); if(c=='\r') continue; if(c=='\n') break; line[len++]=c; }
+    yield(); vTaskDelay(pdMS_TO_TICKS(1));
+    int len=0; while(f.available() && len<(int)sizeof(line)-1){ char c=(char)f.read(); if(c=='\r') continue; if(c=='\n') break; line[len++]=c; yield(); }
     line[len]='\0';
     char* s=line; trim(s);
     if(s[0]=='\0' || s[0]=='#' || s[0]==';') continue;
@@ -721,7 +722,7 @@ static void loadConfig(){
     else if(strcmp(k,"bnc_user")==0) { strncpy(bnc_user, v, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser,v,sizeof(gCfg.bncUser)); }
     else if(strcmp(k,"bnc_net")==0) { strncpy(bnc_net, v, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
     else if(strcmp(k,"bnc_pass")==0) { strncpy(bnc_pass, v, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass,v,sizeof(gCfg.bncPass)); }
-    else if(strcmp(k,"bnc_host")==0) bnc_host = String(v);
+    else if(strcmp(k,"bnc_host")==0) { bnc_host = String(v); /* keep String for config compat, hot paths use char copy via safeCopy */ }
     else if(strcmp(k,"bnc_port")==0) bnc_port = atoi(v);
     else if(strcmp(k,"bnc_network")==0) safeCopy(gCfg.bncNetwork,v,sizeof(gCfg.bncNetwork));
     else if(strcmp(k,"bnc_client")==0) safeCopy(gCfg.bncClient,v,sizeof(gCfg.bncClient));
@@ -803,6 +804,7 @@ static void trigger_config_backup(){
   if(src && dst){
     uint8_t buf[128];
     while(src.available()){
+      yield(); vTaskDelay(pdMS_TO_TICKS(1));
       size_t n = src.read(buf, sizeof(buf));
       if(n>0) dst.write(buf, n);
     }
@@ -839,6 +841,7 @@ static void sweepRecursive(const char* base, int depth){
   if(!dir.isDirectory()){ dir.close(); return; }
   File e=dir.openNextFile();
   while(e){
+    yield(); vTaskDelay(pdMS_TO_TICKS(1));
     char name[96]; safeCopy(name,e.name(),sizeof(name));
     const char* bn=strrchr(name,'/'); if(bn) bn++; else bn=name;
     if(e.isDirectory()){
@@ -2390,8 +2393,9 @@ void irc_network_task(void* pvParameters){ netTask(pvParameters); }
 
 // SPI BUS HARDWARE CONFLICT PROTECTION - Core 0 dedicated SD logging task
 // Completely halts and waits for Core 1 SPI screen canvas flushes via irc_mutex
-static void add_message_to_buffer(const char* system, const char* msg, int color){ (void)system; (void)color; if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); ui_needs_redraw = true; xSemaphoreGive(irc_mutex); }
-static void add_message_to_buffer(const char* msg){ if(!irc_mutex || xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))!=pdTRUE) return; logStatus(msg); ui_needs_redraw = true; xSemaphoreGive(irc_mutex); }
+static void add_message_to_buffer(const char* system, const char* msg, int color){ (void)system; (void)color; // lock order: only gLogQueue.mtx, not irc_mutex to avoid inversion
+ logStatus(msg); if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){ ui_needs_redraw = true; xSemaphoreGive(irc_mutex); } else { ui_needs_redraw = true; } }
+static void add_message_to_buffer(const char* msg){ logStatus(msg); if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){ ui_needs_redraw = true; xSemaphoreGive(irc_mutex); } else { ui_needs_redraw = true; } }
 static void logTask(void* arg){
   (void)arg;
   for(;;){
@@ -2703,13 +2707,13 @@ void setup(){
   M5Cardputer.Display.fillScreen(UI_BG);
   // Create global mutex IMMEDIATELY after hardware init
   irc_mutex = xSemaphoreCreateMutex();
-  gTabsMutex = irc_mutex;
+  gTabsMutex = xSemaphoreCreateMutex(); // separate to avoid priority inversion lock order
     gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
 
   // Safe Mode single-pass check - robust BtnA via TCA8418 (ignore floating GPIO0 strapping) - require intentional hold
   Serial.println("[BOOSTER-LOG] Safe Mode initialization check...");
   pinMode(0, INPUT_PULLUP);
-  vTaskDelay(pdMS_TO_TICKS(10)); yield();
+  vTaskDelay(pdMS_TO_TICKS(10)); yield(); Wire.setTimeOut(50);
   M5Cardputer.update();
   // Only BtnA via TCA8418 counts - raw GPIO0 floats low on Cardputer Adv and causes spurious safe mode
   int btnConfirm = 0;
@@ -2722,6 +2726,8 @@ void setup(){
       gTabCount = 1;
       current_tab_index = 0;
       memset(&gTabs[0], 0, sizeof(gTabs[0]));
+      memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
+      strncpy(active_networks[0], "None", sizeof(active_networks[0])-1); active_networks_count = 1;
       strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
       strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
       gTabs[0].type = TAB_STATUS;
@@ -2755,16 +2761,19 @@ void setup(){
   canvas.setTextSize(1);
   canvas.setTextWrap(false);
   canvas.deleteSprite();
-  canvas.createSprite(240, 109);
-  canvas.setColorDepth(8);
-  if(canvas.width()==240 && canvas.height()==109){ canvas.fillScreen(UI_BG); gCanvasReady=true; } else { gCanvasReady=false; }
+  // Heap check: need 26KB contiguous 8-bit for 240x109, fail gracefully to avoid pushSprite hard fault
+  if(heap_caps_get_free_size(MALLOC_CAP_8BIT) < 30000){ gCanvasReady=false; } else {
+    canvas.createSprite(240, 109);
+    canvas.setColorDepth(8);
+    if(canvas.width()==240 && canvas.height()==109){ canvas.fillScreen(UI_BG); gCanvasReady=true; } else { gCanvasReady=false; }
+  }
   // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
   draw_chat_view();
-  // Intermediate init - SPI, SD, config, etc. (all after mutex, before network)
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  // Intermediate init - SPI, SD, config, etc. (all after mutex, before network) - guarded in safe mode to avoid SPI bus contention with ST7789
   if(!gSafeBoot){
-    gSdReady = SD.begin(12, SPI, 16000000);
+    SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+    gSdReady = SD.begin(12, SPI, 8000000); // 8MHz for 80MHz downclock stability (16MHz violates 80/4)
   } else {
     gSdReady = false;
   }
@@ -2772,6 +2781,9 @@ void setup(){
   ensureStatus();
   setCpuFrequencyMhz(240);
   if(!gSafeBoot && gSdReady) sweepOldLogs();
+  if(!safe_mode_active && WiFi.status()==WL_CONNECTED){ // guard sntp DNS blocking 30s in safe mode
+    configTime(0,0,"pool.ntp.org","time.nist.gov");
+  }
   gLastBattPoll = millis();
   gBattVoltage = readBatteryVoltage();
   // Fix black screen: apply brightness AFTER config load, default to 10 if still 0
