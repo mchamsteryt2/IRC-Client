@@ -3034,6 +3034,7 @@ static void serviceWifi(){
 // Setup - includes safe-boot check, 16MHz SPI, splash, purge, canvas, tasks
 // ---------------------------------------------------------------------------
 void setup(){
+  safe_mode_active = false;
   // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top per spec
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -3092,28 +3093,14 @@ void setup(){
       yield();
       vTaskDelay(pdMS_TO_TICKS(10));
       M5Cardputer.update(); // Poll the I2C matrix registers cleanly
+      if (!M5Cardputer.Keyboard.isPressed()) { safe_mode_active = false; }
       // Check if the user is holding down the native Backspace key during the splash screen
       if (M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed('\b')) {
           safe_mode_active = true;
       }
   }
   xSemaphoreGive(irc_mutex);
-  if (safe_mode_active) {
-      gTabCount = 1;
-      current_tab_index = 0;
-      memset(&gTabs, 0, sizeof(Tab));
-      strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
-      strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
-      xSemaphoreGive(irc_mutex);
-      ui_needs_redraw = true;
-      neopixelWrite(LED_PIN, 60, 0, 0); // pure Red color565(60,0,0) - no green/blue leakage
-      M5Cardputer.Display.setCursor(8, 82); M5Cardputer.Display.print(" SAFE MODE ");
-  } else {
-    Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
-    gSafeBoot = false;
-    M5Cardputer.Display.fillRect(8,70, 180, 20, 0x0000);
-    ui_needs_redraw = true; draw_chat_view();
-  }
+  // Safe mode allocation moved to bottom
   // Intermediate init - SPI, SD, config, etc. (all after mutex, before network) - guarded in safe mode to avoid SPI bus contention with ST7789
   if(!gSafeBoot){
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -3147,6 +3134,30 @@ void setup(){
     // Wi-Fi client initialization loop - non-blocking, no  else {
     logStatus("Safe Mode: net tasks bypassed");
   }
+  if (safe_mode_active) {
+      gTabCount = 1;
+      current_tab_index = 0;
+      memset(&gTabs, 0, sizeof(gTabs));
+      strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
+      strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
+      gSafeBoot = true;
+      xSemaphoreGive(irc_mutex);
+      ui_needs_redraw = true;
+      setDeepCrimson();
+  } else {
+      gSafeBoot = false;
+      // Standard non-safe mode allocations continue here...
+  }
+  if (!safe_mode_active) {
+      // Force standard multi-network boot states if the flag wasn't explicitly tripped
+      if (gTabCount == 0) {
+          gTabCount = 1;
+          current_tab_index = 0;
+          memset(&gTabs, 0, sizeof(gTabs));
+          strncpy(gTabs[0].name, "~system", sizeof(gTabs[0].name) - 1);
+          strncpy(gTabs[0].server, "Bouncer", sizeof(gTabs[0].server) - 1);
+      }
+  }
   // Restore background tasks with safe_mode guard - queues already init before safe_mode check
   if (!safe_mode_active) {
     if (!gNetTaskHandle) xTaskCreatePinnedToCore(netTask, "netTask", 8192, NULL, 1, &gNetTaskHandle, 0);
@@ -3178,6 +3189,7 @@ void custom_ui_loop_task(void* pvParameters) {
                 xSemaphoreGive(irc_mutex);
             }
         }
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
 
