@@ -669,8 +669,8 @@ void handle_keyboard_inputs() {
     }
     
     // Layer B: Master Emergency Escape Back to Main Chat Workspace
-    // Triggers instantly on either (Alt + Backspace [0x08]) OR a single tap of the physical Esc key (0x1B)
-    if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed(0x1B)) {
+    // Captures (Alt + Backspace [0x08]) OR the literal physical Esc key char mapping ('`')
+    if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
         // Auto-export updated parameters safely to card storage upon form exit
         if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_WIFI) {
             if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -687,7 +687,7 @@ void handle_keyboard_inputs() {
             }
         }
         current_app_mode = MODE_CHAT;
-        input_buffer = ""; // Cleanly flush any stray menu layout characters out of RAM
+        input_buffer = ""; // Cleanly flush stray menu characters out of memory registers
         ui_needs_redraw = true;
         return;
     }
@@ -759,55 +759,51 @@ void handle_keyboard_inputs() {
                 return;
             }
         }
-        // Layer F: One-Handed Menu Navigation Pad (Active ONLY inside Menu modes)
-        if (current_app_mode != MODE_CHAT) {
-            // 1. Vertical List Scrolling (Single-press Comma and Period)
-            if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Comma acts as UP
+    // Layer F: One-Handed Menu Navigation Pad (Active inside Menu/Navigator modes)
+    if (current_app_mode != MODE_CHAT) {
+        // Vertical List Selection Scrolling (Single-press Comma=UP, Period=DOWN)
+        if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Comma = UP Arrow
+            if (current_app_mode == MODE_NAVIGATOR) {
+                if (nav_channel_select_idx > 0) { nav_channel_select_idx--; ui_needs_redraw = true; }
+            } else {
                 if (menu_selection_idx > 0) { menu_selection_idx--; ui_needs_redraw = true; }
-                return;
             }
-            if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Period acts as DOWN
-                int max_limit = 3;
-                if (current_app_mode == MODE_SETTINGS) max_limit = 5;
-                if (current_app_mode == MODE_BOUNCER)  max_limit = 4;
-                
+            return;
+        }
+        if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Period = DOWN Arrow
+            if (current_app_mode == MODE_NAVIGATOR) {
+                // Dynamically clamp to active channel size bounds
+                if (nav_channel_select_idx < gTabCount - 1) { nav_channel_select_idx++; ui_needs_redraw = true; }
+            } else {
+                int max_limit = (current_app_mode == MODE_SETTINGS) ? 5 : 4;
                 if (menu_selection_idx < max_limit) { menu_selection_idx++; ui_needs_redraw = true; }
-                return;
             }
+            return;
+        }
 
-            // 2. Horizontal Value Toggling (Single-press Semicolon and Forward Slash)
-            if (current_app_mode == MODE_SETTINGS && (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/'))) {
-                bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
-                
-                if (menu_selection_idx == 0) { // Row 1: Brightness Horizontal Scaler
-                    if (forward) {
-                        if (screen_brightness == 10) screen_brightness = 60;
-                        else if (screen_brightness == 60) screen_brightness = 120;
-                        else if (screen_brightness == 120) screen_brightness = 200;
-                        else if (screen_brightness == 200) screen_brightness = 255;
-                    } else {
-                        if (screen_brightness == 255) screen_brightness = 200;
-                        else if (screen_brightness == 200) screen_brightness = 120;
-                        else if (screen_brightness == 120) screen_brightness = 60;
-                        else if (screen_brightness == 60) screen_brightness = 10;
-                    }
+        // Horizontal Column & Value Swapping (Single-press Semicolon=LEFT, Forward Slash=RIGHT)
+        if (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/')) {
+            bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
+            ui_needs_redraw = true;
+            
+            if (current_app_mode == MODE_SETTINGS) {
+                if (menu_selection_idx == 0) { // Adjust Brightness
+                    screen_brightness += forward ? 30 : -30;
+                    if (screen_brightness > 255) screen_brightness = 255;
+                    if (screen_brightness < 10)  screen_brightness = 10;
                     M5Cardputer.Display.setBrightness(screen_brightness);
                 }
-                else if (menu_selection_idx == 1) { // Row 2: Timezone Offset Adjuster
+                else if (menu_selection_idx == 1) { // Adjust Timezone
                     current_tz_idx += forward ? 1 : -1;
                     if (current_tz_idx > 14) current_tz_idx = -12;
                     if (current_tz_idx < -12) current_tz_idx = 14;
                 }
-                else if (menu_selection_idx == 2) { // Row 3: Toggle 12/24hr Display Format
-                    use_12_hour_format = !use_12_hour_format;
-                }
-                else if (menu_selection_idx == 3) { // Row 4: Toggle Channel Logging
-                    channel_log_enabled = !channel_log_enabled;
-                }
-                ui_needs_redraw = true;
-                return;
+                else if (menu_selection_idx == 2) { use_12_hour_format = !use_12_hour_format; }
+                else if (menu_selection_idx == 3) { channel_log_enabled = !channel_log_enabled; }
             }
+            return;
         }
+    }
     }
 
     // Layer E: Configuration Menu Form Row Value-Changing Handlers
@@ -838,10 +834,15 @@ void handle_keyboard_inputs() {
     // 💬 CHAT MODE PROCESSING PIPELINE (ONLY RUNS IF MODE_CHAT IS ACTIVE)
     // ==========================================
     if (current_app_mode == MODE_CHAT) {
-        // Handle Backspace deletions safely
-        if (status.del && input_buffer.length() > 0) { 
-            input_buffer.remove(input_buffer.length() - 1); 
-            ui_needs_redraw = true; 
+        // Handle Backspace deletions safely with synchronous empty telemetry triggers
+        if (status.del) { 
+            if (input_buffer.length() > 0) {
+                input_buffer.remove(input_buffer.length() - 1); 
+                ui_needs_redraw = true; 
+            } else {
+                // Tapping backspace on an empty textbox triggers our hardware-level red warning alert
+                set_led_mode(5); 
+            }
         }
         
         // Append standard printable characters into the buffer
@@ -986,6 +987,62 @@ void irc_network_task(void* pvParameters) {
                 if (line.startsWith("PING")) {
                     net_client.printf("PONG %s\r\n", line.substring(5).c_str());
                     continue;
+                }
+                // LAYER A: DYNAMIC CHANNEL SYNC - JOIN EVENT EXTRACTION
+                if (line.indexOf(" JOIN ") != -1) {
+                    int join_idx = line.indexOf(" JOIN ");
+                    String disc_chan = line.substring(join_idx + 6);
+                    disc_chan.trim(); if (disc_chan.startsWith(":")) disc_chan = disc_chan.substring(1);
+                    
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        bool tab_exists = false;
+                        for (int t = 0; t < gTabCount; t++) {
+                            if (strcmp(gTabs[t].name, disc_chan.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
+                                tab_exists = true; break;
+                            }
+                        }
+                        if (!tab_exists && gTabCount < MAX_TABS) {
+                            strncpy(gTabs[gTabCount].name, disc_chan.c_str(), sizeof(gTabs[gTabCount].name)-1);
+                            strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
+                            gTabs[gTabCount].line_count = 0;
+                            gTabCount++;
+                        }
+                        xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
+                    }
+                }
+
+                // LAYER B: DYNAMIC CHANNEL SYNC - PART EVENT EXTRACTION (STATE MACHINE DELETION ENGINE)
+                if (line.indexOf(" PART ") != -1) {
+                    int part_idx = line.indexOf(" PART ");
+                    // Extract channel target text out of packet (e.g., "#channel")
+                    int chan_end = line.indexOf(' ', part_idx + 6);
+                    String part_chan = (chan_end == -1) ? line.substring(part_idx + 6) : line.substring(part_idx + 6, chan_end);
+                    part_chan.trim(); if (part_chan.startsWith(":")) part_chan = part_chan.substring(1);
+
+                    // Verify if the part action came from our own active username register handle
+                    int bang_idx = line.indexOf('!');
+                    if (bang_idx != -1 && line.substring(1, bang_idx) == irc_nick) {
+                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            int target_delete_idx = -1;
+                            
+                            // Find the memory offset index matching this specific server/room pairing
+                            for (int t = 1; t < gTabCount; t++) { // Skip Tab 0 (~mentions safeguard)
+                                if (strcmp(gTabs[t].name, part_chan.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
+                                    target_delete_idx = t; break;
+                                }
+                            }
+
+                            // If matched, delete row and collapse array cleanly to maintain alignment bounds
+                            if (target_delete_idx != -1) {
+                                for (int d = target_delete_idx; d < gTabCount - 1; d++) {
+                                    gTabs[d] = gTabs[d + 1];
+                                }
+                                gTabCount--;
+                                if (current_tab_index >= gTabCount) current_tab_index = gTabCount - 1;
+                            }
+                            xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
+                        }
+                    }
                 }
                 if (line.indexOf(" ACCOUNT ") != -1 || line.indexOf(" AWAY ") != -1) {
                     continue;
