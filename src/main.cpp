@@ -1248,13 +1248,32 @@ void draw_chat_view(){
       ui_needs_redraw = false;
       return;
   }
-  if (gTabCount == 0) {
+  if (gTabCount == 0 || gTabCount > MAX_TABS || current_tab_index < 0 || current_tab_index >= gTabCount || strlen(gTabs[current_tab_index].name)==0) {
+      // Auto-repair instead of permanent CRITICAL - ensure valid tab exists
+      if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10))==pdTRUE){
+        if(gTabCount==0 || gTabCount>MAX_TABS){
+          gTabCount=1; current_tab_index=0; gActive=0;
+          memset(gTabs, 0, sizeof(gTabs));
+          if(safe_mode_active){
+            strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name)-1);
+            strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server)-1);
+          } else {
+            strncpy(gTabs[0].name, "~system", sizeof(gTabs[0].name)-1);
+            strncpy(gTabs[0].server, "Bouncer", sizeof(gTabs[0].server)-1);
+          }
+          gTabs[0].type=TAB_STATUS;
+        }
+        if(current_tab_index<0 || current_tab_index>=gTabCount) { current_tab_index=0; gActive=0; }
+        xSemaphoreGive(irc_mutex);
+      }
+      // Show CRITICAL briefly but then allow next draw to recover
       canvas.fillSprite(0x0000);
       canvas.setTextColor(0xF800);
       canvas.setCursor(10, 50);
       canvas.print("CRITICAL LOGICAL UNALIGNED ERROR");
       canvas.pushSprite(0, 12);
-      ui_needs_redraw = false;
+      ui_needs_redraw = true; // retry next loop instead of false freeze
+      vTaskDelay(pdMS_TO_TICKS(50)); yield();
       return;
   }
   if(!gCanvasReady){ initCanvas(); if(!gCanvasReady){ ui_needs_redraw=false; return; } }
@@ -3035,6 +3054,8 @@ static void serviceWifi(){
 // ---------------------------------------------------------------------------
 void setup(){
   safe_mode_active = false;
+  gSafeBoot = false;
+  gTabCount = 0; current_tab_index = 0; // ensure clean start, will be seeded at bottom
   // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top per spec
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
@@ -3134,17 +3155,37 @@ void setup(){
     // Wi-Fi client initialization loop - non-blocking, no  else {
     logStatus("Safe Mode: net tasks bypassed");
   }
-  if (safe_mode_active) {
-      gTabCount = 1;
-      current_tab_index = 0;
-      memset(&gTabs, 0, sizeof(gTabs));
-      strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
-      strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
-      gSafeBoot = true;
-      xSemaphoreGive(irc_mutex);
-      ui_needs_redraw = true;
-      setDeepCrimson();
-  } else {
+  // ABSOLUTE BOTTOM ATOMIC SEED - protected, no init after this can wipe gTabCount
+  if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
+    if (safe_mode_active) {
+        gTabCount = 1;
+        current_tab_index = 0; gActive=0;
+        memset(gTabs, 0, sizeof(gTabs));
+        strncpy(gTabs[0].name, "~safemode", sizeof(gTabs[0].name) - 1);
+        strncpy(gTabs[0].server, "Offline", sizeof(gTabs[0].server) - 1);
+        gTabs[0].type = TAB_STATUS;
+        xSemaphoreGive(irc_mutex);
+        ui_needs_redraw = true;
+        setDeepCrimson();
+    } else {
+        xSemaphoreGive(irc_mutex);
+    }
+  }
+  if (!safe_mode_active) {
+      if (gTabCount == 0) {
+          if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
+            if(gTabCount==0){
+              gTabCount = 1; current_tab_index = 0; gActive=0;
+              memset(gTabs, 0, sizeof(gTabs));
+              strncpy(gTabs[0].name, "~system", sizeof(gTabs[0].name) - 1);
+              strncpy(gTabs[0].server, "Bouncer", sizeof(gTabs[0].server) - 1);
+              gTabs[0].type = TAB_STATUS;
+            }
+            xSemaphoreGive(irc_mutex);
+          }
+      }
+  }
+  if (false) { // dummy to keep else structure {
       gSafeBoot = false;
       // Standard non-safe mode allocations continue here...
   }
