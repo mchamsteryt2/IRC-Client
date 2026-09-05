@@ -671,6 +671,21 @@ void handle_keyboard_inputs() {
     // Layer B: Master Emergency Escape Back to Main Chat Workspace
     // Triggers instantly on either (Alt + Backspace [0x08]) OR a single tap of the physical Esc key (0x1B)
     if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed(0x1B)) {
+        // Auto-export updated parameters safely to card storage upon form exit
+        if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_WIFI) {
+            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                File file = SD.open("/irc/config.txt", FILE_WRITE);
+                if (file) {
+                    file.printf("wifi_ssid=%s\nwifi_pass=%s\nirc_nick=%s\n", wifi_ssid, wifi_pass, irc_nick);
+                    file.printf("bnc_host=%s\nbnc_port=%d\nbnc_user=%s\nbnc_pass=%s\n", bnc_host, bnc_port, bnc_user, bnc_pass);
+                    file.printf("channel_log_enabled=%d\nscreen_brightness=%d\n", channel_log_enabled, screen_brightness);
+                    file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\n", current_tz_idx, use_12_hour_format);
+                    file.close();
+                    Serial.println("[STORAGE-SYNC] Configuration parameters permanently synchronized to micro-SD card.");
+                }
+                xSemaphoreGive(irc_mutex);
+            }
+        }
         current_app_mode = MODE_CHAT;
         input_buffer = ""; // Cleanly flush any stray menu layout characters out of RAM
         ui_needs_redraw = true;
@@ -744,36 +759,79 @@ void handle_keyboard_inputs() {
                 return;
             }
         }
-        // Menu Form Mode Variable Selection Controllers
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Fn+Up Arrow
-            if (menu_selection_idx > 0) { menu_selection_idx--; ui_needs_redraw = true; }
-            return;
-        }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down Arrow
-            int max_limit = 3; // Fallback default for shorter menus
-            if (current_app_mode == MODE_SETTINGS) max_limit = 5; // Allow access to all 6 setup rows (0-5)
-            if (current_app_mode == MODE_BOUNCER)  max_limit = 4;
-            
-            if (menu_selection_idx < max_limit) { 
-                menu_selection_idx++; 
-                ui_needs_redraw = true; 
-            } 
-            return;
+        // Layer F: One-Handed Menu Navigation Pad (Active ONLY inside Menu modes)
+        if (current_app_mode != MODE_CHAT) {
+            // 1. Vertical List Scrolling (Single-press Comma and Period)
+            if (M5Cardputer.Keyboard.isKeyPressed(',')) { // Comma acts as UP
+                if (menu_selection_idx > 0) { menu_selection_idx--; ui_needs_redraw = true; }
+                return;
+            }
+            if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Period acts as DOWN
+                int max_limit = 3;
+                if (current_app_mode == MODE_SETTINGS) max_limit = 5;
+                if (current_app_mode == MODE_BOUNCER)  max_limit = 4;
+                
+                if (menu_selection_idx < max_limit) { menu_selection_idx++; ui_needs_redraw = true; }
+                return;
+            }
+
+            // 2. Horizontal Value Toggling (Single-press Semicolon and Forward Slash)
+            if (current_app_mode == MODE_SETTINGS && (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/'))) {
+                bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
+                
+                if (menu_selection_idx == 0) { // Row 1: Brightness Horizontal Scaler
+                    if (forward) {
+                        if (screen_brightness == 10) screen_brightness = 60;
+                        else if (screen_brightness == 60) screen_brightness = 120;
+                        else if (screen_brightness == 120) screen_brightness = 200;
+                        else if (screen_brightness == 200) screen_brightness = 255;
+                    } else {
+                        if (screen_brightness == 255) screen_brightness = 200;
+                        else if (screen_brightness == 200) screen_brightness = 120;
+                        else if (screen_brightness == 120) screen_brightness = 60;
+                        else if (screen_brightness == 60) screen_brightness = 10;
+                    }
+                    M5Cardputer.Display.setBrightness(screen_brightness);
+                }
+                else if (menu_selection_idx == 1) { // Row 2: Timezone Offset Adjuster
+                    current_tz_idx += forward ? 1 : -1;
+                    if (current_tz_idx > 14) current_tz_idx = -12;
+                    if (current_tz_idx < -12) current_tz_idx = 14;
+                }
+                else if (menu_selection_idx == 2) { // Row 3: Toggle 12/24hr Display Format
+                    use_12_hour_format = !use_12_hour_format;
+                }
+                else if (menu_selection_idx == 3) { // Row 4: Toggle Channel Logging
+                    channel_log_enabled = !channel_log_enabled;
+                }
+                ui_needs_redraw = true;
+                return;
+            }
         }
     }
 
-    // Layer E: Menu Row Value-Changing Form Sub-Handlers
+    // Layer E: Configuration Menu Form Row Value-Changing Handlers
     if (current_app_mode == MODE_SETTINGS && status.enter) {
-        if (menu_selection_idx == 2) { // Toggle 12/24hr layout row choice
+        if (menu_selection_idx == 0) { // Row 1: Cycle Brightness Level (Off -> Dim -> Med -> Max)
+            if (screen_brightness == 10) screen_brightness = 60;
+            else if (screen_brightness == 60) screen_brightness = 120;
+            else if (screen_brightness == 120) screen_brightness = 200;
+            else if (screen_brightness == 200) screen_brightness = 255;
+            else screen_brightness = 10;
+            M5Cardputer.Display.setBrightness(screen_brightness);
+        }
+        else if (menu_selection_idx == 1) { // Row 2: Shift Timezone Indicator Offset index
+            current_tz_idx = (current_tz_idx + 1);
+            if (current_tz_idx > 14) current_tz_idx = -12; // Wrap across international date lines safely
+        }
+        else if (menu_selection_idx == 2) { // Row 3: Toggle 12/24hr Display Format Layer
             use_12_hour_format = !use_12_hour_format;
-            ui_needs_redraw = true;
-            return;
         }
-        if (menu_selection_idx == 3) { // Toggle local file recording row choice
+        else if (menu_selection_idx == 3) { // Row 4: Toggle Local Channel Log File Recording
             channel_log_enabled = !channel_log_enabled;
-            ui_needs_redraw = true;
-            return;
         }
+        ui_needs_redraw = true;
+        return;
     }
 
     // Layer D: Standard Character Stream Buffer Appender
