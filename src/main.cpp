@@ -3037,6 +3037,7 @@ void setup(){
   // 1. INITIALIZE HARDWARE PRIMITIVES FIRST - absolute top per spec
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);
+  Wire.setTimeOut(50);
   M5Cardputer.Display.setRotation(1);
   M5Cardputer.Display.setTextSize(1);
   M5Cardputer.Display.setTextWrap(false);
@@ -3159,6 +3160,27 @@ void setup(){
 // ---------------------------------------------------------------------------
 // Loop - Core 1 graphics/keyboard, protected shared vars via mutex
 // ---------------------------------------------------------------------------
+void custom_ui_loop_task(void* pvParameters) {
+    // Explicitly release any boot restrictions
+    ui_needs_redraw = true;
+    
+    while (true) {
+        yield();
+        vTaskDelay(pdMS_TO_TICKS(5)); // High-speed execution yield
+        
+        M5Cardputer.update();
+        handle_keyboard_inputs();
+        
+        if (ui_needs_redraw) {
+            // Only execute a drawing pass if the core data mutex is accessible
+            if (xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                draw_chat_view();
+                xSemaphoreGive(irc_mutex);
+            }
+        }
+    }
+}
+
 void loop() {
     yield(); 
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
