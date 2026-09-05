@@ -120,6 +120,7 @@ struct ChatLine {
   char stamp[6]; // HH:MM
   char text[MAX_LINE_LEN+1];
   uint8_t flags; // bit0 highlight (!), bit1 own, bit2 notice
+  bool is_highlight = false;
 };
 
 struct Tab {
@@ -221,6 +222,8 @@ static bool gSafeBoot = false;
 bool safe_mode_active = false;
 static bool gNickOverlay = false;
 static uint32_t gLastInputMs = 0;
+unsigned long last_input_time = 0;
+int screen_brightness = 10;
 static bool gDownclocked = false;
 static uint8_t gSavedBrightness = BRIGHT_AWAKE;
 
@@ -659,6 +662,8 @@ static void ringPush(Tab* tab, const char* txt, uint8_t flags, const char* serve
   safeCopy(slot->stamp,hhmm,sizeof(slot->stamp));
   safeCopy(slot->text,sanitized,sizeof(slot->text));
   slot->flags=flags;
+  slot->is_highlight = (flags & 0x01) != 0;
+  if(slot->is_highlight) slot->is_highlight = true;
   tab->head=(tab->head+1)%MAX_LINES_PER_TAB;
   if(tab->count<MAX_LINES_PER_TAB) tab->count++;
   if(tab->scroll>0) tab->scroll++;
@@ -799,7 +804,7 @@ static void loadConfig(){
     else if(strcmp(k,"autojoin")==0) safeCopy(gCfg.autojoin,v,sizeof(gCfg.autojoin));
     else if(strcmp(k,"channel_log_enabled")==0||strcmp(k,"chat_log_enabled")==0) gCfg.logLevel=parseLogLevel(v);
     else if(strcmp(k,"log_root")==0) safeCopy(gCfg.logRoot,v,sizeof(gCfg.logRoot));
-    else if(strcmp(k,"screen_brightness")==0) gCfg.brightness=(uint8_t)constrain(atoi(v),0,10);
+    else if(strcmp(k,"screen_brightness")==0) { gCfg.brightness=(uint8_t)constrain(atoi(v),0,10); screen_brightness = gCfg.brightness; }
     else if(strcmp(k,"current_audio")==0) gCfg.current_audio=atoi(v);
     else if(strcmp(k,"bnc_enabled")==0) gCfg.bncEnabled=strToBoolC(v);
     else if(strcmp(k,"bnc_user")==0) { strncpy(bnc_user, v, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser,v,sizeof(gCfg.bncUser)); }
@@ -1221,6 +1226,9 @@ void draw_chat_view(){
         canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG), 0x0000);
         int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
         canvas.setCursor(70, y+1); canvas.print(bodyTmp);
+        if(cl->is_highlight == true){
+          canvas.drawFastHLine(0, y+ROW_H-1, SCREEN_W, 0xFD20);
+        }
         int current_y = y; if (current_y + 10 > 109) break;
         y+=ROW_H;
       }
@@ -1456,6 +1464,7 @@ static void serverSkipBackward();
 static void add_message_to_buffer(const char* msg);
 void handle_keyboard_inputs() {
     if (!M5Cardputer.Keyboard.isPressed()) return;
+    last_input_time = millis();
     auto status = M5Cardputer.Keyboard.keysState();
     auto st = status;
     if (safe_mode_active) { /* Only permit basic character typing or mute toggling */ }
@@ -1591,6 +1600,36 @@ void handle_keyboard_inputs() {
         } else { gHistNav=-1; }
     }
     if(st.tab){
+        // HARDWARE TAB NICK COMPLETION ENGINE - scan backwards for partial word, prefix match nick index
+        Tab* curTab = activeTab();
+        if(curTab && curTab->nickCount>0 && gInputLen>0){
+            int end = gInputCursor;
+            int start = end;
+            while(start>0 && gInput[start-1]!=' ' && gInput[start-1]!=':' && gInput[start-1]!='@') start--;
+            int partialLen = end - start;
+            if(partialLen>0 && partialLen<32){
+                char partial[32]; memcpy(partial, gInput+start, partialLen); partial[partialLen]='\0';
+                char partialLower[32]; safeCopy(partialLower, partial, sizeof(partialLower)); toLower(partialLower);
+                for(int n=0;n<curTab->nickCount;n++){
+                    char nickLower[32]; safeCopy(nickLower, curTab->nicks[n], sizeof(nickLower)); toLower(nickLower);
+                    if(strncmp(nickLower, partialLower, partialLen)==0){
+                        char completed[64]; snprintf(completed, sizeof(completed), "%s: ", curTab->nicks[n]);
+                        int compLen = strlen(completed);
+                        int tailLen = gInputLen - end;
+                        if(start+compLen+tailLen < INPUT_BUF_SZ){
+                            memmove(gInput+start+compLen, gInput+end, tailLen+1);
+                            memcpy(gInput+start, completed, compLen);
+                            gInputLen = gInputLen - partialLen + compLen;
+                            gInputCursor = start + compLen;
+                            if(gInputCursor > INPUT_BUF_SZ-1) gInputCursor = INPUT_BUF_SZ-1;
+                            gInputScroll = 0;
+                            ui_needs_redraw = true;
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         if(gTabCount>0){ gActive=(gActive+1)%gTabCount; activeTab()->unread=false; activeTab()->mention=false; current_tab_index=gActive; ui_needs_redraw = true; }
     }
     if(!st.word.empty() || st.del || st.enter || st.tab) ui_needs_redraw = true;
@@ -3029,6 +3068,7 @@ void setup(){
   // Fix black screen: apply brightness AFTER config load, default to 10 if still 0
   if(gCfg.brightness==0) gCfg.brightness=10;
   gSavedBrightness = gCfg.brightness;
+  screen_brightness = gCfg.brightness;
   applyBrightness(gSavedBrightness);
   M5Cardputer.Speaker.setVolume(128);
   digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
@@ -3060,6 +3100,7 @@ void loop() {
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
     
     M5Cardputer.update(); // if (!safe_mode_active) { network streams / socket / packet buffers guarded } 
+    if (millis() - last_input_time > 60000) { M5Cardputer.Display.setBrightness(10); } else { M5Cardputer.Display.setBrightness(screen_brightness); }
     updateLedTelemetry();
     handle_keyboard_inputs(); 
     
