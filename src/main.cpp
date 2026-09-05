@@ -67,6 +67,7 @@ char bnc_user[64]  = {0};
 char bnc_pass[64]  = {0};
 int channel_log_enabled = 1;
 int current_tz_idx      = 2;
+unsigned long adj_time = 0; // Sync offset for wall-clock
 int use_12_hour_format  = 1;
 
 #define MAX_NETWORKS 5
@@ -389,310 +390,180 @@ uint16_t get_nick_palette_color(const char* nick) {
 // ==========================================
 void draw_chat_view() {
     if (!ui_needs_redraw) return;
-
-    // 1. SAFEMODE DIRECT-DRAW GATE BYPASS
-    if (safe_mode_active) {
-        canvas.fillSprite(0x0000);
-        canvas.setTextColor(0x7BEF); // Mid-contrast Terminal Slate Grey
-        canvas.setCursor(10, 20);
-        canvas.print("[!] INITIALIZATION BYPASS:");
-        canvas.setTextColor(0xFD20); // Amber Terminal Orange
-        canvas.setCursor(10, 45);
-        canvas.print("~safemode console active");
-        canvas.setCursor(10, 60);
-        canvas.print("press Alt+Backspace to exit");
-        canvas.pushSprite(0, 12);
-        
-        M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
-        M5Cardputer.Display.setTextColor(0xF800, 0x0841);
-        M5Cardputer.Display.setCursor(5, 2);
-        M5Cardputer.Display.print("SAFE MODE");
-        ui_needs_redraw = false;
-        return;
-    }
-
-    // --- MODAL DRAWING RESPONSES: route viewport on current_app_mode ---
+    
+    // ==========================================
+    // STATE 1: WORKSPACE NAVIGATION HUB (Fn + P)
+    // ==========================================
     if (current_app_mode == MODE_NAVIGATOR) {
-        // --- LEFT COLUMN: NETWORK SERVERS (X=5 TO X=110) ---
-        canvas.fillRect(0, 0, 114, 135, 0x0841); // Slate container block
+        // Master Blackout Mask: Completely flush the 240x135 frame buffer to pure black.
+        // This ensures no background text loop remnants can clip anywhere on the glass!
+        canvas.fillSprite(0x0000); 
+        
+        // --- LEFT COLUMN: NETWORK SERVERS ---
+        canvas.fillRect(0, 0, 114, 135, 0x0841); // Slate left panel container block
         canvas.setTextColor(0x07E0); canvas.setCursor(6, 6); canvas.print("NETWORKS");
+        
         for (int i = 0; i < discovered_network_count; i++) {
-            uint16_t txt_color = (nav_server_select_idx == i) ? 0xFFFF : 0x7BEF;
-            canvas.setTextColor(txt_color);
+            canvas.setTextColor(nav_server_select_idx == i ? 0xFFFF : 0x7BEF);
             canvas.setCursor(12, 24 + (i * 14));
             canvas.printf("%s %s", (nav_server_select_idx == i ? ">" : " "), discovered_networks[i]);
         }
         
-        // --- RIGHT COLUMN: CHANNELS LIST ROSTER (X=120 TO X=235) ---
-        canvas.drawFastVLine(116, 0, 135, 0x7BEF); // Split window wire guide line
+        canvas.drawFastVLine(116, 0, 135, 0x7BEF); // Visual separator wire
         canvas.setTextColor(0xFD20); canvas.setCursor(122, 6); canvas.print("ACTIVE ROOMS");
         
         int channel_print_counter = 0;
         for (int i = 0; i < gTabCount; i++) {
-            // Filter and draw strictly the channels belonging to our selected network node
             if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) {
                 uint16_t txt_color = (nav_channel_select_idx == channel_print_counter) ? 0xFFFF : 0x7BEF;
-                canvas.setTextColor(txt_color);
                 canvas.setCursor(126, 24 + (channel_print_counter * 14));
                 
-                // Truncation Shield: Force a maximum limit of 16 characters 
-                // to completely block layout overflows on our 240px wide viewport glass
-                char truncated_chan_name[18] = {0};
-                if (strlen(gTabs[i].name) > 16) {
-                    strncpy(truncated_chan_name, gTabs[i].name, 13);
-                    strcat(truncated_chan_name, "..."); // Append dot signifiers cleanly
-                } else {
-                    strncpy(truncated_chan_name, gTabs[i].name, 16);
+                int local_mention_count = 0;
+                for (int l = 0; l < gTabs[i].line_count; l++) {
+                    if (gTabs[i].lines[l].is_highlight) local_mention_count++;
                 }
-                
+
+                int max_chars_allowed = (local_mention_count > 0) ? 10 : 16;
+                char truncated_chan_name[20] = {0};
+                if (strlen(gTabs[i].name) > max_chars_allowed) {
+                    strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed - 3);
+                    strcat(truncated_chan_name, "...");
+                } else {
+                    strncpy(truncated_chan_name, gTabs[i].name, max_chars_allowed);
+                }
+
+                canvas.setTextColor(txt_color);
                 canvas.printf("%s %s", (nav_channel_select_idx == channel_print_counter ? "*" : " "), truncated_chan_name);
+                
+                if (local_mention_count > 0) {
+                    canvas.setTextColor(0xFD20);
+                    if (local_mention_count > 10) canvas.print(" (10+)");
+                    else canvas.printf(" (%d)", local_mention_count);
+                }
                 channel_print_counter++;
             }
         }
         
         canvas.fillRect(0, 120, 240, 15, 0x0000); 
-        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print(",/. Scroll | Enter: Open");
+        canvas.setCursor(6, 122); canvas.setTextColor(0x7BEF); canvas.print(";/. Scroll | Enter: Open");
         canvas.pushSprite(0, 0);
-        
         ui_needs_redraw = false;
-        return; // <-- CRITICAL BALANCING SHIELD: Halt execution to prevent chat text overlapping!
-    }
-    if (current_app_mode != MODE_CHAT) {
-        switch (current_app_mode) {
-            case MODE_SETTINGS: {
-                canvas.fillSprite(0x0000);
-                canvas.setTextColor(0xFD20); canvas.setCursor(10, 5);
-                canvas.print("--- SYSTEM CONFIGURATIONS ---");
-                canvas.setTextColor(0xFFFF);
-                canvas.setCursor(10, 24); canvas.printf("%s 1. Brightness Level: %d", (menu_selection_idx == 0 ? ">" : " "), screen_brightness);
-                canvas.setCursor(10, 38); canvas.printf("%s 2. Timezone Indicator: %d", (menu_selection_idx == 1 ? ">" : " "), current_tz_idx);
-                canvas.setCursor(10, 52); canvas.printf("%s 3. 12/24hr Format: %s", (menu_selection_idx == 2 ? ">" : " "), use_12_hour_format ? "12-HOUR" : "24-HOUR");
-                canvas.setCursor(10, 66); canvas.printf("%s 4. Channel Log File: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
-                canvas.setCursor(10, 80); canvas.printf("%s 5. Purge History: [ RUN ]", (menu_selection_idx == 4 ? ">" : " "));
-                canvas.setCursor(10, 94); canvas.printf("%s 6. Erase Local Configs: [ RUN ]", (menu_selection_idx == 5 ? ">" : " "));
-                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Next Page");
-                canvas.pushSprite(0, 12);
-                ui_needs_redraw = false;
-                return;
-            }
-            case MODE_BOUNCER: {
-                canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x07E0); canvas.setCursor(10, 8);
-                canvas.print("--- BOUNCER CONNECTION SCHEMAS ---");
-                canvas.setTextColor(0xFFFF);
-                
-                // Explicitly cast bnc character array structures safely
-                canvas.setCursor(10, 26); canvas.printf("%s 1. Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
-                canvas.setCursor(10, 40); canvas.printf("%s 2. Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
-                canvas.setCursor(10, 54); canvas.printf("%s 3. Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
-                canvas.setCursor(10, 68); canvas.printf("%s 4. Password Token: *******", (menu_selection_idx == 3 ? ">" : " "));
-                canvas.setCursor(10, 82); canvas.printf("%s 5. Synchronize Now: [ EXPORT ]", (menu_selection_idx == 4 ? ">" : " "));
-                
-                canvas.setCursor(10, 120); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Next Page");
-                canvas.pushSprite(0, 0);
-                ui_needs_redraw = false;
-                return;
-            }
-            case MODE_WIFI: {
-                canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x5A1F); canvas.setCursor(10, 8);
-                canvas.print("--- WI-FI CONFIG MANAGER ---");
-                canvas.setTextColor(0xFFFF);
-                
-                // Explicitly cast raw pointers to stable string pointers
-                canvas.setCursor(10, 26); canvas.printf("%s 1. Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
-                canvas.setCursor(10, 40); canvas.printf("%s 2. Network Pass: *******", (menu_selection_idx == 1 ? ">" : " "));
-                canvas.setCursor(10, 54); canvas.printf("%s 3. Scan for Airwaves: [ SCAN APs ]", (menu_selection_idx == 2 ? ">" : " "));
-                canvas.setCursor(10, 68); canvas.printf("%s 4. Force Connect: [ INITIALIZE ]", (menu_selection_idx == 3 ? ">" : " "));
-                
-                canvas.setCursor(10, 120); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
-                canvas.pushSprite(0, 0);
-                ui_needs_redraw = false;
-                return;
-            }
-            default: break;
-        }
+        return; // HARD BARRIER GATING: Stops any chat log loop processing from running!
     }
 
-    // 2. SELF-HEALING UN-ALIGNED DATA SAFETY CHECKPOINT
-    if (gTabCount == 0 || gTabCount > MAX_TABS || current_tab_index >= gTabCount) {
-        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            gTabCount = 1;
-            current_tab_index = 0;
-            memset(&gTabs, 0, sizeof(gTabs));
-            strncpy(gTabs[0].name, "~system", sizeof(gTabs[0].name)-1);
-            strncpy(gTabs[0].server, "Bouncer", sizeof(gTabs[0].server)-1);
-            xSemaphoreGive(irc_mutex);
-        }
+    // ==========================================
+    // STATE 2: CONFIGURATION MENUS (Fn + O)
+    // ==========================================
+    if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_WIFI) {
         canvas.fillSprite(0x0000);
-        canvas.setTextColor(0xFD20);
-        canvas.setCursor(10, 45);
-        canvas.print("SYSTEM BUFFER ALIGNING...");
-        canvas.pushSprite(0, 12);
-        ui_needs_redraw = true;
-        return;
+        canvas.setTextColor(0xFD20); canvas.setCursor(10, 8);
+        if (current_app_mode == MODE_SETTINGS) {
+            canvas.print("--- SYSTEM CONFIGURATIONS ---"); canvas.setTextColor(0xFFFF);
+            canvas.setCursor(10, 26); canvas.printf("%s Brightness Level: %d", (menu_selection_idx == 0 ? ">" : " "), screen_brightness);
+            canvas.setCursor(10, 40); canvas.printf("%s Timezone Index: %d", (menu_selection_idx == 1 ? ">" : " "), current_tz_idx);
+            canvas.setCursor(10, 54); canvas.printf("%s Format Layer: %s", (menu_selection_idx == 2 ? ">" : " "), use_12_hour_format ? "12-HR" : "24-HR");
+            canvas.setCursor(10, 68); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
+        } else if (current_app_mode == MODE_BOUNCER) {
+            canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(0xFFFF);
+            canvas.setCursor(10, 26); canvas.printf("%s Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
+            canvas.setCursor(10, 40); canvas.printf("%s Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
+            canvas.setCursor(10, 54); canvas.printf("%s Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
+        } else {
+            canvas.print("--- WI-FI CONFIG MANAGER ---"); canvas.setTextColor(0xFFFF);
+            canvas.setCursor(10, 26); canvas.printf("%s Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
+            canvas.setCursor(10, 40); canvas.printf("%s Scan Airwaves: [ RUN ]", (menu_selection_idx == 1 ? ">" : " "));
+        }
+        canvas.fillRect(0, 120, 240, 15, 0x0000);
+        canvas.setCursor(10, 122); canvas.setTextColor(0x7BEF); canvas.print("Esc: Exit | ,/. Adjust Value");
+        canvas.pushSprite(0, 0); ui_needs_redraw = false; return;
     }
 
-    // ----------------------------------------------------
+    // ==========================================
     // STATE 3: LIVE TERMINAL CHAT VIEWPORT
-    // ----------------------------------------------------
-    // Atomic Memory Fence: Lock the mutex BEFORE clearing the canvas sprite
-    // to stop the text lines from disappearing during background batch streams!
+    // ==========================================
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        
-        canvas.fillSprite(0x0000); // Safe to clear now that memory states are locked
-        
+        canvas.fillSprite(0x0000);
         Tab &t = gTabs[current_tab_index]; int current_y = 2;
+        
         for (int i = 0; i < t.line_count; i++) {
             if (current_y + 11 > 109) break;
-            
-            // Establish an alternating background bar block for visual tracking
             uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
             
-            // Calculate text layout cursor positions
-            int text_start_x = (current_tab_index == 0) ? 160 : 120;
+            // TIMESTAMPS REMOVED: Re-wire horizontal column starts to give text max space
+            int text_start_x = (current_tab_index == 0) ? 110 : 70;
             int max_text_width = 236 - text_start_x;
             
             String msg_text = t.lines[i].message;
             int current_char_pos = 0;
             bool first_line_pass = true;
 
-            // Simple micro-font length-chopper string loop
             while (current_char_pos < msg_text.length()) {
                 if (current_y + 11 > 109) break;
-
-                // 6px per character base resolution math
                 int dynamic_chars_budget = max_text_width / 6;
-                
-                // Safety Guardrail Shield: Force immediate loop break if character budget 
-                // drops to zero to permanently kill core processing freeze glitches
-                if (dynamic_chars_budget <= 0) {
-                    break;
-                }
-                
+                if (dynamic_chars_budget <= 0) break;
+
                 String sub_line = msg_text.substring(current_char_pos, current_char_pos + dynamic_chars_budget);
-                
-                // Draw row background bar
                 canvas.fillRect(0, current_y - 2, 240, 12, row_bg);
                 
                 if (first_line_pass) {
-                    canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Main layout separator line
-                    canvas.setTextColor(0x7BEF); canvas.setCursor(2, current_y); canvas.print(t.lines[i].timeStr);
+                    canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Layout anchor line
                     
+                    // NICKNAME TRUNCATION SHIELD: Rigid 8-character max clamp to optimize readability
+                    char shortened_nick[12] = {0};
+                    if (strlen(t.lines[i].nick) > 8) {
+                        strncpy(shortened_nick, t.lines[i].nick, 6);
+                        strcat(shortened_nick, "..");
+                    } else {
+                        strncpy(shortened_nick, t.lines[i].nick, 8);
+                    }
+
                     if (t.lines[i].is_highlight) { 
-                        canvas.fillRect(68, current_y - 1, 50, 11, 0xFD20); 
-                        canvas.setTextColor(0xFFFF); 
+                        canvas.fillRect(2, current_y - 1, 60, 11, 0xFD20); canvas.setTextColor(0xFFFF); 
                     } else { 
                         canvas.setTextColor(get_nick_palette_color(t.lines[i].nick)); 
                     }
                     
-                    canvas.setCursor(68, current_y);
-                    if (current_tab_index == 0) { canvas.printf("%s", t.lines[i].nick); }
-                    else { canvas.printf("<%s>", t.lines[i].nick); }
-                    
+                    canvas.setCursor(2, current_y);
+                    if (current_tab_index == 0) canvas.printf("%s", shortened_nick);
+                    else canvas.printf("<%s>", shortened_nick);
                     first_line_pass = false;
                 }
                 
-                canvas.setTextColor(t.lines[i].color);
-                canvas.setCursor(text_start_x, current_y);
-                canvas.print(sub_line);
-                
-                current_y += 12;
-                current_char_pos += dynamic_chars_budget;
+                canvas.setTextColor(t.lines[i].color); canvas.setCursor(text_start_x, current_y); canvas.print(sub_line);
+                current_y += 12; current_char_pos += dynamic_chars_budget;
             }
         }
         xSemaphoreGive(irc_mutex);
     }
-    
-    // 4. HARDWARE DISPLAY GLASS DIRECT REFRESH RENDER OVERLAYS
     canvas.pushSprite(0, 12);
-    
-    // Draw background header block bar safely across the full width
-    M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
-    
-    // Draw Server tag context anchor in low-profile slate grey
-    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841);
-    M5Cardputer.Display.setCursor(2, 2);
-    M5Cardputer.Display.printf("[%s]", gTabs[current_tab_index].server);
-    
-    // Draw Channel text title space in crisp high-visibility White
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
-    M5Cardputer.Display.setCursor(54, 2); // Perfectly positioned
-    
-    // Safety Truncation: Copy active room name string up to a strict limit of 10 characters 
-    // to physically block it from ever expanding into the right-side metrics space
-    char truncated_name[12] = {0};
-    strncpy(truncated_name, gTabs[current_tab_index].name, 10);
-    M5Cardputer.Display.print(truncated_name);
-    
-    // ==========================================
-    // 📡 THE COMPACT TELEMETRY GRID LAYER (X=140 TO X=238)
-    // ==========================================
-    
-    // Anchor A: Wireless Network Radio State (X=142)
-    M5Cardputer.Display.setCursor(142, 2);
-    if (WiFi.status() != WL_CONNECTED) {
-        M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
-        M5Cardputer.Display.print("D"); // Disconnected Micro-Indicator
-    } else {
-        M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
-        M5Cardputer.Display.print("W"); // Connected Wi-Fi Micro-Indicator
-    }
-    
-    M5Cardputer.Display.setCursor(158, 2);
-    if (current_audio == 0) {
-        M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
-        M5Cardputer.Display.print("H"); // Stealth Hidden Mode
-    } else {
-        M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
-        M5Cardputer.Display.print("V"); // Standard Visible Mode
-    }
-    
-    // Anchor C: Local System Digital Clock (X=176)
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // Pure White Text
-    M5Cardputer.Display.setCursor(176, 2);
-    // Dynamic system wall-clock ticker string builder pass
-    // Reads current operational uptime to simulate active terminal time parameters
-    uint32_t total_sec = millis() / 1000;
-    uint32_t active_min = (total_sec / 60) % 60;
-    uint32_t active_hr = ((total_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
-    if (use_12_hour_format && active_hr == 0) active_hr = 12;
-    M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
-    
-    // Anchor D: Hardware Calibrated Battery Percentage (X=212)
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
-    M5Cardputer.Display.setCursor(212, 2);
-    int active_bat = (int)get_calibrated_battery_percentage();
-    M5Cardputer.Display.printf("%d%%", active_bat); // Drops brackets to save 12px of screen glass width
-    
-    // Draw flat black footer background bar (from Y=121 to screen edge Y=135)
-    M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
-    M5Cardputer.Display.drawFastHLine(0, 121, 240, 0x7BEF); // Mid-contrast slate divider
-    
-    // Draw the bright amber/orange command prompt indicator tag
-    M5Cardputer.Display.setTextColor(0xFD20, 0x0000); // Enforce clear Amber on Black back-color
-    M5Cardputer.Display.setCursor(4, 124);            // Shift slightly out from the screen glass bezel wall
-    M5Cardputer.Display.print("> ");
-    
-    // Print the live interactive user typing input string characters
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0000); // Crisp White text
-    M5Cardputer.Display.print(input_buffer.c_str());
-    
-    // Place a small rectangular background overlay color mask to serve as a clean text scroll fade boundary edge
-    M5Cardputer.Display.fillRect(215, 122, 25, 13, 0x0000);
-    
-    // Draw the remaining numerical characters indicator budget using micro-fonts
-    M5Cardputer.Display.setTextColor(0x7BEF); // Dimmed slate grey
-    M5Cardputer.Display.setCursor(218, 124);
-    M5Cardputer.Display.printf("%03d", 400 - input_buffer.length());
-    
-    ui_needs_redraw = false;
-}
 
-// ==========================================
-// ⌨️ 56 INDIVIDUAL TACTILE MICRO-SWITCH INTERCEPTS
-// ==========================================
-void handle_keyboard_inputs() {
+    // NAVBAR RENDERING SYSTEM
+    M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
+    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(2, 2);
+    M5Cardputer.Display.printf("[%s]", gTabs[current_tab_index].server);
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(54, 2);
+    char truncated_name[12] = {0}; strncpy(truncated_name, gTabs[current_tab_index].name, 10);
+    M5Cardputer.Display.print(truncated_name);
+
+    M5Cardputer.Display.setCursor(142, 2);
+    if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
+    else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
+    M5Cardputer.Display.setCursor(158, 2);
+    if (current_audio == 0) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("H"); }
+    else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("V"); }
+    
+    unsigned long current_sync_sec = (millis() / 1000) + adj_time;
+    uint32_t active_min = (current_sync_sec / 60) % 60;
+    uint32_t active_hr  = ((current_sync_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
+    if (use_12_hour_format && active_hr == 0) active_hr = 12;
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(176, 2); M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
+    M5Cardputer.Display.setCursor(212, 2); M5Cardputer.Display.printf("%03d", 400 - input_buffer.length());
+
+    // LOWER INPUT BOX
+    M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
+    M5Cardputer.Display.drawFastHLine(0, 121, 240, 0x7BEF);
+    M5Cardputer.Display.setTextColor(0xFD20, 0x0000); M5Cardputer.Display.setCursor(4, 124); M5Cardputer.Display.print("> ");M5Cardputer.Display.setTextColor(0xFFFF, 0x0000); M5Cardputer.Display.print(input_buffer.c_str());ui_needs_redraw = false;
+}void handle_keyboard_inputs() {
     if (!M5Cardputer.Keyboard.isPressed()) return;
     
     // Explicit 150ms hardware bounce filter guard to stop character double-chatter
