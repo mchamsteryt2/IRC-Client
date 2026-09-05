@@ -209,7 +209,6 @@ static Config gCfg;
 static String bnc_host = "";
 static int bnc_port = 0;
 static char bnc_user[32] = {0};
-static char bnc_net[32] = {0};
 static char bnc_pass[64] = {0};
 static Tab gTabs[MAX_TABS];
 static int gTabCount = 0;
@@ -676,7 +675,11 @@ static bool shouldLog(const Tab* tab, bool isSystemError){
   if(gCfg.logLevel==LOG_NONE) return false;
   if(gCfg.logLevel==LOG_ALL) return true;
   if(isSystemError) return true;
-  if(tab && tab->type==TAB_QUERY) return true;
+  // LOG filtering gate: channel_log_enabled==1 => LOG_DMS_ONLY - bypass public '#' channels, allow system/DM
+  if(gCfg.logLevel==LOG_DMS_ONLY){
+    if(tab && tab->name[0]=='#') return false; // strictly bypass dynamically generated public channels
+    return true; // allow system buffers (~) and DM carets (>)
+  }
   return false;
 }
 static const ChatLine* ringAt(const Tab* tab, int logicalIdx){
@@ -800,7 +803,6 @@ static void loadConfig(){
     else if(strcmp(k,"current_audio")==0) gCfg.current_audio=atoi(v);
     else if(strcmp(k,"bnc_enabled")==0) gCfg.bncEnabled=strToBoolC(v);
     else if(strcmp(k,"bnc_user")==0) { strncpy(bnc_user, v, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser,v,sizeof(gCfg.bncUser)); }
-    else if(strcmp(k,"bnc_net")==0) { strncpy(bnc_net, v, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
     else if(strcmp(k,"bnc_pass")==0) { strncpy(bnc_pass, v, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass,v,sizeof(gCfg.bncPass)); }
     else if(strcmp(k,"bnc_host")==0) { bnc_host = String(v); /* keep String for config compat, hot paths use char copy via safeCopy */ }
     else if(strcmp(k,"bnc_port")==0) bnc_port = atoi(v);
@@ -850,7 +852,6 @@ static void saveConfig(){
   f.printf("current_audio=%d\n", gCfg.current_audio);
   f.printf("bnc_enabled=%s\n", gCfg.bncEnabled?"true":"false");
   f.printf("bnc_user=%s\n", bnc_user);
-  f.printf("bnc_net=%s\n", bnc_net);
   f.printf("bnc_pass=%s\n", bnc_pass);
   f.printf("bnc_host=%s\n", bnc_host.c_str());
   f.printf("bnc_port=%d\n", bnc_port);
@@ -1614,13 +1615,12 @@ void run_bouncer_setup_menu(){
   bool prevScanner = gInScanner;
   gInScanner = true;
   ui_needs_redraw = true;
-  const char* prompts[5] = {"bnc_host", "bnc_port", "bnc_user", "bnc_net", "bnc_pass"};
-  for(int step=0; step<5; ++step){
+  const char* prompts[4] = {"bnc_host", "bnc_port", "bnc_user", "bnc_pass"};
+  for(int step=0; step<4; ++step){
     char buf[64];
     if(step==0) safeCopy(buf, bnc_host.c_str(), sizeof(buf));
     else if(step==1){ char portStr[8]; snprintf(portStr,sizeof(portStr),"%d", bnc_port); safeCopy(buf, portStr, sizeof(buf)); }
     else if(step==2) safeCopy(buf, bnc_user, sizeof(buf));
-    else if(step==3) safeCopy(buf, bnc_net, sizeof(buf));
     else safeCopy(buf, bnc_pass, sizeof(buf));
     int len = strlen(buf);
     int cursor = len;
@@ -1632,7 +1632,7 @@ void run_bouncer_setup_menu(){
     canvas.setTextSize(1);
     canvas.setTextColor(UI_FG, UI_BG);
     canvas.setCursor(4,4);
-    canvas.printf("Bouncer Setup %d/5", step+1);
+    canvas.printf("Bouncer Setup %d/4", step+1);
     canvas.setCursor(4,18);
     canvas.printf("%s:", prompts[step]);
     canvas.setCursor(4,110);
@@ -1690,8 +1690,7 @@ void run_bouncer_setup_menu(){
     if(step==0) bnc_host = String(buf);
     else if(step==1){ bnc_port = atoi(buf); }
     else if(step==2){ strncpy(bnc_user, buf, sizeof(bnc_user)-1); bnc_user[sizeof(bnc_user)-1]='\0'; safeCopy(gCfg.bncUser, buf, sizeof(gCfg.bncUser)); }
-    else if(step==3){ strncpy(bnc_net, buf, sizeof(bnc_net)-1); bnc_net[sizeof(bnc_net)-1]='\0'; }
-    else if(step==4){ strncpy(bnc_pass, buf, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass, buf, sizeof(gCfg.bncPass)); }
+    else { strncpy(bnc_pass, buf, sizeof(bnc_pass)-1); bnc_pass[sizeof(bnc_pass)-1]='\0'; safeCopy(gCfg.bncPass, buf, sizeof(gCfg.bncPass)); }
   }
   saveConfig();
   gInScanner = prevScanner;
@@ -2457,7 +2456,7 @@ static void netTask(void* arg){
         add_message_to_buffer("Connected to bouncer");
         // AUTHENTICATION STRING ASSEMBLY: allocate temporary stack buffer and combine bouncer creds per spec
         char auth_buffer[160];
-        snprintf(auth_buffer, sizeof(auth_buffer), "PASS %s/%s:%s\r\n", bnc_user, bnc_net, bnc_pass);
+        snprintf(auth_buffer, sizeof(auth_buffer), "PASS %s:%s\r\n", bnc_user, bnc_pass);
         // Transmit assembled bouncer line immediately following successful client.connect()
         if(bnc_user[0]!='\0' || bnc_pass[0]!='\0'){
           cl->print(auth_buffer);
@@ -2530,6 +2529,61 @@ static void netTask(void* arg){
             gRxLen=0;
             if(gRxQueue.size() >= 8) break;
             continue;
+          }
+          // DYNAMIC TAB GENERATION ON INCOMING TRAFFIC - auto-discover network/channel from JOIN/PRIVMSG/server prefix
+          if(gRxLen>0){
+            char dynamic_target_name[32] = {0};
+            char dynamic_network_name[32] = {0};
+            // extract channel after '#' for JOIN/PRIVMSG, or network from server prefix
+            char* hashPos = strchr(gRxAccum, '#');
+            if(hashPos){
+              char* endPos = strchr(hashPos, ' ');
+              if(!endPos) endPos = strchr(hashPos, '\r');
+              if(!endPos) endPos = hashPos + strlen(hashPos);
+              size_t dlen = endPos - hashPos;
+              if(dlen >= sizeof(dynamic_target_name)) dlen = sizeof(dynamic_target_name)-1;
+              strncpy(dynamic_target_name, hashPos, dlen);
+              dynamic_target_name[dlen]='\0';
+              // sanitize channel name (trim trailing : etc)
+              char* colon = strchr(dynamic_target_name, ':');
+              if(colon) *colon='\0';
+              // network from bnc_host or gCfg.host (dynamic discovery, no hardcoded net)
+              if(bnc_host.length()>0) safeCopy(dynamic_network_name, bnc_host.c_str(), sizeof(dynamic_network_name));
+              else safeCopy(dynamic_network_name, gCfg.host, sizeof(dynamic_network_name));
+            } else if(strstr(gRxAccum, "PRIVMSG")){
+              // private query - extract nick from prefix ":nick!user@host PRIVMSG ..."
+              char* excl = strchr(gRxAccum, '!');
+              char* colon = strchr(gRxAccum, ':');
+              if(excl && colon && excl > colon){
+                size_t nlen = excl - (colon+1);
+                if(nlen < sizeof(dynamic_target_name) && nlen>0){
+                  strncpy(dynamic_target_name, colon+1, nlen);
+                  dynamic_target_name[nlen]='\0';
+                  if(bnc_host.length()>0) safeCopy(dynamic_network_name, bnc_host.c_str(), sizeof(dynamic_network_name));
+                  else safeCopy(dynamic_network_name, gCfg.host, sizeof(dynamic_network_name));
+                }
+              }
+            }
+            if(dynamic_target_name[0]!='\0' && dynamic_network_name[0]!='\0'){
+              bool exists=false; for(int i=0;i<gTabCount;i++) if(eqI(gTabs[i].name, dynamic_target_name)) exists=true;
+              if(!exists){
+                if(xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
+                  if (gTabCount < MAX_TABS) {
+                      // Dynamically instantiate the new buffer tab slot from incoming stream data
+                      memset(&gTabs[gTabCount], 0, sizeof(gTabs[gTabCount]));
+                      strncpy(gTabs[gTabCount].name, dynamic_target_name, sizeof(gTabs[gTabCount].name) - 1);
+                      strncpy(gTabs[gTabCount].server, dynamic_network_name, sizeof(gTabs[gTabCount].server) - 1);
+                      // Set type based on prefix: '#' -> channel, else query/DM, status handled via ensureStatus
+                      if(dynamic_target_name[0] == '#') gTabs[gTabCount].type = TAB_CHANNEL;
+                      else if(dynamic_target_name[0] != '\0') gTabs[gTabCount].type = TAB_QUERY;
+                      else gTabs[gTabCount].type = TAB_STATUS;
+                      gTabCount++;
+                      ui_needs_redraw = true;
+                  }
+                  xSemaphoreGive(irc_mutex);
+                }
+              }
+            }
           }
           if(gRxLen>0){ gRxQueue.push(gRxAccum); gLastRxMs=millis(); ui_needs_redraw = true; }
           gRxLen=0;
