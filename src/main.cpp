@@ -306,6 +306,15 @@ static bool gStealthPulseActive = false;
 static uint32_t gLastPulseMs = 0;
 static int gHighlightedTab = -1;
 static bool gLedOn = false;
+// 9-MODE ASYNC LED TELEMETRY DECK - all millis() non-blocking, pure C-string safe
+static uint32_t gYellowBlipMs = 0; // MODE3 PONG 40ms
+static uint32_t gGreenBurstMs = 0; static bool gGreenBurstActive = false; // MODE4 SD write
+static uint32_t gRedFlashMs = 0; // MODE5 boundary 80ms
+static uint32_t gWhiteSparkMs = 0; // MODE7 typing 15ms
+static uint32_t gMagentaTintMs = 0; // MODE8 RSSI < -80 100ms
+static uint32_t gPurpleFlashMs = 0; static uint8_t gPurpleFlashPhase = 0; // MODE2 double purple
+static uint32_t gCrimsonLastMs = 0; // MODE6 <15% breathing
+static uint32_t gDisconnectMs = 0; // MODE9 solid orange timeout
 
 // Jack and battery
 static bool gJackPlugged = false;
@@ -521,6 +530,75 @@ static void serviceStealthLed(){
   // enforce 150ms on-time
   if(gLedOn && millis() - gLastPulseMs > 150) setStealthLed(false);
 }
+// 9-MODE ASYNC LED TELEMETRY DECK - all millis() non-blocking, pure C-string safe, never stall Core1
+static void updateLedTelemetry(){
+  uint32_t now = millis();
+  // MODE9 Disconnect Fault - highest priority solid Orange if socket drops
+  if(!gIrcConnected || WiFi.status()!=WL_CONNECTED){
+    neopixelWrite(LED_PIN, 40, 15, 0);
+    gDisconnectMs = now;
+    return;
+  }
+  // MODE2 Highlight Ping - fast double Purple pulse on mention
+  if(gPurpleFlashPhase>0){
+    uint32_t elapsed = now - gPurpleFlashMs;
+    if(gPurpleFlashPhase==2 && elapsed<100){ neopixelWrite(LED_PIN, 60,0,60); return; }
+    if(gPurpleFlashPhase==2 && elapsed<200){ neopixelWrite(LED_PIN, 0,0,0); return; }
+    if(gPurpleFlashPhase==2 && elapsed<300){ neopixelWrite(LED_PIN, 60,0,60); return; }
+    if(elapsed>400){ gPurpleFlashPhase=0; neopixelWrite(LED_PIN,0,0,0); }
+    else if(elapsed<100 || (elapsed>=200 && elapsed<300)) neopixelWrite(LED_PIN,60,0,60);
+    else neopixelWrite(LED_PIN,0,0,0);
+    if(elapsed>400) gPurpleFlashPhase=0;
+    return;
+  }
+  // MODE6 Power Alert - Crimson breathing if bat <15%
+  float v = gBattVoltage; int bat_pct = (int)((v - 3.2f)/(4.2f-3.2f)*100); if(bat_pct<0) bat_pct=0;
+  if(bat_pct < 15){
+    uint8_t crimson = (uint8_t)((sin(now/600.0)+1.0)*30); // slow 600ms
+    neopixelWrite(LED_PIN, crimson, 0, 0);
+    return;
+  }
+  // MODE8 Signal Fade - Magenta tint 100ms if RSSI < -80
+  if(now - gMagentaTintMs < 100){
+    neopixelWrite(LED_PIN, 60, 0, 60);
+    return;
+  } else if(WiFi.status()==WL_CONNECTED && WiFi.RSSI() < -80){
+    gMagentaTintMs = now;
+    neopixelWrite(LED_PIN, 60, 0, 60);
+    return;
+  }
+  // MODE4 Storage Sync - Solid Green burst during SD log write
+  if(gGreenBurstActive && now - gGreenBurstMs < 200){
+    neopixelWrite(LED_PIN, 0, 40, 0);
+    return;
+  } else { gGreenBurstActive=false; }
+  // MODE5 Boundary Hit - 80ms Red flash
+  if(now - gRedFlashMs < 80){
+    neopixelWrite(LED_PIN, 20, 0, 0);
+    return;
+  }
+  // MODE3 Latency Check - 40ms Yellow blip on PONG
+  if(now - gYellowBlipMs < 40){
+    neopixelWrite(LED_PIN, 20, 20, 0);
+    return;
+  }
+  // MODE7 Typing Cadence - 15ms White spark
+  if(now - gWhiteSparkMs < 15){
+    neopixelWrite(LED_PIN, 10, 10, 10);
+    return;
+  }
+  // MODE1 Idle Heartbeat - slow Cyan breathing when healthy
+  if(gIrcConnected){
+    uint8_t breathe_val = (sin(now / 300.0) + 1.0) * 20;
+    // also check if has general unread for slightly brighter
+    bool hasUnread=false; for(int i=0;i<gTabCount;i++) if(gTabs[i].unread) hasUnread=true;
+    uint8_t b = hasUnread ? 60 : 30;
+    neopixelWrite(LED_PIN, 0, breathe_val, b);
+    return;
+  }
+  // idle off
+  neopixelWrite(LED_PIN, 0,0,0);
+}
 
 // ---------------------------------------------------------------------------
 // Tab helpers - ring buffer strictly 20 lines
@@ -614,6 +692,7 @@ static void appendLog(Tab* tab, const char* raw, const char* serverHHMM=nullptr)
   if(lowNick[0] && strstr(lowTxt,lowNick)) fl|=0x01;
   ringPush(tab,raw,fl,serverHHMM);
   // stealth trigger: highlight while stealth mode active
+  if(fl & 0x01){ gPurpleFlashMs=millis(); gPurpleFlashPhase=2; }
   if((fl & 0x01) && gCfg.current_audio == 1){
     // mute speaker entirely
     M5Cardputer.Speaker.stop();
@@ -966,23 +1045,32 @@ static void drawTopBar(){
   // Scrolling tab-strip: show all buffers with [active] and !/* markers
   // HEADER COLOR SEGREGATION: dividers '[',']','|' muted grey, text bright white
   int x=2;
-  for(int i=0;i<gTabCount && x < SCREEN_W-2; ++i){
+  for(int i=0;i<gTabCount && i<3 && x < SCREEN_W-2; ++i){ if(gTabCount>3 && i==2){ d.setTextColor(0x8410, UI_BG); d.setCursor(120,2); d.print("..."); break; }
     bool isActive = (i==gActive);
     char tabTok[36];
     char mark = ' ';
     if(gTabs[i].mention) mark='!';
     else if(gTabs[i].unread) mark='*';
-    if(isActive){
-      if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"[%s%c]", gTabs[i].name, mark);
-      else snprintf(tabTok,sizeof(tabTok),"[%s]", gTabs[i].name);
+    // BUFFER STATUS ICONOGRAPHY: strict 7-bit ASCII - channel '#', DM '>', status '~'
+    if(gTabs[i].type == TAB_CHANNEL || gTabs[i].name[0] == '#'){
+      if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"#%s%c", gTabs[i].name, mark);
+      else snprintf(tabTok,sizeof(tabTok),"#%s", gTabs[i].name);
+    } else if(gTabs[i].type == TAB_QUERY){
+      if(mark!=' ') snprintf(tabTok,sizeof(tabTok),">%s%c", gTabs[i].name, mark);
+      else snprintf(tabTok,sizeof(tabTok),">%s", gTabs[i].name);
     } else {
-      if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"%s%c", gTabs[i].name, mark);
-      else safeCopy(tabTok,gTabs[i].name,sizeof(tabTok));
+      if(mark!=' ') snprintf(tabTok,sizeof(tabTok),"~%s%c", gTabs[i].name, mark);
+      else snprintf(tabTok,sizeof(tabTok),"~%s", gTabs[i].name);
     }
-    // Color-code dividers low-contrast muted grey (0x8410), text bright white (0xFFFF) for legibility
+    // NAVBAR HIGHLIGHT FLASHING: non-blocking 500ms pulse for '!' badge
+    bool flash_on = (millis() / 500) % 2;
     for(char *p=tabTok; *p; ++p){
-      bool isDiv = (*p=='[' || *p==']' || *p=='|');
-      d.setTextColor(isDiv ? 0x8410 : 0xFFFF, UI_BG);
+      if(*p == '!'){
+        d.setTextColor(flash_on ? 0xFD20 : 0x8410, UI_BG);
+      } else {
+        bool isDiv = (*p=='[' || *p==']' || *p=='|');
+        d.setTextColor(isDiv ? 0x8410 : 0xFFFF, UI_BG);
+      }
       d.setCursor(x,2);
       d.print(*p);
       x += CHAR_W;
@@ -1114,7 +1202,11 @@ void draw_chat_view(){
       if(startLogical<0) startLogical=0;
       int endLogical = startLogical + vis; if(endLogical>total) endLogical=total;
       int y=1;
+      // render_polished_chat_rows() - lazy history scroll blitting optimized
       for(int li=startLogical; li<endLogical; ++li){
+        // LAZY HISTORY SCROLL BLITTING: skip off-viewport rows to save CPU - Y < 0 (scrollback) skip word-wrapping math
+        if(y < 0){ y+=ROW_H; continue; }
+        if(y > 109){ break; }
         const ChatLine* cl=ringAt(tab, li); if(!cl) continue;
         canvas.setTextColor(0x5AEB, 0x0000); canvas.setCursor(2, y+1); canvas.print(cl->stamp);
         canvas.drawFastVLine(64, y, ROW_H, 0x5AEB);
@@ -1127,12 +1219,14 @@ void draw_chat_view(){
         canvas.setTextColor((cl->flags&0x01)?UI_WARN:((cl->flags&0x04)?0x8410:UI_FG), 0x0000);
         int maxBodyCols=(SCREEN_W-70-2)/CHAR_W; if((int)strlen(bodyTmp)>maxBodyCols){bodyTmp[maxBodyCols-1]='~'; bodyTmp[maxBodyCols]='\0';}
         canvas.setCursor(70, y+1); canvas.print(bodyTmp);
+        int current_y = y; if (current_y + 10 > 109) break;
         y+=ROW_H;
       }
     }
     xSemaphoreGive(irc_mutex);
   }
   // STEP B (THE DIRECT HARDWARE BLIT): push middle chat viewport first, offset by 12px past top bar
+  canvas.setTextColor(0xFFFF, 0x0000);
   if(gCanvasReady) canvas.pushSprite(0, 12);
   // STEP C (THE FIXED HEADER & FOOTER OVERLAYS): draw top 12px and bottom 14px straight to glass with zero flicker
   // Explicit direct hardware blit per spec: M5Cardputer.Display.fillRect and M5Cardputer.Display.print
@@ -1148,12 +1242,19 @@ void draw_chat_view(){
     char title[32]; if(at) safeCopy(title, at->name, sizeof(title)); else safeCopy(title, "status", sizeof(title));
     // Truncate to fit X=130 (approx 21 chars at 6px)
     if(strlen(title)*CHAR_W > 130){ title[21]='\0'; }
-    // Header dividers muted grey, text white
+    // Header dividers muted grey, text bright white - strict ASCII glyph fallback
     int x=2;
-    // Draw truncated title with muted brackets
-    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print("["); x+=CHAR_W;
+    char prefixChar='~';
+    if(at){
+      if(at->type==TAB_CHANNEL || at->name[0]=='#') prefixChar='#';
+      else if(at->type==TAB_QUERY) prefixChar='>';
+      else prefixChar='~';
+    }
+    char prefixStr[2]={prefixChar,'\0'};
+    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print(prefixStr); x+=CHAR_W;
     d.setTextColor(0xFFFF, UI_BG); d.setCursor(x,2); d.print(title); x+=strlen(title)*CHAR_W;
-    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print("]"); x+=CHAR_W;
+    d.setTextColor(0x5AEB, UI_BG); d.setCursor(x,2); d.print(prefixStr); x+=CHAR_W;
+    if(gTabCount > 3){ d.setTextColor(0x8410, UI_BG); d.setCursor(120, 2); d.print("..."); }
     // Fixed HUD anchors
     // Mute at X=145
     char audioTag[7]; uint16_t audioCol;
@@ -1175,10 +1276,10 @@ void draw_chat_view(){
     d.fillRect(0,INPUT_Y,SCREEN_W,INPUT_H, UI_BG);
     d.drawFastHLine(0,INPUT_Y,SCREEN_W, UI_DIM);
     d.setTextSize(1); d.setTextColor(UI_FG, UI_BG);
-    int maxCols=INPUT_VISIBLE_COLS;
+    int maxCols=INPUT_VISIBLE_COLS; if(maxCols>38) maxCols=38;
     if(gInputLen<=maxCols) gInputScroll=0;
     else { if(gInputCursor<gInputScroll) gInputScroll=gInputCursor; else if(gInputCursor>=gInputScroll+maxCols) gInputScroll=gInputCursor-maxCols+1; if(gInputScroll>gInputLen-maxCols) gInputScroll=gInputLen-maxCols; if(gInputScroll<0) gInputScroll=0; }
-    int vlen=gInputLen-gInputScroll; if(vlen>maxCols) vlen=maxCols; if(vlen<0) vlen=0;
+    int vlen=gInputLen-gInputScroll; if(vlen>38) vlen=38; if(vlen>maxCols) vlen=maxCols; if(vlen<0) vlen=0;
     char visible[INPUT_BUF_SZ]; memcpy(visible,gInput+gInputScroll,vlen); visible[vlen]='\0';
     d.setCursor(2,INPUT_Y+4); d.print(">"); d.print(visible);
     if(gInputScroll>0){
@@ -1362,6 +1463,11 @@ void handle_keyboard_inputs() {
         int total_tabs = gTabCount;
         if (total_tabs > 0) {
             current_tab_index = (current_tab_index + 1) % total_tabs;
+            // CONTEXT-AWARE COMMAND INJECTION: private query window -> pre-seed /msg
+            if(gTabs[current_tab_index].name[0] != '#' && (unsigned char)gTabs[current_tab_index].name[0] != 0xE2){
+                snprintf(gInput, sizeof(gInput), "/msg %s ", gTabs[current_tab_index].name);
+                gInputLen = strlen(gInput); gInputCursor = gInputLen; gInputScroll = 0;
+            }
             ui_needs_redraw = true;
         }
         return;
@@ -1370,6 +1476,10 @@ void handle_keyboard_inputs() {
         int total_tabs = gTabCount;
         if (total_tabs > 0) {
             current_tab_index = (current_tab_index == 0) ? (total_tabs - 1) : current_tab_index - 1;
+            if(gTabs[current_tab_index].name[0] != '#' && (unsigned char)gTabs[current_tab_index].name[0] != 0xE2){
+                snprintf(gInput, sizeof(gInput), "/msg %s ", gTabs[current_tab_index].name);
+                gInputLen = strlen(gInput); gInputCursor = gInputLen; gInputScroll = 0;
+            }
             ui_needs_redraw = true;
         }
         return;
@@ -1384,6 +1494,10 @@ void handle_keyboard_inputs() {
             char target_server[96]; if(strlen(gTabs[idx].server)>0) safeCopy(target_server,gTabs[idx].server,sizeof(target_server)); else if(bnc_host.length()>0) safeCopy(target_server,bnc_host.c_str(),sizeof(target_server)); else safeCopy(target_server,gCfg.host,sizeof(target_server));
             if (!eqI(current_server, target_server)) {
                 current_tab_index = idx;
+                if(gTabs[current_tab_index].name[0] != '#' && (unsigned char)gTabs[current_tab_index].name[0] != 0xE2){
+                    snprintf(gInput, sizeof(gInput), "/msg %s ", gTabs[current_tab_index].name);
+                    gInputLen = strlen(gInput); gInputCursor = gInputLen; gInputScroll = 0;
+                }
                 ui_needs_redraw = true;
                 return;
             }
@@ -1399,6 +1513,10 @@ void handle_keyboard_inputs() {
             char target_server[96]; if(strlen(gTabs[idx].server)>0) safeCopy(target_server,gTabs[idx].server,sizeof(target_server)); else if(bnc_host.length()>0) safeCopy(target_server,bnc_host.c_str(),sizeof(target_server)); else safeCopy(target_server,gCfg.host,sizeof(target_server));
             if (!eqI(current_server, target_server)) {
                 current_tab_index = idx;
+                if(gTabs[current_tab_index].name[0] != '#' && (unsigned char)gTabs[current_tab_index].name[0] != 0xE2){
+                    snprintf(gInput, sizeof(gInput), "/msg %s ", gTabs[current_tab_index].name);
+                    gInputLen = strlen(gInput); gInputCursor = gInputLen; gInputScroll = 0;
+                }
                 ui_needs_redraw = true;
                 return;
             }
@@ -1443,10 +1561,13 @@ void handle_keyboard_inputs() {
         if(st.fn && (c==';' || c=='.' || c==',' || c=='/')) continue;
         if(c>=32 && c<127 && gInputLen < INPUT_BUF_SZ-1){
             memmove(gInput+gInputCursor+1, gInput+gInputCursor, gInputLen - gInputCursor +1);
-            gInput[gInputCursor++]=c; gInputLen++; gHistNav=-1; ui_needs_redraw = true;
+            gInput[gInputCursor++]=c; gInputLen++; gHistNav=-1; ui_needs_redraw = true; gWhiteSparkMs=millis();
         }
     }
-    if(st.del && gInputLen>0 && gInputCursor>0){ memmove(gInput+gInputCursor-1, gInput+gInputCursor, gInputLen - gInputCursor +1); gInputCursor--; gInputLen--; gHistNav=-1; ui_needs_redraw = true; }
+    if(st.del){
+      if(gInputLen>0 && gInputCursor>0){ memmove(gInput+gInputCursor-1, gInput+gInputCursor, gInputLen - gInputCursor +1); gInputCursor--; gInputLen--; gHistNav=-1; ui_needs_redraw = true; }
+      else if(gInputLen==0){ gRedFlashMs=millis(); }
+    }
     if(st.fn){
         for(char c : st.word){
             if(c==',' && gInputCursor>0){ gInputCursor--; ui_needs_redraw = true; }
@@ -1839,7 +1960,7 @@ static void handleRawIrc(char* line){
     logStatus(msg);
     return;
   }
-  if(strcmp(cmd,"PONG")==0){ gAwaitPong=false; return; }
+  if(strcmp(cmd,"PONG")==0){ gAwaitPong=false; gYellowBlipMs=millis(); return; }
   if(strcmp(cmd,"001")==0){
     gIrcRegistered=true;
     logStatus("Registered on IRC");
@@ -2134,9 +2255,9 @@ static void runWifiProvisioning(){
   struct Ent{ char ssid[33]; int rssi; };
   Ent all[24]; int ac=0;
   for(int i=0;i<n && ac<24; ++i){
-    String ss=WiFi.SSID(i);
-    if(ss.length()==0) continue;
-    safeCopy(all[ac].ssid, ss.c_str(), sizeof(all[ac].ssid));
+    char ss[33]; safeCopy(ss, WiFi.SSID(i).c_str(), sizeof(ss));
+    if(ss[0]=='\0') continue;
+    safeCopy(all[ac].ssid, ss, sizeof(all[ac].ssid));
     all[ac].rssi=WiFi.RSSI(i);
     ac++;
   }
@@ -2315,6 +2436,7 @@ static void netTask(void* arg){
       }
     }
     if(WiFi.status()!=WL_CONNECTED){ gIrcConnected=false; vTaskDelay(pdMS_TO_TICKS(200)); continue; }
+    if(WiFi.RSSI() < -80){ gMagentaTintMs=millis(); }
     Client* cl = gCfg.useTLS ? (Client*)&gSecure : (Client*)&gPlain;
     if(!gIrcConnected){
       static uint32_t lastTry=0;
@@ -2420,12 +2542,14 @@ static void logTask(void* arg){
           }
         }
         // All SD file write operations wrapped inside irc_mutex per spec
+        gGreenBurstActive=true; gGreenBurstMs=millis();
         File f = SD.open(e.path, FILE_APPEND);
         if(!f) f = SD.open(e.path, FILE_WRITE);
         if(f){
           f.println(e.line);
           f.close();
         }
+        // keep Green burst active for 200ms via timer, cleared in updateLedTelemetry
         xSemaphoreGive(irc_mutex);
       }
     } else {
@@ -2710,34 +2834,11 @@ void setup(){
   gTabsMutex = xSemaphoreCreateMutex(); // separate to avoid priority inversion lock order
     gTxQueue.init(); gRxQueue.init(); gLogQueue.init();
 
-  // Safe Mode single-pass check - robust BtnA via TCA8418 (ignore floating GPIO0 strapping) - require intentional hold
-  Serial.println("[BOOSTER-LOG] Safe Mode initialization check...");
-  pinMode(0, INPUT_PULLUP);
-  vTaskDelay(pdMS_TO_TICKS(10)); yield(); Wire.setTimeOut(50);
-  M5Cardputer.update();
-  // Only BtnA via TCA8418 counts - raw GPIO0 floats low on Cardputer Adv and causes spurious safe mode
-  int btnConfirm = 0;
-  for(int i=0;i<5;i++){ vTaskDelay(pdMS_TO_TICKS(10)); yield(); M5Cardputer.update(); if(M5Cardputer.BtnA.isPressed()) btnConfirm++; }
-  bool safeModeRequested = (btnConfirm >= 4); // 4/5 BtnA reads over 50ms, ignore floating GPIO0 strapping - require intentional hold
-  if (safeModeRequested) {
-      Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
-      safe_mode_active = true;
-      gSafeBoot = true;
-      gTabCount = 1;
-      current_tab_index = 0;
-      memset(&gTabs[0], 0, sizeof(gTabs[0]));
-      memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
-      strncpy(active_networks[0], "None", sizeof(active_networks[0])-1); active_networks_count = 1;
-      strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
-      strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
-      gTabs[0].type = TAB_STATUS;
-      add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
-      xSemaphoreGive(irc_mutex); // Force release the initialization lock per spec (safe even if already freed, ensures SPI bus unlocked)
-  } else {
-      Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
-      safe_mode_active = false;
-      gSafeBoot = false;
-  }
+  // Safe Mode: defer decision until after display ready - avoid floating GPIO0 at boot
+  Serial.println("[BOOSTER-LOG] Safe Mode initialization check - deferred until after splash...");
+  safe_mode_active = false;
+  gSafeBoot = false;
+  // Do not sample GPIO0 here - floating strapping causes spurious safe mode; decision after splash with visual hold prompt
   // Execution MUST flow through cleanly past this block immediately!
 
   // Hardware pin setup after mutex creation (does not touch irc_mutex)
@@ -2747,6 +2848,8 @@ void setup(){
   pinMode(JACK_DETECT_PIN, INPUT_PULLUP);
   pinMode(AMP_SHUTDOWN_PIN, OUTPUT);
   digitalWrite(AMP_SHUTDOWN_PIN, HIGH);
+  pinMode(38, OUTPUT);
+  digitalWrite(38, HIGH);
   pinMode(LED_PIN, OUTPUT);
   neopixelWrite(LED_PIN,0,0,0);
   gLastInputMs=millis();
@@ -2770,6 +2873,44 @@ void setup(){
   // PRE-FLIGHT DRAWING INSURANCE: force initial draw before background thread
   ui_needs_redraw = true;
   draw_chat_view();
+  // Safe Mode hold prompt - require intentional 1s hold of G0/BtnA after splash, not floating GPIO at boot
+  {
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
+    M5Cardputer.Display.setCursor(8, 70);
+    M5Cardputer.Display.print("Hold G0 1s for SafeMode");
+    // sample BtnA for 1s with visual feedback, feed WDT
+    int holdConfirm = 0;
+    for(int i=0;i<10;i++){ vTaskDelay(pdMS_TO_TICKS(100)); yield(); M5Cardputer.update(); Wire.setTimeOut(50);
+      bool isHeld = M5Cardputer.BtnA.isPressed(); // only TCA8418 BtnA, ignore floating GPIO0 strapping
+      if(isHeld) holdConfirm++; else holdConfirm = 0;
+      // visual tick
+      M5Cardputer.Display.setCursor(8+ i*6, 82); M5Cardputer.Display.print(isHeld?".":" ");
+      if(holdConfirm >= 8){ // 800ms continuous hold
+        Serial.println("[BOOSTER-LOG] Safe Mode Triggered! Bypassing connections.");
+        safe_mode_active = true; gSafeBoot = true;
+        gTabCount = 1; current_tab_index = 0;
+        memset(&gTabs[0], 0, sizeof(gTabs[0]));
+        memset(active_networks, 0, sizeof(active_networks)); active_networks_count = 0;
+        strncpy(active_networks[0], "None", sizeof(active_networks[0])-1); active_networks_count = 1;
+        strncpy(gTabs[0].name, "SafeMode", sizeof(gTabs[0].name) - 1);
+        strncpy(gTabs[0].server, "None", sizeof(gTabs[0].server) - 1);
+        gTabs[0].type = TAB_STATUS;
+        add_message_to_buffer("System", "Safe Mode Active: All connections bypassed.", 0xFD20);
+        xSemaphoreGive(irc_mutex);
+        break;
+      }
+    }
+    if(!safe_mode_active){
+      Serial.println("[BOOSTER-LOG] Normal Boot: Safe Mode not held.");
+      safe_mode_active = false; gSafeBoot = false;
+      // clear prompt
+      M5Cardputer.Display.fillRect(8,70, 180, 20, 0x0000);
+      ui_needs_redraw = true; draw_chat_view();
+    } else {
+      // keep SafeMode prompt visible
+      M5Cardputer.Display.setCursor(8, 82); M5Cardputer.Display.print(" SAFE MODE ");
+    }
+  }
   // Intermediate init - SPI, SD, config, etc. (all after mutex, before network) - guarded in safe mode to avoid SPI bus contention with ST7789
   if(!gSafeBoot){
     SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
@@ -2820,6 +2961,7 @@ void loop() {
     vTaskDelay(pdMS_TO_TICKS(5)); // High-speed <5ms execution pass throttle
     
     M5Cardputer.update(); // if (!safe_mode_active) { network streams / socket / packet buffers guarded } 
+    updateLedTelemetry();
     handle_keyboard_inputs(); 
     
     if (ui_needs_redraw) {
