@@ -109,8 +109,7 @@ void set_led_mode(uint8_t mode) {
             r = 60;
             break;
     }
-    uint32_t raw_hex_color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
-    M5Cardputer.Display.setBaseColor(raw_hex_color);
+    neopixelWrite(21, r, g, b);
 }
 
 // ==========================================
@@ -923,8 +922,8 @@ void custom_ui_loop_task(void* pvParameters) {
         handle_keyboard_inputs();
         
         // Non-blocking auto dim screen backlight sleep timer check
-        if (millis() - last_input_time > 60000) { M5Cardputer.Display.setBrightness(10); }
-        else { M5Cardputer.Display.setBrightness(screen_brightness); }
+        if (millis() - last_input_time > 60000) { M5Cardputer.Display.setBrightness(10); vTaskDelay(pdMS_TO_TICKS(5)); }
+        else { M5Cardputer.Display.setBrightness(screen_brightness); vTaskDelay(pdMS_TO_TICKS(5)); }
         
         // Drive Stamp-S3A LED modes asynchronously without delay halts
         set_led_mode(safe_mode_active ? 0 : 1);
@@ -946,6 +945,10 @@ void setup() {
     cfg.external_spk = false; // Turn off legacy I2S audio channels cleanly to prevent core panics
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
+    // Create canvas sprite for middle viewport (240x109) - must be done after Display init
+    // Without this, pushSprite operates on 0x0 buffer -> middle stays on splash / appears frozen
+    canvas.createSprite(240, 109);
+    canvas.setTextSize(1);
     
     // UN-LOCKABLE WIRE I2C REGISTER TIMEOUT PROTECTION CODES
     Wire.setTimeOut(50);
@@ -955,8 +958,9 @@ void setup() {
     digitalWrite(38, HIGH);
     
     // Open clean cooperative SPI bus lane pipelines
-    SPI.begin();
-    SD.begin(12, SPI, 10000000); // Strict 10MHz layout clock limit safety to wipe line trace cross-talk noise
+    // Cardputer SD uses SCK=40, MISO=39, MOSI=14, CS=12 per official example
+    SPI.begin(40, 39, 14, 12);
+    SD.begin(12, SPI, 10000000);
     
     irc_mutex = xSemaphoreCreateMutex();
     gLogQueue = xQueueCreate(20, sizeof(char) * 128);
@@ -998,8 +1002,6 @@ void setup() {
     
     strncpy(gTabs[1].name, "~system", sizeof(gTabs[1].name)-1);
     strncpy(gTabs[1].server, "Bouncer", sizeof(gTabs[1].server)-1);
-    
-    if (irc_mutex) xSemaphoreGive(irc_mutex);
     
     // SPAWN CONCURRENT COOPERATIVE WORKERS STRATEGIC CORES
     xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 8192, NULL, 1, NULL, 0); // Socket operations on Core 0
