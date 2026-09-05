@@ -60,6 +60,13 @@ M5Canvas canvas(&M5Cardputer.Display);
 // Core Configuration Properties (Zero-Initialized, No Hardcoding)
 char wifi_ssid[64] = {0};
 char wifi_pass[64] = {0};
+char wifi_ssid2[32] = {0}; // Fallback phone hotspot network name
+char wifi_pass2[64] = {0}; // Fallback password
+bool using_backup_ap = false;
+unsigned long last_wifi_fail_tick = 0;
+
+volatile int scrollback_offset_idx = 0; // 0 = Live bottom-anchored feed, >0 = Looking at past lines
+volatile bool scrollback_mode_active = false;
 char irc_nick[64]  = {0};
 char bnc_host[64]  = {0};
 int bnc_port       = 0;
@@ -500,9 +507,13 @@ void draw_chat_view() {
             canvas.setCursor(10, 40); canvas.printf("%s Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
             canvas.setCursor(10, 54); canvas.printf("%s Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
         } else {
+            // --- WI-FI CONFIG MANAGER WITH FALLBACK CREDENTIALS ---
             canvas.print("--- WI-FI CONFIG MANAGER ---"); canvas.setTextColor(0xFFFF);
-            canvas.setCursor(10, 26); canvas.printf("%s Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
-            canvas.setCursor(10, 40); canvas.printf("%s Scan Airwaves: [ RUN ]", (menu_selection_idx == 1 ? ">" : " "));
+            canvas.setCursor(10, 26); canvas.printf("%s Primary SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
+            canvas.setCursor(10, 40); canvas.printf("%s Primary Pass: [ **** ]", (menu_selection_idx == 1 ? ">" : " "));
+            canvas.setCursor(10, 54); canvas.printf("%s Backup Hotspot: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)wifi_ssid2);
+            canvas.setCursor(10, 68); canvas.printf("%s Backup Pass:  [ **** ]", (menu_selection_idx == 3 ? ">" : " "));
+            canvas.setCursor(10, 86); canvas.printf("%s Scan Airwaves: [ RUN ]", (menu_selection_idx == 4 ? ">" : " "));
         }
         canvas.fillRect(0, 120, 240, 15, 0x0000);
         canvas.setCursor(10, 122); canvas.setTextColor(0x7BEF); canvas.print("Esc: Exit | ,/. Adjust Value");
@@ -515,19 +526,14 @@ void draw_chat_view() {
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         canvas.fillSprite(0x0000);
         Tab &t = gTabs[current_tab_index];
-        // Reverse-Viewport Engine: Draw text lines starting from the absolute 
-        // latest message in memory, stacking older traffic upwards toward the navbar
-        int current_y = 97; // Anchor initial line right above the textbox border
-        
-        for (int i = t.line_count - 1; i >= 0; i--) {
-            if (current_y < 2) break; // Stop drawing if text pushes past the top navbar border
-            
-            // Bottom Viewport Clipping Shield: Forcefully skip rendering this specific 
-            // text row if a multi-line wrapping layout accidentally drops its Y cursor past our chat pane floor
-            if (current_y > 115) {
-                current_y -= 12; // Shift up to prevent task lock and keep processing historical blocks
-                continue;
-            }
+        // Reverse-Viewport Engine with active Scrollback Reviewer support offsets
+        int current_y = 97; 
+        int start_array_idx = (t.line_count - 1) - scrollback_offset_idx;
+        if (start_array_idx < 0) start_array_idx = 0;
+
+        for (int i = start_array_idx; i >= 0; i--) {
+            if (current_y < 2) break;
+            if (current_y > 115) { current_y -= 12; continue; }
             
             uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
             int text_start_x = (current_tab_index == 0) ? 110 : 70;
@@ -600,18 +606,34 @@ void draw_chat_view() {
     if (channel_log_enabled == 1) { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("L"); }
     else { M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.print("N"); }
     
-    // De-clutter and space out top-right telemetry items to prevent overlapping strings
     unsigned long current_sync_sec = (millis() / 1000) + adj_time;
     uint32_t active_min = (current_sync_sec / 60) % 60;
     uint32_t active_hr  = ((current_sync_sec / 3600) + current_tz_idx) % (use_12_hour_format ? 12 : 24);
     if (use_12_hour_format && active_hr == 0) active_hr = 12;
-    
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); 
-    M5Cardputer.Display.setCursor(166, 2); // Shift clock leftward 
-    M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
-    
-    M5Cardputer.Display.setCursor(210, 2); // Pull battery percentage into its own far-right slot
-    M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(182, 2); M5Cardputer.Display.printf("%02d:%02d", active_hr, active_min);
+    M5Cardputer.Display.setCursor(212, 2); M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
+
+    // Low-Profile Navbar Activity Indicator Dots Engine
+    // Draws tiny 2px tracking dots along the navbar floor to alert your eyes to background channel traffic
+    for (int t = 1; t < gTabCount; t++) {
+        if (t == current_tab_index) continue; // Skip drawing a dot for the active tab you are looking at
+        
+        int dot_x = 2 + (t * 6); // Space out alert pins cleanly across the left navbar edge
+        if (dot_x > 130) break;   // Boundary shield to prevent dots from bleeding into network text labels
+        
+        bool has_unread_highlight = false;
+        bool has_unread_msg = (gTabs[t].line_count > 0);
+        
+        for (int l = 0; l < gTabs[t].line_count; l++) {
+            if (gTabs[t].lines[l].is_highlight) { has_unread_highlight = true; break; }
+        }
+        
+        if (has_unread_highlight) {
+            M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0xFD20); // High-contrast Amber dot for unread mentions
+        } else if (has_unread_msg) {
+            M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0x07FF); // Soft Cyan dot for standard background chatter
+        }
+    }
 
     // LOWER INPUT BOX
     M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
@@ -692,29 +714,24 @@ void draw_chat_view() {
     // On the Cardputer layout, Fn+Arrows outputs direct character values:
     // Fn+Left = ';' | Fn+Right = '/' | Fn+Up = ',' | Fn+Down = '.'
     if (current_app_mode == MODE_CHAT) {
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn+Left Arrow shortcut intercepted
-            if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; set_led_mode(18); }
-            // Clear highlights automatically upon entering or cycling active channel views
-            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                Tab &current_view_tab = gTabs[current_tab_index];
-                for (int l = 0; l < current_view_tab.line_count; l++) {
-                    current_view_tab.lines[l].is_highlight = false;
-                }
-                xSemaphoreGive(irc_mutex);
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn + UP Arrow
+            Tab &t = gTabs[current_tab_index];
+            if (scrollback_offset_idx < t.line_count - 1) {
+                scrollback_offset_idx++; // Shift old message history down into viewport frame
+                ui_needs_redraw = true;
             }
             return;
         }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Fn+Right Arrow shortcut intercepted
-            if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; set_led_mode(18); }
-            // Clear highlights automatically upon entering or cycling active channel views
-            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                Tab &current_view_tab = gTabs[current_tab_index];
-                for (int l = 0; l < current_view_tab.line_count; l++) {
-                    current_view_tab.lines[l].is_highlight = false;
-                }
-                xSemaphoreGive(irc_mutex);
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn + DOWN Arrow
+            if (scrollback_offset_idx > 0) {
+                scrollback_offset_idx--; // Scroll back down toward the newest messages
+                ui_needs_redraw = true;
             }
             return;
+        }
+        if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
+            scrollback_offset_idx = 0; // Escape key sequence instantly snaps viewport right back to live chat
+            ui_needs_redraw = true;
         }
     } else {
         // Navigator Hub override: side-by-side Server & Channel navigation
@@ -802,7 +819,8 @@ void draw_chat_view() {
                 }
                 if (nav_channel_select_idx < total_chans - 1) { nav_channel_select_idx++; ui_needs_redraw = true; }
             } else {
-                int max_limit = (current_app_mode == MODE_SETTINGS) ? 3 : 2;
+                // Determine our menu navigation boundary max depending on active layout modes
+                int max_limit = (current_app_mode == MODE_WIFI) ? 4 : ((current_app_mode == MODE_SETTINGS) ? 3 : 2);
                 if (menu_selection_idx < max_limit) { menu_selection_idx++; ui_needs_redraw = true; }
             }
             return;
@@ -1041,11 +1059,27 @@ void irc_network_task(void* pvParameters) {
             continue;
         }
 
-        // Keep cycling if the radio chip is still negotiating access point authentication
         if (WiFi.status() != WL_CONNECTED) {
-            set_led_mode(9); // Animate Orange to indicate background connection tuning
+            set_led_mode(9); // Orange Network Fault Light
+            
+            if (last_wifi_fail_tick == 0) last_wifi_fail_tick = millis();
+            
+            // If primary network link stays dead for more than 10 seconds, failover roam to backup credentials
+            if (millis() - last_wifi_fail_tick > 10000 && strlen(wifi_ssid2) > 0) {
+                WiFi.disconnect(true);
+                vTaskDelay(pdMS_TO_TICKS(100));
+                
+                using_backup_ap = !using_backup_ap; // Alternate target networks
+                const char* target_ssid = using_backup_ap ? wifi_ssid2 : wifi_ssid;
+                const char* target_pass = using_backup_ap ? wifi_pass2 : wifi_pass;
+                
+                Serial.printf("[NET] Hotspot Auto-Roaming triggered! Target: %s\n", target_ssid);
+                WiFi.begin(target_ssid, target_pass);
+                last_wifi_fail_tick = millis(); // Reset timer for next rotation check
+            }
             continue;
         }
+        last_wifi_fail_tick = 0; // Reset ticker once connection settles healthy
 
         // STEP 1: INITIAL PASS - EXTRACT NETWORKS DYNAMICALLY FROM THE BOUNCER
         if (!master_scan_complete) {
