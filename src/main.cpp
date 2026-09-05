@@ -533,10 +533,15 @@ void draw_chat_view() {
         return;
     }
 
-    // 3. GENERATE MIDDLE GRAPHICS CANVAS VIEWPORT (Y=12 TO Y=121)
-    canvas.fillSprite(0x0000);
-    
+    // ----------------------------------------------------
+    // STATE 3: LIVE TERMINAL CHAT VIEWPORT
+    // ----------------------------------------------------
+    // Atomic Memory Fence: Lock the mutex BEFORE clearing the canvas sprite
+    // to stop the text lines from disappearing during background batch streams!
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        
+        canvas.fillSprite(0x0000); // Safe to clear now that memory states are locked
+        
         Tab &t = gTabs[current_tab_index]; int current_y = 2;
         for (int i = 0; i < t.line_count; i++) {
             if (current_y + 11 > 109) break;
@@ -831,7 +836,7 @@ void handle_keyboard_inputs() {
     // ==========================================
     if (current_app_mode != MODE_CHAT) {
         
-        // 1. VERTICAL SCROLLING AXIS (Semicolon = UP | Period = DOWN)
+        // Vertical List Row Selection (Single-press Semicolon = UP | Period = DOWN)
         if (M5Cardputer.Keyboard.isKeyPressed(';')) { // Physical UP Key
             if (current_app_mode == MODE_NAVIGATOR) {
                 if (nav_channel_select_idx > 0) { nav_channel_select_idx--; ui_needs_redraw = true; }
@@ -1128,6 +1133,66 @@ void irc_network_task(void* pvParameters) {
             if (net_client.connected() && net_client.available()) {
                 String line = net_client.readStringUntil('\n');
                 line.trim(); line.replace("\r", "");
+
+                // --- DYNAMIC CHANNEL SYNC - UNIVERSAL DISCOVERY SCANNER ---
+                String discovered_room = "";
+
+                if (line.indexOf(" JOIN ") != -1) {
+                    int join_idx = line.indexOf(" JOIN ");
+                    discovered_room = line.substring(join_idx + 6);
+                } 
+                else if (line.indexOf(" 353 ") != -1) { // Process server NAMES response packets
+                    int equal_idx = line.indexOf(" = ");
+                    if (equal_idx != -1) {
+                        int colon_idx = line.indexOf(" :", equal_idx);
+                        if (colon_idx != -1) discovered_room = line.substring(equal_idx + 3, colon_idx);
+                    }
+                }
+                else if (line.indexOf(" PRIVMSG ") != -1) { // Flexible chat playback scanner
+                    int priv_idx = line.indexOf(" PRIVMSG ");
+                    int colon_idx = line.indexOf(" :", priv_idx);
+                    if (priv_idx != -1 && colon_idx != -1) {
+                        String target_recipient = line.substring(priv_idx + 9, colon_idx);
+                        target_recipient.trim();
+                        int hash_pos = target_recipient.indexOf('#');
+                        if (hash_pos != -1) discovered_room = target_recipient.substring(hash_pos);
+                    }
+                }
+
+                // If a channel name was isolated, dynamically allocate its space in RAM
+                if (discovered_room.length() > 0) {
+                    discovered_room.trim(); if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
+                    if (discovered_room.startsWith("#") || discovered_room.startsWith("&")) {
+                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            bool tab_exists = false;
+                            for (int t = 0; t < gTabCount; t++) {
+                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) { tab_exists = true; break; }
+                            }
+                            // Dynamic Tab Provisioning Safety Guardrail
+                            if (!tab_exists && gTabCount < MAX_TABS) {
+                                strncpy(gTabs[gTabCount].name, discovered_room.c_str(), sizeof(gTabs[gTabCount].name)-1);
+                                strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
+                                
+                                // CRITICAL RE-ALIGNMENT: ONLY initialize line count to zero 
+                                // for brand new tabs. Never let background updates overwrite an active tab!
+                                gTabs[gTabCount].line_count = 0; 
+                                gTabCount++;
+                            }
+                            xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
+                        }
+                    }
+                }
+
+                // ==========================================
+                // 🛑 PROTOCOL DROP SHIELD MASK
+                // ==========================================
+                // Intercept raw 353 (NAMES list) and 366 (End of NAMES) protocol blocks.
+                // Drop them out of execution instantly so they can never flood message buffers or flash screens!
+                if (line.indexOf(" 353 ") != -1 || line.indexOf(" 366 ") != -1) {
+                    continue; 
+                }
+
+                // Process standard live traffic below this shield pass...
                 // Recommended alternative: zero-init + explicit null guarantee (fixes char parsed_time[6]="00:00" truncation risk)
                 char parsed_time[6] = {0};
                 strncpy(parsed_time, "00:00", sizeof(parsed_time)-1);
@@ -1160,57 +1225,6 @@ void irc_network_task(void* pvParameters) {
                     network_handshake_complete[i] = true;
                     Serial.printf("[NET-SYNC] Handshake finalized for network: %s. Releasing channels.\n", discovered_networks[i]);
                     continue;
-                }
-
-                // LAYER A: DYNAMIC CHANNEL SYNC - EXPANDED AUTOMATED ROOM DISCOVERY ENGINE
-                String discovered_room = "";
-
-                if (line.indexOf(" JOIN ") != -1) {
-                    int join_idx = line.indexOf(" JOIN ");
-                    discovered_room = line.substring(join_idx + 6);
-                } 
-                else if (line.indexOf(" 353 ") != -1) { // Intercept NAMES channel listing protocol
-                    int equal_idx = line.indexOf(" = ");
-                    if (equal_idx != -1) {
-                        int colon_idx = line.indexOf(" :", equal_idx);
-                        if (colon_idx != -1) {
-                            discovered_room = line.substring(equal_idx + 3, colon_idx);
-                        }
-                    }
-                }
-                else if (line.indexOf(" PRIVMSG #") != -1) { // Intercept historical playback line channels
-                    int priv_idx = line.indexOf(" PRIVMSG ");
-                    int colon_idx = line.indexOf(" :", priv_idx);
-                    if (priv_idx != -1 && colon_idx != -1) {
-                        discovered_room = line.substring(priv_idx + 9, colon_idx);
-                    }
-                }
-
-                // If a channel name was successfully isolated out of the background socket stream, register it
-                if (discovered_room.length() > 0) {
-                    discovered_room.trim();
-                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
-                    
-                    // Filter out server/user text remnants to ensure it's a valid room query tag
-                    if (discovered_room.startsWith("#") || discovered_room.startsWith("&")) {
-                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            bool tab_exists = false;
-                            for (int t = 0; t < gTabCount; t++) {
-                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && 
-                                    strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
-                                    tab_exists = true; break;
-                                }
-                            }
-                            // Spawn the channel tab dynamically under its origin network context string
-                            if (!tab_exists && gTabCount < MAX_TABS) {
-                                strncpy(gTabs[gTabCount].name, discovered_room.c_str(), sizeof(gTabs[gTabCount].name)-1);
-                                strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
-                                gTabs[gTabCount].line_count = 0;
-                                gTabCount++;
-                            }
-                            xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
-                        }
-                    }
                 }
 
                 // LAYER B: DYNAMIC CHANNEL SYNC - PART EVENT EXTRACTION (STATE MACHINE DELETION ENGINE)
@@ -1404,7 +1418,11 @@ void custom_ui_loop_task(void* pvParameters) {
 
         set_led_mode(target_led_mode);
         
-        if (ui_needs_redraw) {
+        // Repaint Throttle Guard Shield
+        // Restricts viewport sprite flashes by throttling screen clear loops during heavy bouncer playback dumps
+        static unsigned long last_screen_render_tick = 0;
+        if (ui_needs_redraw && (millis() - last_screen_render_tick >= 50)) {
+            last_screen_render_tick = millis();
             draw_chat_view();
         }
     }
