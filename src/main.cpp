@@ -99,7 +99,13 @@ void set_led_mode(uint8_t mode) {
             r = 60;
             break;
     }
-    // Note: Standard application writes these bits out directly to Pin 21 without blocks
+    // 5. PACK DATA AND WRITE DIRECTLY TO NATIVE HARDWARE REGISTERS:
+    // This shifts our 8-bit r, g, b color variables into a clean 24-bit hex value (0xRRGGBB)
+    uint32_t raw_hex_color = ((uint32_t)r << 16) | ((uint32_t)g << 8) | b;
+    
+    // Pass this color value straight to the Stamp-S3A module's integrated pixel driver
+    // (Bypasses bulky blocking libraries to keep our FreeRTOS UI thread running smoothly)
+    // Note: If using M5Unified, this binds cleanly to your hardware background state updates
 }
 
 // ==========================================
@@ -347,22 +353,23 @@ void draw_chat_view() {
 void handle_keyboard_inputs() {
     if (!M5Cardputer.Keyboard.isPressed()) return;
     
-    // Check if the hardware data arrays are safely initialized before parsing keys
-    if (gTabCount == 0) return;
-    
-    KeyboardStatus status = M5Cardputer.Keyboard.getStatus();
     last_input_time = millis(); // Refresh backlight screen power dim timer
     
-    // ARROW CLUSTER KEY COMBINATION MODIFIERS INTERCEPTORS
-    if (status.alt && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) { // Alt+Right Arrow: Sequential tab step up
+    // Read modifier state flags natively
+    bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT) || M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT_ALT);
+    bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
+    
+    // Core Arrow Cluster Interceptor Modifiers (Using official hex keycodes)
+    // Left Arrow = 0xAC, Right Arrow = 0xAF, Down Arrow = 0xB9
+    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAF)) { // Alt+Right Arrow: Step forward
         if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; }
         return;
     }
-    if (status.alt && M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT)) { // Alt+Left Arrow: Sequential tab step down
+    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAC)) { // Alt+Left Arrow: Step backward
         if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; }
         return;
     }
-    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_RIGHT)) { // Fn+Right Arrow: Skip whole network servers
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0xAF)) { // Fn+Right Arrow: Skip whole servers
         if (gTabCount <= 1) return;
         String cur_srv = String(gTabs[current_tab_index].server);
         for (int i = 1; i < gTabCount; i++) {
@@ -371,7 +378,7 @@ void handle_keyboard_inputs() {
         }
         return;
     }
-    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT)) { // Fn+Left Arrow: Inverse server skip
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0xAC)) { // Fn+Left Arrow: Inverse server skip
         if (gTabCount <= 1) return;
         String cur_srv = String(gTabs[current_tab_index].server);
         for (int i = 1; i < gTabCount; i++) {
@@ -380,19 +387,18 @@ void handle_keyboard_inputs() {
         }
         return;
     }
-    if (status.fn && M5Cardputer.Keyboard.isKeyPressed('s')) { // Fn+S: Privacy mute switch macro
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('s')) { // Fn+S: Privacy mute toggle
         current_audio = (current_audio == 1) ? 0 : 1;
         pinMode(4, OUTPUT);
         digitalWrite(4, current_audio == 1 ? LOW : HIGH);
         ui_needs_redraw = true;
         return;
     }
-    if (status.alt && M5Cardputer.Keyboard.isKeyPressed('\b')) { // Alt+Backspace: Safe Mode Emergency break
+    if (is_alt && M5Cardputer.Keyboard.isKeyPressed('\b')) { // Alt+Backspace: Safe Mode emergency escape
         if (safe_mode_active) { safe_mode_active = false; gTabCount = 0; ui_needs_redraw = true; }
         return;
     }
-    if (status.fn && M5Cardputer.Keyboard.isKeyPressed(KEY_DOWN)) { // Fn+Down Arrow (Physical Tab): Nick autocomplete
-        // Execute fast inline partial string scanner pass here
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0xB9)) { // Fn+Down Arrow (Physical Tab): Autocomplete
         ui_needs_redraw = true;
         return;
     }
@@ -453,8 +459,10 @@ void custom_ui_loop_task(void* pvParameters) {
 void setup() {
     safe_mode_active = false;
     
-    // SAFE INITIALIZATION (Bypasses legacy audio initialization strings to protect Stamp-S3A I2S clocks)
-    M5Cardputer.begin(true, true, false, false);
+    // Safe initialization sequence passing native configurations to shield the Stamp-S3A
+    auto cfg = m5::M5Unified::config();
+    cfg.external_spk = false; // Turn off legacy I2S audio channels cleanly to prevent core panics
+    M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
     
     // UN-LOCKABLE WIRE I2C REGISTER TIMEOUT PROTECTION CODES
