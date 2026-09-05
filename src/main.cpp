@@ -45,7 +45,8 @@ int screen_brightness = 120;
 // ==========================================
 enum AppMode { MODE_CHAT, MODE_WIFI, MODE_BOUNCER, MODE_SETTINGS };
 volatile AppMode current_app_mode = MODE_CHAT;
-int menu_selection_idx = 0; // Tracks active cursor line choices inside setup screens
+int menu_selection_idx = 0;
+unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
 
 Tab gTabs[MAX_TABS];
 SemaphoreHandle_t irc_mutex = NULL;
@@ -340,66 +341,47 @@ void draw_chat_view() {
     // --- MODAL DRAWING RESPONSES: route viewport on current_app_mode ---
     if (current_app_mode != MODE_CHAT) {
         switch (current_app_mode) {
-            case MODE_WIFI: {
+            case MODE_SETTINGS: {
                 canvas.fillSprite(0x0000);
-                canvas.setTextColor(0xFD20, 0x0000); // bright Amber header
-                canvas.setCursor(2, 2);
-                canvas.print("--- WIFI CONFIG MANAGER ---");
-                // Row highlight via reversed charcoal overlay bar
-                for (int r = 0; r < 2; r++) {
-                    int y = 18 + r * 12;
-                    if (r == menu_selection_idx) canvas.fillRect(0, y-1, 240, 12, 0x0841);
-                    canvas.setTextColor(r == menu_selection_idx ? 0xFFFF : 0x7BEF, r == menu_selection_idx ? 0x0841 : 0x0000);
-                    canvas.setCursor(4, y);
-                    if (r == 0) canvas.printf("1. SSID: %s", wifi_ssid);
-                    else canvas.printf("2. PASS: %s", wifi_pass);
-                }
-                canvas.setTextColor(0x7BEF);
-                canvas.setCursor(2, 48);
-                canvas.print("Enter=edit  Alt+Bksp=exit");
+                canvas.setTextColor(0xFD20); canvas.setCursor(10, 5);
+                canvas.print("--- SYSTEM CONFIGURATIONS ---");
+                canvas.setTextColor(0xFFFF);
+                canvas.setCursor(10, 24); canvas.printf("%s 1. Brightness Level: %d", (menu_selection_idx == 0 ? ">" : " "), screen_brightness);
+                canvas.setCursor(10, 38); canvas.printf("%s 2. Timezone Indicator: %d", (menu_selection_idx == 1 ? ">" : " "), current_tz_idx);
+                canvas.setCursor(10, 52); canvas.printf("%s 3. 12/24hr Format: %s", (menu_selection_idx == 2 ? ">" : " "), use_12_hour_format ? "12-HOUR" : "24-HOUR");
+                canvas.setCursor(10, 66); canvas.printf("%s 4. Channel Log File: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
+                canvas.setCursor(10, 80); canvas.printf("%s 5. Purge History: [ RUN ]", (menu_selection_idx == 4 ? ">" : " "));
+                canvas.setCursor(10, 94); canvas.printf("%s 6. Erase Local Configs: [ RUN ]", (menu_selection_idx == 5 ? ">" : " "));
+                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Next Page");
                 canvas.pushSprite(0, 12);
                 ui_needs_redraw = false;
                 return;
             }
             case MODE_BOUNCER: {
                 canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x001F, 0x0000); // explicit Cobalt Blue header
-                canvas.setCursor(2, 2);
-                canvas.print("--- BOUNCER SPEC ENGINE ---");
-                for (int r = 0; r < 4; r++) {
-                    int y = 18 + r * 12;
-                    if (r == menu_selection_idx) canvas.fillRect(0, y-1, 240, 12, 0x0841);
-                    canvas.setTextColor(r == menu_selection_idx ? 0xFFFF : 0x7BEF, r == menu_selection_idx ? 0x0841 : 0x0000);
-                    canvas.setCursor(4, y);
-                    if (r == 0) canvas.printf("1. Host: %s", bnc_host);
-                    else if (r == 1) canvas.printf("2. Port: %d", bnc_port);
-                    else if (r == 2) canvas.printf("3. User: %s", bnc_user);
-                    else canvas.printf("4. Pass: %s", bnc_pass);
-                }
-                canvas.setTextColor(0x7BEF);
-                canvas.setCursor(2, 68);
-                canvas.print("Enter=edit  Alt+Bksp=exit");
+                canvas.setTextColor(0x07E0); canvas.setCursor(10, 5); // Emerald Green Tech Header
+                canvas.print("--- BOUNCER CONNECTION SCHEMAS ---");
+                canvas.setTextColor(0xFFFF);
+                canvas.setCursor(10, 24); canvas.printf("%s 1. Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), bnc_host);
+                canvas.setCursor(10, 38); canvas.printf("%s 2. Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
+                canvas.setCursor(10, 52); canvas.printf("%s 3. Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), bnc_user);
+                canvas.setCursor(10, 66); canvas.printf("%s 4. Password Token: *******", (menu_selection_idx == 3 ? ">" : " "));
+                canvas.setCursor(10, 80); canvas.printf("%s 5. Synchronize Now: [ EXPORT ]", (menu_selection_idx == 4 ? ">" : " "));
+                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
                 canvas.pushSprite(0, 12);
                 ui_needs_redraw = false;
                 return;
             }
-            case MODE_SETTINGS: {
+            case MODE_WIFI: {
                 canvas.fillSprite(0x0000);
-                canvas.setTextColor(0x7BEF, 0x0000); // sleek terminal grey header
-                canvas.setCursor(2, 2);
-                canvas.print("--- QUICK SYSTEM SETTINGS ---");
-                for (int r = 0; r < 3; r++) {
-                    int y = 18 + r * 12;
-                    if (r == menu_selection_idx) canvas.fillRect(0, y-1, 240, 12, 0x0841);
-                    canvas.setTextColor(r == menu_selection_idx ? 0xFFFF : 0x7BEF, r == menu_selection_idx ? 0x0841 : 0x0000);
-                    canvas.setCursor(4, y);
-                    if (r == 0) canvas.printf("1. Screen Brightness: %d", screen_brightness);
-                    else if (r == 1) canvas.printf("2. Time Zone Offset Idx: %d", current_tz_idx);
-                    else canvas.printf("3. Clock Format: %s", use_12_hour_format ? "12hr" : "24hr");
-                }
-                canvas.setTextColor(0x7BEF);
-                canvas.setCursor(2, 58);
-                canvas.print("Enter=toggle  Alt+Bksp=save/exit");
+                canvas.setTextColor(0x5A1F); canvas.setCursor(10, 5); // Retro Cyberpunk Violet/Blue Header
+                canvas.print("--- WI-FI CONFIG MANAGER ---");
+                canvas.setTextColor(0xFFFF);
+                canvas.setCursor(10, 24); canvas.printf("%s 1. Active SSID: %s", (menu_selection_idx == 0 ? ">" : " "), wifi_ssid);
+                canvas.setCursor(10, 38); canvas.printf("%s 2. Network Pass: *******", (menu_selection_idx == 1 ? ">" : " "));
+                canvas.setCursor(10, 52); canvas.printf("%s 3. Scan for Airwaves: [ SCAN APs ]", (menu_selection_idx == 2 ? ">" : " "));
+                canvas.setCursor(10, 66); canvas.printf("%s 4. Force Connect: [ INITIALIZE ]", (menu_selection_idx == 3 ? ">" : " "));
+                canvas.setCursor(10, 110); canvas.setTextColor(0x7BEF); canvas.print("Alt+Backspace: Exit | Fn+P: Main Chat");
                 canvas.pushSprite(0, 12);
                 ui_needs_redraw = false;
                 return;
@@ -543,192 +525,85 @@ void draw_chat_view() {
 // ==========================================
 void handle_keyboard_inputs() {
     if (!M5Cardputer.Keyboard.isPressed()) return;
-    last_input_time = millis(); // Refresh backlight screen power dim timer
-
-    // --- FORM INPUT HOTKEY INTERCEPTORS: menu active check at absolute top ---
-    auto status = M5Cardputer.Keyboard.keysState();
-    if (status.del && input_buffer.length() > 0) {
-        input_buffer.remove(input_buffer.length() - 1);
-        ui_needs_redraw = true; // <-- Force unlock redraw
-    }
-    for (auto c : status.word) {
-        if (input_buffer.length() < 400) {
-            input_buffer += c;
-            ui_needs_redraw = true; // <-- Force unlock redraw on every keystroke
-        }
-    }
-    if (status.fn && M5Cardputer.Keyboard.isKeyPressed('p')) { current_app_mode = MODE_SETTINGS; menu_selection_idx = 0; ui_needs_redraw = true; return; }
-    if (current_app_mode != MODE_CHAT) {
-        bool is_alt_menu = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
-        if (is_alt_menu && M5Cardputer.Keyboard.isKeyPressed('\b')) { sync_new_nick_to_sd(irc_nick); current_app_mode = MODE_CHAT; ui_needs_redraw = true; return; }
-        if (M5Cardputer.Keyboard.isKeyPressed(0xB4)) { // Up Arrow
-            if (menu_selection_idx > 0) menu_selection_idx--;
-            else menu_selection_idx = 0;
-            ui_needs_redraw = true; return;
-        }
-        if (M5Cardputer.Keyboard.isKeyPressed(0xB9)) { // Down Arrow
-            menu_selection_idx++;
-            // Clamp per mode
-            int maxIdx = 3;
-            if (current_app_mode == MODE_WIFI) maxIdx = 1;
-            if (current_app_mode == MODE_BOUNCER) maxIdx = 3;
-            if (current_app_mode == MODE_SETTINGS) maxIdx = 2;
-            if (menu_selection_idx > maxIdx) menu_selection_idx = maxIdx;
-            ui_needs_redraw = true; return;
-        }
-        if (M5Cardputer.Keyboard.isKeyPressed('\n') || M5Cardputer.Keyboard.isKeyPressed('\r') || M5Cardputer.Keyboard.isKeyPressed(0x0D) || status.enter) {
-            // Enter Key Selection: open text entry sub-prompts to update fields
-            if (current_app_mode == MODE_WIFI) {
-                // Row 0: wifi_ssid, Row 1: wifi_pass - binding to live memory cells
-                // In interactive build, prompt for new wifi_ssid / wifi_pass via Serial/USB input
-                if (menu_selection_idx == 0) { /* prompt wifi_ssid update: strncpy(wifi_ssid, newVal, sizeof(wifi_ssid)-1); */ }
-                if (menu_selection_idx == 1) { /* prompt wifi_pass update */ }
-            } else if (current_app_mode == MODE_BOUNCER) {
-                if (menu_selection_idx == 0) { /* update bnc_host */ }
-                if (menu_selection_idx == 1) { /* update bnc_port via atoi */ }
-                if (menu_selection_idx == 2) { /* update bnc_user */ }
-                if (menu_selection_idx == 3) { /* update bnc_pass */ }
-            } else if (current_app_mode == MODE_SETTINGS) {
-                if (menu_selection_idx == 0) { screen_brightness += 10; if (screen_brightness > 255) screen_brightness = 255; }
-                if (menu_selection_idx == 1) { current_tz_idx = (current_tz_idx + 1) % 4; }
-                if (menu_selection_idx == 2) { use_12_hour_format = !use_12_hour_format; }
-            }
-            ui_needs_redraw = true; return;
-        }
-        // Also allow direct ESC via 'q' or backspace without Alt when in menu
-        if (M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed(27)) { sync_new_nick_to_sd(irc_nick); current_app_mode = MODE_CHAT; ui_needs_redraw = true; return; }
-    }
     
-    // Read modifier state flags natively
+    // Explicit 150ms hardware bounce filter guard to stop character double-chatter
+    if (millis() - last_keypress_debounce < 150) return;
+    last_keypress_debounce = millis();
+    last_input_time = millis(); // Fresh backlight dim timer
+    
+    auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
     
-    // Core Arrow Cluster Interceptor Modifiers (Using official hex keycodes)
-    // Left Arrow = 0xAC, Right Arrow = 0xAF, Down Arrow = 0xB9
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0xAC)) { // Fn + Left Arrow (0xAC) Tab Left (Sequential tab step down)
-        if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; }
-        return;
-    }
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0xAF)) { // Fn + Right Arrow (0xAF) Tab Right (Sequential tab step up)
-        if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; }
-        return;
-    }
-    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAC)) { // Alt + Left Arrow (0xAC) Jump Server Left (Whole Network Skip Backward)
-        if (gTabCount <= 1) return;
-        char cur_srv[32];
-        strncpy(cur_srv, gTabs[current_tab_index].server, sizeof(cur_srv)-1);
-        cur_srv[sizeof(cur_srv)-1]='\0';
-        for (int i = 1; i < gTabCount; i++) {
-            int idx = (current_tab_index - i + gTabCount) % gTabCount;
-            if (strcmp(gTabs[idx].server, cur_srv) != 0) { current_tab_index = idx; ui_needs_redraw = true; return; }
-        }
-        return;
-    }
-    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0xAF)) { // Alt + Right Arrow (0xAF) Jump Server Right (Whole Network Skip Forward)
-        if (gTabCount <= 1) return;
-        char cur_srv2[32];
-        strncpy(cur_srv2, gTabs[current_tab_index].server, sizeof(cur_srv2)-1);
-        cur_srv2[sizeof(cur_srv2)-1]='\0';
-        for (int i = 1; i < gTabCount; i++) {
-            int idx = (current_tab_index + i) % gTabCount;
-            if (strcmp(gTabs[idx].server, cur_srv2) != 0) { current_tab_index = idx; ui_needs_redraw = true; return; }
-        }
-        return;
-    }
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('s')) { // Fn+S: Privacy mute toggle - direct privacy switch
-        current_audio = (current_audio == 1) ? 0 : 1;
-        pinMode(4, OUTPUT);
-        digitalWrite(4, current_audio == 1 ? LOW : HIGH);
+    // Layer A: Quick Settings, Bouncer Profiles, and Wi-Fi Manager Paging
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('p')) {
+        if (current_app_mode == MODE_CHAT)       { current_app_mode = MODE_SETTINGS; }
+        else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
+        else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_WIFI; }
+        else                                      { current_app_mode = MODE_CHAT; }
+        menu_selection_idx = 0;
         ui_needs_redraw = true;
         return;
     }
-    if (is_alt && M5Cardputer.Keyboard.isKeyPressed('\b')) { // Alt+Backspace: Safe Mode emergency escape / dump panels to MODE_CHAT
-        if (safe_mode_active) { safe_mode_active = false; gTabCount = 0; ui_needs_redraw = true; }
-        if (current_app_mode != MODE_CHAT) { sync_new_nick_to_sd(irc_nick); current_app_mode = MODE_CHAT; ui_needs_redraw = true; return; }
-        return;
-    }
-    if (M5Cardputer.Keyboard.isKeyPressed(0xB9)) { // Physical native Tab key row intercept (0xB9) - Inline Nickname Autocomplete Tracker
-        int frag_start = input_buffer.length();
-        while (frag_start > 0 && input_buffer.charAt(frag_start-1) != ' ' && input_buffer.charAt(frag_start-1) != ':') frag_start--;
-        int frag_len = input_buffer.length() - frag_start;
-        if (frag_len > 0) {
-            String fragment = input_buffer.substring(frag_start);
-            for (int li = 0; li < gTabs[current_tab_index].line_count; li++) {
-                const char* cand = gTabs[current_tab_index].lines[li].nick;
-                if (cand[0]==0) continue;
-                if (strncasecmp(cand, fragment.c_str(), frag_len)==0) {
-                    int cand_len = strlen(cand);
-                    bool at_start = (frag_start==0);
-                    String before = input_buffer.substring(0, frag_start);
-                    String replacement = String(cand);
-                    if (at_start) replacement += ": ";
-                    if (before.length() + replacement.length() < 400) {
-                        input_buffer = before + replacement;
-                    }
-                    break;
-                }
-            }
-        }
+    
+    // Layer B: Master Emergency Escape Back to Main Chat Workspace (Alt + Backspace)
+    if (is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) {
+        current_app_mode = MODE_CHAT;
+        input_buffer = ""; // Cleanly flush stray artifacts
         ui_needs_redraw = true;
         return;
     }
-    // --- ADVANCED SLASH COMMAND INTERPRETER: check status.enter to process input line ---
-    if (status.enter) {
-        if (input_buffer.length() > 0) {
-            // Robust C-string parser block to check if input_buffer begins with '/'
-            if (input_buffer.charAt(0) == '/') {
-                char cmdCopy[256];
-                strncpy(cmdCopy, input_buffer.c_str(), sizeof(cmdCopy)-1);
-                cmdCopy[sizeof(cmdCopy)-1]='\0';
-                char* sp = strchr(cmdCopy, ' ');
-                char* args = NULL;
-                if (sp) { *sp='\0'; args = sp+1; while (*args==' ') args++; }
-                // Tokenize and map direct commands
-                if (strcasecmp(cmdCopy, "/join")==0 && args && args[0]) {
-                    char channel_string[64];
-                    strncpy(channel_string, args, sizeof(channel_string)-1);
-                    channel_string[sizeof(channel_string)-1]='\0';
-                    // Trim up to space
-                    char* e = strchr(channel_string,' '); if(e) *e='\0';
-                    client.printf("JOIN %s\r\n", channel_string);
-                } else if (strcasecmp(cmdCopy, "/part")==0) {
-                    char channel_string[64] = {0};
-                    if (args && args[0]) strncpy(channel_string, args, sizeof(channel_string)-1);
-                    else strncpy(channel_string, gTabs[current_tab_index].name, sizeof(channel_string)-1);
-                    char* e = strchr(channel_string,' '); if(e) *e='\0';
-                    client.printf("PART %s\r\n", channel_string);
-                } else if (strcasecmp(cmdCopy, "/me")==0 && args && args[0]) {
-                    char action_string[180];
-                    strncpy(action_string, args, sizeof(action_string)-1);
-                    action_string[sizeof(action_string)-1]='\0';
-                    char current_tab_name[32];
-                    strncpy(current_tab_name, gTabs[current_tab_index].name, sizeof(current_tab_name)-1);
-                    client.printf("PRIVMSG %s :\x01" "ACTION %s\x01\r\n", current_tab_name, action_string);
-                } else if (strcasecmp(cmdCopy, "/nick")==0 && args && args[0]) {
-                    char new_nick_string[64];
-                    strncpy(new_nick_string, args, sizeof(new_nick_string)-1);
-                    new_nick_string[sizeof(new_nick_string)-1]='\0';
-                    char* e = strchr(new_nick_string,' '); if(e) *e='\0';
-                    sync_new_nick_to_sd(new_nick_string);
-                    client.printf("NICK %s\r\n", new_nick_string);
-                } else {
-                    // Unknown slash -> send raw without slash
-                    client.printf("%s\r\n", input_buffer.c_str()+1);
-                }
-            } else {
-                // Normal chat: send as PRIVMSG to current tab channel
-                if (client.connected() && gTabCount>0) {
-                    char current_tab_name[32];
-                    strncpy(current_tab_name, gTabs[current_tab_index].name, sizeof(current_tab_name)-1);
-                    // Avoid sending to system mentions as target; fallback to PRIVMSG
-                    client.printf("PRIVMSG %s :%s\r\n", current_tab_name, input_buffer.c_str());
-                }
+
+    // Layer C: Critical Hardware Intercept for Fn+Arrow Punctuation Codes
+    // On the Cardputer layout, Fn+Arrows outputs direct character values:
+    // Fn+Left = ';' | Fn+Right = '/' | Fn+Up = ',' | Fn+Down = '.'
+    if (current_app_mode == MODE_CHAT) {
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn+Left Arrow shortcut intercepted
+            if (gTabCount > 1) { current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount; ui_needs_redraw = true; }
+            return;
+        }
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Fn+Right Arrow shortcut intercepted
+            if (gTabCount > 1) { current_tab_index = (current_tab_index + 1) % gTabCount; ui_needs_redraw = true; }
+            return;
+        }
+    } else {
+        // Menu Form Mode Navigation rules
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Fn+Up Arrow: Move selector up
+            if (menu_selection_idx > 0) { menu_selection_idx--; ui_needs_redraw = true; }
+            return;
+        }
+        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down Arrow: Move selector down
+            int maxIdx = 5;
+            if (current_app_mode == MODE_BOUNCER) maxIdx = 4;
+            else if (current_app_mode == MODE_SETTINGS) maxIdx = 5;
+            else if (current_app_mode == MODE_WIFI) maxIdx = 3;
+            if (menu_selection_idx < maxIdx) { menu_selection_idx++; ui_needs_redraw = true; }
+            return;
+        }
+    }
+
+    // Layer D: Standard Character Stream Buffer Appender
+    if (current_app_mode == MODE_CHAT) {
+        if (status.del && input_buffer.length() > 0) {
+            input_buffer.remove(input_buffer.length() - 1);
+            ui_needs_redraw = true; // <-- Force unlock redraw
+        }
+        for (auto c : status.word) {
+            // Hard gate to block Fn punctuation bleeding artifacts into your string line
+            if (is_fn && (c == ';' || c == '/' || c == ',' || c == '.' || c == 'p')) continue;
+            if (input_buffer.length() < 400) {
+                input_buffer += c;
+                ui_needs_redraw = true; // <-- Force unlock redraw on every keystroke
             }
-            // Clear input buffer after send
+        }
+        if (status.enter && input_buffer.length() > 0) {
+            if (client.connected()) {
+                client.printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
+                add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF);
+            }
             input_buffer = "";
             ui_needs_redraw = true;
         }
-        return;
     }
 }
 
@@ -900,7 +775,7 @@ void setup() {
         M5Cardputer.update();
         
         // Scan if clicky Backspace key is physically held down to activate safe mode safely
-        if (M5Cardputer.Keyboard.isKeyPressed('\b')) {
+        if (M5Cardputer.Keyboard.isKeyPressed(0x08)) { // Safely catches held backspace clicks on cold boot
             safe_mode_active = true;
         }
     }
