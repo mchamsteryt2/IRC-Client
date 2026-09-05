@@ -1110,26 +1110,54 @@ void irc_network_task(void* pvParameters) {
                     continue;
                 }
 
-                // --- LIVE CHANNEL SYNC - JOIN EVENT EXTRACTION
+                // LAYER A: DYNAMIC CHANNEL SYNC - EXPANDED AUTOMATED ROOM DISCOVERY ENGINE
+                String discovered_room = "";
+
                 if (line.indexOf(" JOIN ") != -1) {
                     int join_idx = line.indexOf(" JOIN ");
-                    String disc_chan = line.substring(join_idx + 6);
-                    disc_chan.trim(); if (disc_chan.startsWith(":")) disc_chan = disc_chan.substring(1);
+                    discovered_room = line.substring(join_idx + 6);
+                } 
+                else if (line.indexOf(" 353 ") != -1) { // Intercept NAMES channel listing protocol
+                    int equal_idx = line.indexOf(" = ");
+                    if (equal_idx != -1) {
+                        int colon_idx = line.indexOf(" :", equal_idx);
+                        if (colon_idx != -1) {
+                            discovered_room = line.substring(equal_idx + 3, colon_idx);
+                        }
+                    }
+                }
+                else if (line.indexOf(" PRIVMSG #") != -1) { // Intercept historical playback line channels
+                    int priv_idx = line.indexOf(" PRIVMSG ");
+                    int colon_idx = line.indexOf(" :", priv_idx);
+                    if (priv_idx != -1 && colon_idx != -1) {
+                        discovered_room = line.substring(priv_idx + 9, colon_idx);
+                    }
+                }
+
+                // If a channel name was successfully isolated out of the background socket stream, register it
+                if (discovered_room.length() > 0) {
+                    discovered_room.trim();
+                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
                     
-                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                        bool tab_exists = false;
-                        for (int t = 0; t < gTabCount; t++) {
-                            if (strcmp(gTabs[t].name, disc_chan.c_str()) == 0 && strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
-                                tab_exists = true; break;
+                    // Filter out server/user text remnants to ensure it's a valid room query tag
+                    if (discovered_room.startsWith("#") || discovered_room.startsWith("&")) {
+                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                            bool tab_exists = false;
+                            for (int t = 0; t < gTabCount; t++) {
+                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && 
+                                    strcmp(gTabs[t].server, discovered_networks[i]) == 0) {
+                                    tab_exists = true; break;
+                                }
                             }
+                            // Spawn the channel tab dynamically under its origin network context string
+                            if (!tab_exists && gTabCount < MAX_TABS) {
+                                strncpy(gTabs[gTabCount].name, discovered_room.c_str(), sizeof(gTabs[gTabCount].name)-1);
+                                strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
+                                gTabs[gTabCount].line_count = 0;
+                                gTabCount++;
+                            }
+                            xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
                         }
-                        if (!tab_exists && gTabCount < MAX_TABS) {
-                            strncpy(gTabs[gTabCount].name, disc_chan.c_str(), sizeof(gTabs[gTabCount].name)-1);
-                            strncpy(gTabs[gTabCount].server, discovered_networks[i], sizeof(gTabs[gTabCount].server)-1);
-                            gTabs[gTabCount].line_count = 0;
-                            gTabCount++;
-                        }
-                        xSemaphoreGive(irc_mutex); ui_needs_redraw = true;
                     }
                 }
 
