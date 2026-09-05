@@ -817,17 +817,17 @@ void handle_keyboard_inputs() {
             if (current_app_mode == MODE_SETTINGS) {
                 if (menu_selection_idx == 0) { // Brightness Row Step Toggles
                     if (forward) {
-                        if (screen_brightness == 10) screen_brightness = 60;
-                        else if (screen_brightness == 60) screen_brightness = 120;
+                        if (screen_brightness <= 15)   screen_brightness = 60;
+                        else if (screen_brightness == 60)  screen_brightness = 120;
                         else if (screen_brightness == 120) screen_brightness = 200;
                         else if (screen_brightness == 200) screen_brightness = 255;
                     } else {
-                        if (screen_brightness == 255) screen_brightness = 200;
+                        if (screen_brightness == 255)      screen_brightness = 200;
                         else if (screen_brightness == 200) screen_brightness = 120;
                         else if (screen_brightness == 120) screen_brightness = 60;
-                        else if (screen_brightness == 60) screen_brightness = 10;
+                        else if (screen_brightness == 60)  screen_brightness = 15;
                     }
-                    analogWrite(38, screen_brightness); // Force instant hardware panel modulation update
+                    M5Cardputer.Display.setBrightness(screen_brightness); // Secure instant hardware update
                 }
                 else if (menu_selection_idx == 1) { // Timezone Index Offsets
                     current_tz_idx += forward ? 1 : -1;
@@ -1305,13 +1305,16 @@ void custom_ui_loop_task(void* pvParameters) {
         M5Cardputer.update(); // Polling matrix registers over un-lockable bus lane
         handle_keyboard_inputs();
         
-        // Bare-Metal Backlight Modulation Controller (GPIO Pin 38)
+        // Native M5Unified Background Backlight Driver Controller
         if (current_audio == 0) {
-            analogWrite(38, 0); // Privacy Stealth Mode: Kill the panel current completely
+            M5Cardputer.Display.setBrightness(0); // Privacy Stealth Mode: Kill panel backlight cleanly
+            neopixelWrite(21, 0, 0, 0);          // Turn off the diagnostic corner LED completely
         } else if (millis() - last_input_time > 60000) {
-            analogWrite(38, 8); // Ambient Sleep Dim Mode: Drop to low trace current level
+            M5Cardputer.Display.setBrightness(10); // Ambient Sleep Dim Mode: Drop to trace visibility
         } else {
-            analogWrite(38, screen_brightness); // Normal Mode: Drive matching custom preference
+            // Guardrail protection: Ensure screen_brightness never drops below 15 to prevent panel shutoffs
+            if (screen_brightness < 15) screen_brightness = 15; 
+            M5Cardputer.Display.setBrightness(screen_brightness);
         }
         
         // Drive Stamp-S3A LED modes asynchronously without delay halts
