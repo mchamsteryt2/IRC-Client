@@ -476,35 +476,40 @@ void draw_chat_view() {
     strncpy(truncated_name, gTabs[current_tab_index].name, 10);
     M5Cardputer.Display.print(truncated_name);
     
-    // Anchor A: Wireless Network Link Status (X=125)
-    M5Cardputer.Display.setCursor(125, 2);
+    // ==========================================
+    // 📡 THE COMPACT TELEMETRY GRID LAYER (X=140 TO X=238)
+    // ==========================================
+    
+    // Anchor A: Wireless Network Radio State (X=142)
+    M5Cardputer.Display.setCursor(142, 2);
     if (WiFi.status() != WL_CONNECTED) {
         M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
-        M5Cardputer.Display.print("[DISC]");
+        M5Cardputer.Display.print("D"); // Disconnected Micro-Indicator
     } else {
         M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
-        M5Cardputer.Display.print("[WIFI]");
+        M5Cardputer.Display.print("W"); // Connected Wi-Fi Micro-Indicator
     }
     
-    // Anchor B: Audio Privacy State Flag (X=162)
-    M5Cardputer.Display.setCursor(162, 2);
+    // Anchor B: Audio Privacy State Flag (X=158)
+    M5Cardputer.Display.setCursor(158, 2);
     if (current_audio == 0) {
         M5Cardputer.Display.setTextColor(0xF800, 0x0841); // Warning Red
-        M5Cardputer.Display.print("[MUTE]");
+        M5Cardputer.Display.print("M"); // Muted Micro-Indicator
     } else {
         M5Cardputer.Display.setTextColor(0x07E0, 0x0841); // Healthy Green
-        M5Cardputer.Display.print("[+]");
+        M5Cardputer.Display.print("S"); // Sound Active Micro-Indicator
     }
     
-    // Anchor C: Local System Digital Clock (X=192)
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // High-visibility White
-    M5Cardputer.Display.setCursor(192, 2);
+    // Anchor C: Local System Digital Clock (X=176)
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); // Pure White Text
+    M5Cardputer.Display.setCursor(176, 2);
     M5Cardputer.Display.print("00:00");
     
     // Anchor D: Hardware Calibrated Battery Percentage (X=212)
+    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
     M5Cardputer.Display.setCursor(212, 2);
     int active_bat = (int)get_calibrated_battery_percentage();
-    M5Cardputer.Display.printf("[%d%%]", active_bat);
+    M5Cardputer.Display.printf("%d%%", active_bat); // Drops brackets to save 12px of screen glass width
     
     // Draw flat black footer background bar (from Y=121 to screen edge Y=135)
     M5Cardputer.Display.fillRect(0, 121, 240, 14, 0x0000);
