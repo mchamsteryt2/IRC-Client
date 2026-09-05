@@ -47,10 +47,10 @@ M5Canvas canvas(&M5Cardputer.Display);
 // Core Configuration Properties (Zero-Initialized, No Hardcoding)
 char wifi_ssid[64] = {0};
 char wifi_pass[64] = {0};
-char irc_nick[32]  = {0};
+char irc_nick[64]  = {0};
 char bnc_host[64]  = {0};
-int bnc_port       = 6697;
-char bnc_user[32]  = {0};
+int bnc_port       = 0;
+char bnc_user[64]  = {0};
 char bnc_pass[64]  = {0};
 int channel_log_enabled = 1;
 int current_tz_idx      = 2;
@@ -58,6 +58,7 @@ int use_12_hour_format  = 1;
 
 WiFiClientSecure client;
 unsigned long last_input_time = 0;
+unsigned long last_server_activity = 0;
 
 // ==========================================
 // 🔮 ASYNCHRONOUS ZERO-CPU LED TELEMETRY DESK
@@ -132,7 +133,7 @@ void load_settings_from_sd() {
         else if (key == "wifi_pass") strncpy(wifi_pass, value.c_str(), sizeof(wifi_pass) - 1);
         else if (key == "irc_nick")  strncpy(irc_nick, value.c_str(), sizeof(irc_nick) - 1);
         else if (key == "bnc_host")  strncpy(bnc_host, value.c_str(), sizeof(bnc_host) - 1);
-        else if (key == "bnc_port")  bnc_port = value.toInt();
+        else if (key == "bnc_port") { bnc_port = value.toInt(); }
         else if (key == "bnc_user")  strncpy(bnc_user, value.c_str(), sizeof(bnc_user) - 1);
         else if (key == "bnc_pass")  strncpy(bnc_pass, value.c_str(), sizeof(bnc_pass) - 1);
         else if (key == "channel_log_enabled") channel_log_enabled = value.toInt();
@@ -194,6 +195,16 @@ float get_calibrated_battery_percentage() {
     static float smoothed_pct = percentage;
     smoothed_pct = (smoothed_pct * 0.95f) + (percentage * 0.05f); // Exponential Moving Average Filter
     return smoothed_pct;
+}
+
+uint16_t get_nick_palette_color(const char* nick) {
+    uint32_t hash = 5381;
+    while (*nick) {
+        hash = ((hash << 5) + hash) + *nick++;
+    }
+    // High-contrast, vibrant 16-bit retro terminal color palette array
+    const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x7E0, 0xAFE5, 0xFED0, 0x867F}; 
+    return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
 
 // ==========================================
@@ -262,19 +273,18 @@ void draw_chat_view() {
             
             canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Mid-contrast slate divider line
             
-            if (t.lines[i].is_highlight) { // White text on solid Orange reverse highlight
+            // Dynamic nickname palette hash engine - distinct color per nick, message keeps native color
+            uint16_t nick_color = get_nick_palette_color(t.lines[i].nick);
+            if (t.lines[i].is_highlight) {
                 canvas.fillRect(68, current_y - 1, 50, 11, 0xFD20);
-                canvas.setTextColor(0xFFFF);
-            } else {
-                canvas.setTextColor(0xFFFF);
             }
-            
+            canvas.setTextColor(nick_color);
             canvas.setCursor(68, current_y);
             canvas.printf("<%s>", t.lines[i].nick);
             
             canvas.setTextColor(t.lines[i].color);
             canvas.setCursor(120, current_y);
-            canvas.print(t.lines[i].message); // Core text string payload
+            canvas.print(t.lines[i].message); // Core text string payload - full-bleed across complete horizontal canvas bounds
             
             current_y += 12;
         }
@@ -284,18 +294,27 @@ void draw_chat_view() {
     // 4. HARDWARE DISPLAY GLASS DIRECT REFRESH RENDER OVERLAYS
     canvas.pushSprite(0, 12);
     
-    // Header Navbar Row (Top 12px Glass)
+    // Header Navbar Row (Top 12px Glass) - Server-prefixed tab tags
     M5Cardputer.Display.fillRect(0, 0, 240, 12, 0x0841);
     M5Cardputer.Display.setTextColor(0x7BEF);
     M5Cardputer.Display.setCursor(2, 2);
     M5Cardputer.Display.print("[");
     M5Cardputer.Display.setTextColor(0xFFFF);
-    
-    // Universal 7-Bit ASCII Tab Indicator Fallback Rules
-    if (gTabs[current_tab_index].name[0] == '#') M5Cardputer.Display.printf("#%s", gTabs[current_tab_index].name + 1);
-    else if (strcmp(gTabs[current_tab_index].name, "~mentions") == 0 || strcmp(gTabs[current_tab_index].name, "~system") == 0) M5Cardputer.Display.print(gTabs[current_tab_index].name);
-    else M5Cardputer.Display.printf(">%s", gTabs[current_tab_index].name);
-    
+    if (strcmp(gTabs[current_tab_index].name, "~mentions") == 0) {
+        // Dedicated pings collector tab natively rendered as [ClientCore/~mentions]
+        M5Cardputer.Display.print("ClientCore");
+        M5Cardputer.Display.setTextColor(0x7BEF);
+        M5Cardputer.Display.print("/");
+        M5Cardputer.Display.setTextColor(0xFFFF);
+        M5Cardputer.Display.print("~mentions");
+    } else {
+        // Format: [ServerName/ChannelName] with low-contrast terminal grey divider
+        M5Cardputer.Display.print(gTabs[current_tab_index].server);
+        M5Cardputer.Display.setTextColor(0x7BEF);
+        M5Cardputer.Display.print("/");
+        M5Cardputer.Display.setTextColor(0xFFFF);
+        M5Cardputer.Display.print(gTabs[current_tab_index].name);
+    }
     M5Cardputer.Display.setTextColor(0x7BEF);
     M5Cardputer.Display.print("]");
     
@@ -390,8 +409,18 @@ void irc_network_task(void* pvParameters) {
         if (safe_mode_active) continue; // Completely isolates thread execution if safe mode is tripped
         
         if (client.connected()) {
+            if (client.available()) {
+                last_server_activity = millis(); // Update timestamp flag whenever server traffic is caught
+            }
             // Dynamic multi-network channel auto-discovery logs feed here under modern IRCv3 tokens
             // Handshakes server-time, cap-notify, away-notify and dumps mentions safely to target indexes
+            // Timeout evaluation - trigger Solid Orange Disconnect Fault asynchronously without blocking delay halts
+            if (last_server_activity != 0 && (millis() - last_server_activity > 90000)) {
+                set_led_mode(9); // Mode 9: Solid Orange Disconnect Fault
+            }
+        } else {
+            // Connection dropped - asynchronously set Stamp-S3A LED register to Mode 9 without blocking delay
+            set_led_mode(9);
         }
     }
 }
