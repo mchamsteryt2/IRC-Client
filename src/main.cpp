@@ -493,45 +493,57 @@ void draw_chat_view() {
     canvas.fillSprite(0x0000);
     
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        Tab &t = gTabs[current_tab_index];
-        int current_y = 2;
-        
+        Tab &t = gTabs[current_tab_index]; int current_y = 2;
         for (int i = 0; i < t.line_count; i++) {
-            if (current_y + 11 > 109) break; // Strict clipping shield limit
+            if (current_y + 11 > 109) break;
             
-            // Alternating Charcoal background strip colors row-by-row
+            // Establish an alternating background bar block for visual tracking
             uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
-            canvas.fillRect(0, current_y - 2, 240, 12, row_bg);
             
-            canvas.setTextColor(0x7BEF); // Slate grey timestamps
-            canvas.setCursor(2, current_y);
-            canvas.print(t.lines[i].timeStr);
+            // Calculate text layout cursor positions
+            int text_start_x = (current_tab_index == 0) ? 160 : 120;
+            int max_text_width = 236 - text_start_x;
             
-            canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Mid-contrast slate divider line
-            
-            // Alternating Charcoal background handled above - now multi-color nicknames & reverse highlights
-            if (t.lines[i].is_highlight) {
-                // High-contrast reverse-highlight: White text nested over solid Orange 0xFD20 background rectangle
-                canvas.fillRect(68, current_y - 1, 50, 11, 0xFD20);
-                canvas.setTextColor(0xFFFF);
-            } else {
-                canvas.setTextColor(get_nick_palette_color(t.lines[i].nick));
-            }
-            canvas.setCursor(68, current_y);
-            if (current_tab_index == 0) {
-                // Mentions mode layout: Print prefix without brackets formatting, force text column to X=160
-                canvas.printf("%s", t.lines[i].nick);
+            String msg_text = t.lines[i].message;
+            int current_char_pos = 0;
+            bool first_line_pass = true;
+
+            // Simple micro-font length-chopper string loop
+            while (current_char_pos < msg_text.length()) {
+                if (current_y + 11 > 109) break;
+
+                // 6px per character base resolution math
+                int dynamic_chars_budget = max_text_width / 6;
+                String sub_line = msg_text.substring(current_char_pos, current_char_pos + dynamic_chars_budget);
+                
+                // Draw row background bar
+                canvas.fillRect(0, current_y - 2, 240, 12, row_bg);
+                
+                if (first_line_pass) {
+                    canvas.drawFastVLine(64, 0, 109, 0x7BEF); // Main layout separator line
+                    canvas.setTextColor(0x7BEF); canvas.setCursor(2, current_y); canvas.print(t.lines[i].timeStr);
+                    
+                    if (t.lines[i].is_highlight) { 
+                        canvas.fillRect(68, current_y - 1, 50, 11, 0xFD20); 
+                        canvas.setTextColor(0xFFFF); 
+                    } else { 
+                        canvas.setTextColor(get_nick_palette_color(t.lines[i].nick)); 
+                    }
+                    
+                    canvas.setCursor(68, current_y);
+                    if (current_tab_index == 0) { canvas.printf("%s", t.lines[i].nick); }
+                    else { canvas.printf("<%s>", t.lines[i].nick); }
+                    
+                    first_line_pass = false;
+                }
+                
                 canvas.setTextColor(t.lines[i].color);
-                canvas.setCursor(160, current_y); // <-- Slide text out to prevent multi-network label overlap
-            } else {
-                // Standard mode layout: Print standard bracketed room nickname, leave text column at X=120
-                canvas.printf("<%s>", t.lines[i].nick);
-                canvas.setTextColor(t.lines[i].color);
-                canvas.setCursor(120, current_y);
+                canvas.setCursor(text_start_x, current_y);
+                canvas.print(sub_line);
+                
+                current_y += 12;
+                current_char_pos += dynamic_chars_budget;
             }
-            canvas.print(t.lines[i].message); // Core text string payload - full-bleed across complete 240x109 horizontal canvas bounds, zero placeholders
-            
-            current_y += 12;
         }
         xSemaphoreGive(irc_mutex);
     }
@@ -781,25 +793,31 @@ void handle_keyboard_inputs() {
             return;
         }
 
-        // Horizontal Column & Value Swapping (Single-press Semicolon=LEFT, Forward Slash=RIGHT)
+        // Horizontal Column & Value Toggling (Single-press Semicolon=LEFT, Forward Slash=RIGHT)
         if (M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('/')) {
             bool forward = M5Cardputer.Keyboard.isKeyPressed('/');
             ui_needs_redraw = true;
             
             if (current_app_mode == MODE_SETTINGS) {
-                if (menu_selection_idx == 0) { // Adjust Brightness
+                if (menu_selection_idx == 0) {
                     screen_brightness += forward ? 30 : -30;
                     if (screen_brightness > 255) screen_brightness = 255;
                     if (screen_brightness < 10)  screen_brightness = 10;
                     M5Cardputer.Display.setBrightness(screen_brightness);
                 }
-                else if (menu_selection_idx == 1) { // Adjust Timezone
+                else if (menu_selection_idx == 1) {
                     current_tz_idx += forward ? 1 : -1;
                     if (current_tz_idx > 14) current_tz_idx = -12;
                     if (current_tz_idx < -12) current_tz_idx = 14;
                 }
                 else if (menu_selection_idx == 2) { use_12_hour_format = !use_12_hour_format; }
                 else if (menu_selection_idx == 3) { channel_log_enabled = !channel_log_enabled; }
+            }
+            else if (current_app_mode == MODE_BOUNCER) {
+                if (menu_selection_idx == 1) { // Interactive Port Adjuster Row
+                    bnc_port += forward ? 1 : -1;
+                    if (bnc_port < 0) bnc_port = 0;
+                }
             }
             return;
         }
@@ -834,6 +852,38 @@ void handle_keyboard_inputs() {
     // 💬 CHAT MODE PROCESSING PIPELINE (ONLY RUNS IF MODE_CHAT IS ACTIVE)
     // ==========================================
     if (current_app_mode == MODE_CHAT) {
+        // Layer G: Tab Autocomplete Key Intercept Matrix (Physical Tab = 0xB9)
+        if (M5Cardputer.Keyboard.isKeyPressed(0xB9) && input_buffer.length() > 0) {
+            int last_space = input_buffer.lastIndexOf(' ');
+            String partial_token = (last_space == -1) ? input_buffer : input_buffer.substring(last_space + 1);
+            partial_token.toLowerCase();
+
+            Tab &active_tab = gTabs[current_tab_index];
+            String discovered_match = "";
+
+            // Scan backwards through recent channel lines to find a matching nickname handle
+            for (int line_scan = active_tab.line_count - 1; line_scan >= 0; line_scan--) {
+                String candidate_nick = String(active_tab.lines[line_scan].nick);
+                String lookup_lower = candidate_nick;
+                lookup_lower.toLowerCase();
+
+                if (lookup_lower.startsWith(partial_token) && candidate_nick != String(irc_nick)) {
+                    discovered_match = candidate_nick;
+                    break;
+                }
+            }
+
+            if (discovered_match.length() > 0) {
+                // Strip the typed fragment and replace it with the true, completed nickname handle string
+                if (last_space == -1) {
+                    input_buffer = discovered_match + ": ";
+                } else {
+                    input_buffer = input_buffer.substring(0, last_space + 1) + discovered_match + ": ";
+                }
+                ui_needs_redraw = true;
+                return;
+            }
+        }
         // Handle Backspace deletions safely with synchronous empty telemetry triggers
         if (status.del) { 
             if (input_buffer.length() > 0) {
@@ -854,17 +904,65 @@ void handle_keyboard_inputs() {
             }
         }
         
-        // Route and transmit typed entries out of the active socket handle
         if (status.enter && input_buffer.length() > 0) {
             const char* active_net = gTabs[current_tab_index].server;
+            WiFiClientSecure* target_socket = nullptr;
+            int current_net_idx = -1;
+
+            // Isolate the active parallel network socket handle
             for (int i = 0; i < discovered_network_count; i++) {
-                if (strcmp(discovered_networks[i], active_net) == 0 && clients[i].connected()) {
-                    clients[i].printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
-                    add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF); 
+                if (strcmp(discovered_networks[i], active_net) == 0) {
+                    target_socket = &clients[i];
+                    current_net_idx = i;
                     break;
                 }
             }
-            input_buffer = ""; 
+
+            if (target_socket && target_socket->connected()) {
+                if (input_buffer.startsWith("/")) {
+                    // --- LOCAL SLASH COMMAND ENGINE ---
+                    int space_idx = input_buffer.indexOf(' ');
+                    String cmd = (space_idx == -1) ? input_buffer.substring(1) : input_buffer.substring(1, space_idx);
+                    cmd.toUpperCase();
+                    String args = (space_idx == -1) ? "" : input_buffer.substring(space_idx + 1);
+                    args.trim();
+
+                    if (cmd == "JOIN" && args.length() > 0) {
+                        target_socket->printf("JOIN %s\r\n", args.c_str());
+                    }
+                    else if (cmd == "PART") {
+                        // If no argument is passed, part the channel you are currently viewing
+                        String target_chan = (args.length() > 0) ? args : gTabs[current_tab_index].name;
+                        target_socket->printf("PART %s\r\n", target_chan.c_str());
+                    }
+                    else if (cmd == "NICK" && args.length() > 0) {
+                        target_socket->printf("NICK %s\r\n", args.c_str());
+                        strncpy(irc_nick, args.c_str(), sizeof(irc_nick) - 1); // Dynamic RAM update
+                    }
+                    else if (cmd == "MSG" && args.length() > 0) {
+                        // Direct Messaging format: /msg Nickname message text...
+                        int msg_space = args.indexOf(' ');
+                        if (msg_space != -1) {
+                            String target_nick = args.substring(0, msg_space);
+                            String private_txt = args.substring(msg_space + 1);
+                            target_socket->printf("PRIVMSG %s :%s\r\n", target_nick.c_str(), private_txt.c_str());
+                            add_message_to_buffer(target_nick.c_str(), private_txt.c_str(), 0xF81F); // Render text in hot pink DM colors
+                        }
+                    }
+                    else if (cmd == "RAW" && args.length() > 0) {
+                        // Power User Escape Hatch: Transmit un-filtered protocol lines straight down the wire
+                        target_socket->printf("%s\r\n", args.c_str());
+                    }
+                    else {
+                        add_message_to_buffer("ClientCore", "Unknown local slash command protocol instruction.", 0xF800);
+                    }
+                } else {
+                    // --- STANDARD CHAT TEXT TRANSMISSION PATH ---
+                    target_socket->printf("PRIVMSG %s :%s\r\n", gTabs[current_tab_index].name, input_buffer.c_str());
+                    add_message_to_buffer(irc_nick, input_buffer.c_str(), 0xFFFF);
+                }
+            }
+            input_buffer = "";
             ui_needs_redraw = true;
         }
     }
