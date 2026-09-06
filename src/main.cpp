@@ -260,14 +260,16 @@ void set_led_mode(uint8_t mode) {
             
         default: r = 30; g = 30; b = 30; break;
     }
-    // Tie LED to display brightness with gamma 2.2 (stop forcing pin 38 HIGH)
+    // LED on Cardputer Adv is hardware-tied to backlight rail (pin 21 supply follows
+    // Display.setBrightness PWM). Previous code double-dimmed: hardware PWM * software
+    // gamma (80 -> hw 31% * sw 7% = 2% -> off). Remove software scaling and let hardware
+    // handle dimming directly so idle heartbeat (b 0-24) at display 80 remains ~7 visible.
+    // Critical alerts will still pulse via hardware dim; no extra software scaling needed.
     {
-        float br = g_backlight_level / 255.0f;
-        if (br < 0) br = 0; if (br > 1) br = 1;
-        br = powf(br, 2.2f);
-        r = (uint8_t)(r * br);
-        g = (uint8_t)(g * br);
-        b = (uint8_t)(b * br);
+        // Intentionally no br scaling - hardware tie already dims LED with backlight.
+        // Keep RGB as-is for correct hue; if constant brightness is desired, compensate
+        // with 1/br here, but for now let LED follow display for power saving.
+        (void)g_backlight_level;
     }
     neopixelWrite(21, r, g, b); // Deliver bits down to physical Pin 21
 }
@@ -3213,38 +3215,33 @@ void custom_ui_loop_task(void* pvParameters) {
         // Interrupt-driven idle check consumes kb_interrupt_fired flag to avoid polling churn
         if (kb_interrupt_fired) { kb_interrupt_fired = false; last_input_time = millis(); last_user_keyboard_input_tick = millis(); }
         
-        // --- REFINED 60-SECOND PARTIAL AUTO-DIMMER + UNIFIED HARDWARE POWER & TELEMETRY ENGINE ---
+        // --- REFINED 60-SECOND PARTIAL AUTO-DIMMER + HARDWARE-TIED LED RAIL ---
+        // Cardputer Adv: LED (GPIO21 neopixel) VCC is tied to backlight rail (GPIO38).
+        // At display 80/89/30 the rail PWM avg is 31%/35%/12% -> WS2812 browns out, idle LED off even at normal 80.
+        // Keep rail high enough for LED heartbeat: normal 180 (70%), idle 150 (59%), low-batt 100 (39%) still visible.
         float current_battery_pct = get_calibrated_battery_percentage();
         int target_backlight_level = screen_brightness;
         static bool was_dimmed = false;
-        // Always enforce Pin 38 High by default to keep NeoPixel rail alive for Mode 15/9 blips
-        // pin 38 tied to backlight via scaling (no forced HIGH)
         if (current_battery_pct <= 5.0f) {
-            // CRITICAL GUARD: Drop backlight to 10% minimal draw, turn off power switch to cut LED drain completely
-            target_backlight_level = 30; // keep visible, was 10 black (no pin LOW, brightness handles)
+            target_backlight_level = 100; // 39% keeps LED visible, was 30 (12% -> off)
             flush_log_cache();
             was_dimmed = false;
         } else if (current_battery_pct <= 20.0f) {
-            target_backlight_level = 30;
+            target_backlight_level = 100;
             was_dimmed = false;
         } else {
             bool is_chat_idle_60s = (current_app_mode == MODE_CHAT && (millis() - last_user_keyboard_input_tick >= 60000));
             if (is_chat_idle_60s) {
-                // Partial power-saving step: 35% brightness (89/255) readable floor, Pin 38 stays HIGH for NeoPixel
-                target_backlight_level = 89;
-                // pin 38 tied to backlight via scaling (no forced HIGH)
+                target_backlight_level = 150; // 59% idle floor, was 89 (35% -> LED off)
                 was_dimmed = true;
             } else {
-                // Instant restore on any key matrix fire: full operational brightness 100% duty cycle
                 if (was_dimmed) {
-                    target_backlight_level = 255; // 100% duty cycle instant restore
-                    // pin 38 tied to backlight via scaling (no forced HIGH)
+                    target_backlight_level = 255;
                     ui_needs_redraw = true;
                     was_dimmed = false;
                 } else {
-                    if (screen_brightness < 40) screen_brightness = 40;
+                    if (screen_brightness < 100) screen_brightness = 180;
                     target_backlight_level = screen_brightness;
-                    // pin 38 tied to backlight via scaling (no forced HIGH)
                 }
             }
         }
@@ -3408,9 +3405,9 @@ void setup() {
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
     canvas.fillSprite(0x0000);
-    // Force visible brightness at boot (ignore SD 15)
-    M5Cardputer.Display.setBrightness(80);
-    g_backlight_level=80;
+    // Force visible brightness at boot (hardware LED rail needs >150 to keep idle heartbeat on)
+    M5Cardputer.Display.setBrightness(180);
+    g_backlight_level=180;
     
     // BMI270 Wire1 tilt sensor init - cfg.internal_imu already inits via M5Cardputer.begin, just ensure Wire1
     Wire1.begin(2, 1);
@@ -3470,8 +3467,8 @@ void setup() {
     }
     
     load_settings_from_sd();
-    screen_brightness = 80; g_backlight_level=80; // fixed, user setting removed, keep timeout/power saving
-    if (screen_brightness < 40) { Serial.printf("[BRIGHT] bump %d->80\n", screen_brightness); screen_brightness = 80; g_backlight_level=80; sync_new_nick_to_sd(irc_nick); }
+    screen_brightness = 180; g_backlight_level=180; // fixed 180 keeps LED rail alive (was 80 -> LED off due to hardware tie)
+    if (screen_brightness < 100) { Serial.printf("[BRIGHT] bump %d->180\n", screen_brightness); screen_brightness = 180; g_backlight_level=180; sync_new_nick_to_sd(irc_nick); }
     if (!safe_mode_active) purge_old_logs();
 
     irc_mutex = xSemaphoreCreateMutex();
@@ -3496,9 +3493,9 @@ void setup() {
     load_alias_list();
     load_highlight_list();
 
-    // Force visible brightness at boot (80) after all init, before draw
-    M5Cardputer.Display.setBrightness(80);
-    g_backlight_level=80;
+    // Force visible brightness at boot (180 keeps LED rail alive, was 80 -> LED off)
+    M5Cardputer.Display.setBrightness(180);
+    g_backlight_level=180;
     // Ensure canvas is valid before boot (viewport 109)
     if(canvas.width()==0 || canvas.height()==0){
         canvas.deleteSprite();
