@@ -13,7 +13,7 @@
 // ⚡ SYSTEM CONSTANTS & HARDWARE BUFFER BOUNDS
 // ==========================================
 #define MAX_TABS 10
-#define MSG_BUFFER_SIZE 20
+#define MSG_BUFFER_SIZE 10
 #define COLUMNS_MAX 38
 
 struct ChatLine {
@@ -999,9 +999,10 @@ void draw_chat_view() {
         int right_x = is_vertical ? (display_width/2 + 1) : 117;
         int right_w = is_vertical ? (display_width - right_x) : 123;
         int split_x = is_vertical ? (display_width/2) : 116;
-        canvas.fillRect(0, 0, left_w, display_height, 0x0841);
-        canvas.fillRect(right_x, 0, right_w, display_height, 0x0000);
-        canvas.drawFastVLine(split_x, 0, display_height, 0x7BEF);
+        int ch = canvas.height();
+        canvas.fillRect(0, 0, left_w, ch, 0x0841);
+        canvas.fillRect(right_x, 0, right_w, ch, 0x0000);
+        canvas.drawFastVLine(split_x, 0, ch, 0x7BEF);
         
         canvas.setTextColor(0x07E0); canvas.setCursor(6, 6); canvas.print("NETWORKS");
         
@@ -1101,7 +1102,8 @@ void draw_chat_view() {
                 channel_print_counter++;
             }
         }
-        int bar_y = display_height - 13;
+        int ch2 = canvas.height();
+        int bar_y = ch2 - 13;
         canvas.fillRect(0, bar_y, display_width, 13, 0x0841);
         canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
         if (nav_filter_active) {
@@ -1111,6 +1113,15 @@ void draw_chat_view() {
         }
         canvas.pushSprite(0, 0); 
         if (canvas.height()==109) M5Cardputer.Display.fillRect(0, 109, 240, 26, 0x0000);
+        ui_needs_redraw = false; 
+        chrome_needs_redraw = false;
+        input_needs_redraw = false;
+        sparkline_needs_redraw = false;
+        return; 
+    }
+
+    // ==========================================
+    // STATE 2: CONFIGURATION MENUS (Fn + O)
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
@@ -1202,7 +1213,8 @@ void draw_chat_view() {
                 canvas.setTextColor(0xF800); canvas.setCursor(10, 102); canvas.print("No networks");
             }
         }
-        int bar_y = display_height - 13;
+        int ch3 = canvas.height();
+        int bar_y = ch3 - 13;
         canvas.fillRect(0, bar_y, display_width, 13, 0x0841);
         canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
         canvas.setCursor(10, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print("Esc: Exit | ,/. Adjust Value");
@@ -1211,6 +1223,7 @@ void draw_chat_view() {
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
+        sparkline_needs_redraw = false;
         return;
     }
 
@@ -1221,10 +1234,8 @@ void draw_chat_view() {
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] canvas 0 in draw, recreating viewport");
         canvas.deleteSprite();
-        canvas.setColorDepth(8);
         if(!canvas.createSprite(240,109)){
-            canvas.setColorDepth(8);
-        if(!canvas.createSprite(135,214)){
+            if(!canvas.createSprite(135,214)){
                 // last resort 240x135 will likely fail without PSRAM but try
                 canvas.createSprite(240,135);
             }
@@ -1786,7 +1797,9 @@ void handle_keyboard_inputs() {
         if(cur_p && !was_p_prev){
             current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
             menu_selection_idx = 0; nav_server_select_idx = 0; nav_channel_select_idx = 0;
-            ui_needs_redraw = true;
+            ui_needs_redraw = true; chrome_needs_redraw = true; input_needs_redraw = true; sparkline_needs_redraw = true;
+            // clear chat scroll when returning to chat from navigator
+            if (current_app_mode == MODE_CHAT) { scrollback_offset=0; scrollback_offset_idx=0; is_scrollback_active=false; scrollback_mode_active=false; }
             set_led_mode(18);
             was_p_prev=true;
             return;
@@ -1800,13 +1813,14 @@ void handle_keyboard_inputs() {
         static bool was_o_prev=false;
         bool cur_o = is_fn && M5Cardputer.Keyboard.isKeyPressed('o');
         if(cur_o && !was_o_prev){
-            if (current_app_mode == MODE_CHAT)       { current_app_mode = MODE_SETTINGS; }
+            // Fix: from any mode (including NAVIGATOR/LOGS/WHOIS) go to SETTINGS, not just CHAT
+            if (current_app_mode == MODE_CHAT || current_app_mode == MODE_NAVIGATOR || current_app_mode == MODE_LOGS || current_app_mode == MODE_WHOIS) { current_app_mode = MODE_SETTINGS; }
             else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
             else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_THEME; }
             else if (current_app_mode == MODE_THEME)    { current_app_mode = MODE_WIFI; }
             else                                      { current_app_mode = MODE_CHAT; }
             menu_selection_idx = 0;
-            ui_needs_redraw = true;
+            ui_needs_redraw = true; chrome_needs_redraw = true; input_needs_redraw = true; sparkline_needs_redraw = true;
             set_led_mode(18);
             was_o_prev=true;
             return;
@@ -2886,9 +2900,9 @@ void irc_network_task(void* pvParameters) {
                 if (ESP.getMinFreeHeap() < 45 * 1024) {
                     Serial.println("[HEAP] Low heap detected (<45KB), recycling old channel history buffers");
                     for (int t_idx = 0; t_idx < gTabCount; t_idx++) {
-                        if (gTabs[t_idx].line_count > 15) {
-                            int keep = 15;
-                            ChatLine tmp[15];
+                        if (gTabs[t_idx].line_count > 8) {
+                            int keep = 8;
+                            ChatLine tmp[10];
                             for(int k=0;k<keep;k++) tmp[k]=gTabs[t_idx].lines[(gTabs[t_idx].head + gTabs[t_idx].line_count - keep + k) % MSG_BUFFER_SIZE];
                             for(int k=0;k<keep;k++) gTabs[t_idx].lines[k]=tmp[k];
                             for(int k=keep;k<MSG_BUFFER_SIZE;k++) memset(&gTabs[t_idx].lines[k],0,sizeof(ChatLine));
@@ -3655,19 +3669,31 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
-        // Periodic UI refresh - subtle: sparkline 500ms, time 60s, battery 5s
+        // Periodic UI refresh - subtle per-element, not whole bar
         {
             static unsigned long last_rssi_tick = 0;
+            static int8_t last_rssi_val = -127;
             if (millis() - last_rssi_tick >= 500) {
                 last_rssi_tick = millis();
                 int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
-                rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
-                if (current_app_mode == MODE_CHAT) sparkline_needs_redraw = true;
+                if (cur != last_rssi_val) {
+                    last_rssi_val = cur;
+                    rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
+                    if (current_app_mode == MODE_CHAT) sparkline_needs_redraw = true;
+                }
             }
             static unsigned long last_time_tick = 0;
+            static int last_minute = -1;
             if (millis() - last_time_tick >= 1000) {
                 last_time_tick = millis();
-                if (current_app_mode == MODE_CHAT) chrome_needs_redraw = true;
+                struct tm tm;
+                int cur_min = -1;
+                if (getLocalTime(&tm, 30)) cur_min = tm.tm_hour*60 + tm.tm_min;
+                else cur_min = (millis()/1000 + adj_time)/60 % 1440;
+                if (cur_min != last_minute) {
+                    last_minute = cur_min;
+                    if (current_app_mode == MODE_CHAT) chrome_needs_redraw = true;
+                }
             }
         }
         // Hardware Frame-Rate Governor Shield - 30 FPS (33ms) reduces SPI load and flood flicker, atomic push eliminates tearing
@@ -3740,21 +3766,18 @@ void setup() {
     use_light_theme=false; text_scale=1;
     // No PSRAM - use 240x109 middle viewport (52KB) bloat-free, never 240x135
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
-    canvas.setColorDepth(8);
     if(!canvas.createSprite(240, 109)){
         Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
         if(!canvas.createSprite(135, 214)){
             Serial.println("[GFX] 135x214 fail, trying 240x135 last resort");
-            canvas.setColorDepth(8);
-            canvas.createSprite(240, 135);
+                canvas.createSprite(240, 135);
         }
     }
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] sprite still 0, retry 240x109 after heap trim");
         for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
         canvas.deleteSprite();
-        canvas.setColorDepth(8);
         canvas.createSprite(240,109);
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
