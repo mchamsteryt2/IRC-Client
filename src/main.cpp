@@ -1075,14 +1075,13 @@ void draw_chat_view() {
         canvas.setTextColor(0xFD20); canvas.setCursor(10, 8);
         if (current_app_mode == MODE_SETTINGS) {
             canvas.print("--- SYSTEM CONFIGURATIONS ---"); canvas.setTextColor(0xFFFF);
-            canvas.setCursor(10, 26); canvas.printf("%s Brightness Level: %d", (menu_selection_idx == 0 ? ">" : " "), screen_brightness);
             {
                 char utcLab[20]; snprintf(utcLab, sizeof(utcLab), "UTC%+d%s", current_tz_idx, use_dst ? " DST" : "");
-                canvas.setCursor(10, 40); canvas.printf("%s Timezone: %s", (menu_selection_idx == 1 ? ">" : " "), utcLab);
+                canvas.setCursor(10, 26); canvas.printf("%s Timezone: %s", (menu_selection_idx == 0 ? ">" : " "), utcLab);
             }
-            canvas.setCursor(10, 54); canvas.printf("%s Format Layer: %s", (menu_selection_idx == 2 ? ">" : " "), use_12_hour_format ? "12-HR" : "24-HR");
-            canvas.setCursor(10, 68); canvas.printf("%s DST Override: %s", (menu_selection_idx == 3 ? ">" : " "), use_dst ? "ON +1h" : "OFF");
-            canvas.setCursor(10, 82); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 4 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
+            canvas.setCursor(10, 40); canvas.printf("%s Format Layer: %s", (menu_selection_idx == 1 ? ">" : " "), use_12_hour_format ? "12-HR" : "24-HR");
+            canvas.setCursor(10, 54); canvas.printf("%s DST Override: %s", (menu_selection_idx == 2 ? ">" : " "), use_dst ? "ON +1h" : "OFF");
+            canvas.setCursor(10, 68); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
         } else if (current_app_mode == MODE_BOUNCER) {
             canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(0xFFFF);
             canvas.setCursor(10, 26); canvas.printf("%s Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
@@ -1841,7 +1840,7 @@ void handle_keyboard_inputs() {
                 if (current_app_mode == MODE_WIFI) {
                     int sc = WiFi.scanComplete();
                     if (sc > 0) { if (sc>5) sc=5; max_limit = 4 + sc; } else max_limit = 4;
-                } else if (current_app_mode == MODE_SETTINGS) max_limit = 4;
+                } else if (current_app_mode == MODE_SETTINGS) max_limit = 3;
                 else if (current_app_mode == MODE_THEME) max_limit = 4;
                 else if (current_app_mode == MODE_LOGS) max_limit = 9;
                 else if (current_app_mode == MODE_WHOIS) max_limit = 0;
@@ -1863,20 +1862,15 @@ void handle_keyboard_inputs() {
                 nav_channel_select_idx = 0; // Clear rows index step on server swap
             }
             else if (current_app_mode == MODE_SETTINGS) {
-                if (menu_selection_idx == 0) { // Screen Backlight Scaler
-                    screen_brightness += forward ? 30 : -30;
-                    if (screen_brightness > 255) screen_brightness = 255;
-                    if (screen_brightness < 40)  screen_brightness = 40;
-                }
-                else if (menu_selection_idx == 1) { // Timezone Offset Index
+                if (menu_selection_idx == 0) { // Timezone Offset Index
                     current_tz_idx += forward ? 1 : -1;
                     if (current_tz_idx > 14) current_tz_idx = -12;
                     if (current_tz_idx < -12) current_tz_idx = 14;
                     sync_ntp_timezone();
                 }
-                else if (menu_selection_idx == 2) { use_12_hour_format = !use_12_hour_format; }
-                else if (menu_selection_idx == 3) { use_dst = !use_dst; sync_ntp_timezone(); }
-                else if (menu_selection_idx == 4) { channel_log_enabled = !channel_log_enabled; }
+                else if (menu_selection_idx == 1) { use_12_hour_format = !use_12_hour_format; }
+                else if (menu_selection_idx == 2) { use_dst = !use_dst; sync_ntp_timezone(); }
+                else if (menu_selection_idx == 3) { channel_log_enabled = !channel_log_enabled; }
             } else if (current_app_mode == MODE_THEME) {
                 if (menu_selection_idx == 0) { use_light_theme = !use_light_theme; }
                 else if (menu_selection_idx == 1) { theme_accent = (theme_accent + (forward?1:-1) +4)%4; }
@@ -1939,28 +1933,20 @@ void handle_keyboard_inputs() {
         }
     }
     }
-    // Layer E: Configuration Menu Form Row Value-Changing Handlers
+    // Layer E: Configuration Menu Form Row Value-Changing Handlers (brightness fixed 80, no user row)
     if (current_app_mode == MODE_SETTINGS && status.enter) {
-        if (menu_selection_idx == 0) { // Row 1: Cycle Brightness Level (Off -> Dim -> Med -> Max)
-            if (screen_brightness == 40) screen_brightness = 80;
-            else if (screen_brightness == 80) screen_brightness = 120;
-            else if (screen_brightness == 120) screen_brightness = 200;
-            else if (screen_brightness == 200) screen_brightness = 255;
-            else screen_brightness = 40;
-            M5Cardputer.Display.setBrightness(screen_brightness);
-        }
-        else if (menu_selection_idx == 1) { // Row 2: Shift Timezone Indicator Offset index
+        if (menu_selection_idx == 0) { // Row 1: Shift Timezone Indicator Offset index
             current_tz_idx = (current_tz_idx + 1);
             if (current_tz_idx > 14) current_tz_idx = -12; // Wrap across international date lines safely
             sync_ntp_timezone();
         }
-        else if (menu_selection_idx == 2) { // Row 3: Toggle 12/24hr Display Format Layer
+        else if (menu_selection_idx == 1) { // Row 2: Toggle 12/24hr Display Format Layer
             use_12_hour_format = !use_12_hour_format;
         }
-        else if (menu_selection_idx == 3) { // Row 4: DST Override
+        else if (menu_selection_idx == 2) { // Row 3: DST Override
             use_dst = !use_dst; sync_ntp_timezone();
         }
-        else if (menu_selection_idx == 4) { // Row 5: Toggle Local Channel Log File Recording
+        else if (menu_selection_idx == 3) { // Row 4: Toggle Local Channel Log File Recording
             channel_log_enabled = !channel_log_enabled;
         }
         ui_needs_redraw = true;
@@ -3236,8 +3222,7 @@ void setup() {
     Wire.setTimeOut(50);
     
     // Activate Stamp module built-in NeoPixel line switch rail power output
-    pinMode(38, OUTPUT);
-    // pin 38 tied to backlight via scaling (no forced HIGH)
+    // pin 38 via Display.setBrightness (was NeoPixel rail, now tied LED/backlight)
     
     // Open clean cooperative SPI bus lane pipelines with SD self-heal 3x retry
     // Cardputer SD uses SCK=40, MISO=39, MOSI=14, CS=12 per official example
@@ -3277,6 +3262,7 @@ void setup() {
     }
     
     load_settings_from_sd();
+    screen_brightness = 80; g_backlight_level=80; // fixed, user setting removed, keep timeout/power saving
     if (screen_brightness < 40) { Serial.printf("[BRIGHT] bump %d->80\n", screen_brightness); screen_brightness = 80; g_backlight_level=80; sync_new_nick_to_sd(irc_nick); }
     if (!safe_mode_active) purge_old_logs();
 
