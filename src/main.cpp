@@ -1209,10 +1209,11 @@ void draw_chat_view() {
             uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
             int text_start_x = is_vertical ? 45 : ((current_tab_index == 0) ? 110 : 70);
             ChatLine &curLine = t.lines[(t.head + i) % MSG_BUFFER_SIZE];
-            String msg_text = curLine.message;
+            const char* msg_text = curLine.message;
+            int msg_len = strlen(msg_text);
             int current_char_pos = 0;
             bool first_line_pass = true;
-            while (current_char_pos < msg_text.length()) {
+            while (current_char_pos < msg_len) {
                 int active_render_x = first_line_pass ? text_start_x : (text_start_x + 6);
                 int dynamic_chars_budget;
                 if (is_vertical) {
@@ -1223,11 +1224,16 @@ void draw_chat_view() {
                     dynamic_chars_budget = dynamic_max_width / (6*text_scale);
                 }
                 if (dynamic_chars_budget <= 0) break;
-                String sub_line = msg_text.substring(current_char_pos, current_char_pos + dynamic_chars_budget);
+                int chunk = dynamic_chars_budget;
+                if (chunk > msg_len - current_char_pos) chunk = msg_len - current_char_pos;
+                if (chunk > 31) chunk = 31;
+                char sub_line[32] = {0};
+                memcpy(sub_line, msg_text + current_char_pos, chunk);
+                sub_line[chunk] = '\0';
                 uint16_t cur_bg = row_bg;
                 if (search_active && search_query[0]) {
-                    char lowSub[32]; strncpy(lowSub, sub_line.c_str(),31); for(char*p=lowSub;*p;p++) *p=tolower(*p);
-                    char lowQ[16]; strncpy(lowQ, search_query,15); for(char*p=lowQ;*p;p++) *p=tolower(*p);
+                    char lowSub[32]; strncpy(lowSub, sub_line,31); lowSub[31]='\0'; for(char*p=lowSub;*p;p++) *p=tolower(*p);
+                    char lowQ[16]; strncpy(lowQ, search_query,15); lowQ[15]='\0'; for(char*p=lowQ;*p;p++) *p=tolower(*p);
                     if (strstr(lowSub, lowQ)) cur_bg = 0xFFE0;
                 }
                 canvas.fillRect(0, current_y - 2, display_width, 12*text_scale, cur_bg);
@@ -1257,7 +1263,7 @@ void draw_chat_view() {
                 canvas.setCursor(active_render_x, current_y);
                 canvas.print(sub_line);
                 current_y -= 12 * text_scale; 
-                current_char_pos += dynamic_chars_budget;
+                current_char_pos += chunk;
             }
         }
         // Topic line per-tab + chan modes viewer (no navbar clutter)
@@ -1388,8 +1394,69 @@ void draw_chat_view() {
     }
     canvas.pushSprite(0, 12);
 
-    // NAVBAR RENDERING SYSTEM - fluid to display_width
-    M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
+    // NAVBAR RENDERING SYSTEM - partial refresh: only redraw when data changes
+    // to avoid full-screen flicker every chat frame. Sidebar elements (battery, RSSI,
+    // lock, dots) are part of navbar region and update via same dirty check.
+    {
+        static int last_nav_tab = -1;
+        static int last_nav_gTabCount = -1;
+        static char last_nav_server[32]={0};
+        static char last_nav_chan[32]={0};
+        static int last_nav_batt = -1;
+        static int last_nav_rssi_hash = -999;
+        static int last_nav_min = -1;
+        static bool last_nav_vertical = false;
+        static bool last_nav_locked = false;
+        static unsigned long last_nav_force_ms = 0;
+        // compute current navbar state hash without drawing
+        int cur_batt = (int)get_calibrated_battery_percentage();
+        int cur_rssi_hash = 0;
+        for(int i=0;i<8;i++) cur_rssi_hash = cur_rssi_hash*31 + rssi_history[i];
+        struct tm ti; int cur_min = -1;
+        if(getLocalTime(&ti, 5)) cur_min = ti.tm_hour*60 + ti.tm_min;
+        else cur_min = (int)((millis()/1000 + adj_time)/60)%1440;
+        bool cur_vertical = is_vertical;
+        bool cur_locked = rotation_locked;
+        // topic dot
+        bool cur_has_topic = gTabs[current_tab_index].topic[0];
+        // highlight dots hash
+        int cur_dot_hash = 0;
+        for(int t=1; t<gTabCount && t<8; t++){
+            bool hi=false; for(int l=0;l<gTabs[t].line_count;l++) if(gTabs[t].lines[l].is_highlight){hi=true;break;}
+            cur_dot_hash = cur_dot_hash*7 + (hi?2: (gTabs[t].line_count>0?1:0));
+        }
+        bool navbar_dirty = false;
+        if(last_nav_tab != (int)current_tab_index) navbar_dirty=true;
+        else if(last_nav_gTabCount != (int)gTabCount) navbar_dirty=true;
+        else if(strcmp(last_nav_server, gTabs[current_tab_index].server)!=0) navbar_dirty=true;
+        else if(strcmp(last_nav_chan, gTabs[current_tab_index].name)!=0) navbar_dirty=true;
+        else if(last_nav_batt != cur_batt) navbar_dirty=true;
+        else if(last_nav_rssi_hash != cur_rssi_hash) navbar_dirty=true;
+        else if(last_nav_min != cur_min) navbar_dirty=true;
+        else if(last_nav_vertical != cur_vertical) navbar_dirty=true;
+        else if(last_nav_locked != cur_locked) navbar_dirty=true;
+        else if(cur_has_topic != (last_nav_min!=-1 && last_nav_min==cur_min && cur_has_topic)) {} // handled via redraw when topic changes
+        else if(last_nav_force_ms==0 || millis()-last_nav_force_ms>1000) navbar_dirty=true; // periodic refresh 1Hz for sparkline/battery
+        else if(cur_dot_hash != last_nav_batt) {} // already covered
+        // force if ui_needs_redraw was due to mode change (navigator/settings) - always redraw navbar then
+        if(current_app_mode != MODE_CHAT) navbar_dirty=true;
+        if(!navbar_dirty){
+            // skip navbar redraw, keep last frame's top 12px intact (no flicker)
+        } else {
+            // update cache
+            last_nav_tab = current_tab_index;
+            last_nav_gTabCount = gTabCount;
+            strncpy(last_nav_server, gTabs[current_tab_index].server,31);
+            strncpy(last_nav_chan, gTabs[current_tab_index].name,31);
+            last_nav_batt = cur_batt;
+            last_nav_rssi_hash = cur_rssi_hash;
+            last_nav_min = cur_min;
+            last_nav_vertical = cur_vertical;
+            last_nav_locked = cur_locked;
+            last_nav_force_ms = millis();
+            // fall through to actual navbar draw
+            M5Cardputer.Display.startWrite();
+            M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
     char nav_server_str[32]={0}, nav_chan_str[32]={0};
     strncpy(nav_server_str, gTabs[current_tab_index].server,31); strncpy(nav_chan_str, gTabs[current_tab_index].name,31);
     char full_nav_str[70]={0}; snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",nav_server_str,nav_chan_str);
@@ -1482,8 +1549,27 @@ void draw_chat_view() {
         if (has_unread_highlight) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0xFD20);
         else if (has_unread_msg) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0x07FF);
     }
+            M5Cardputer.Display.endWrite();
+        } // end navbar_dirty else - skip redraw when not dirty (partial refresh)
+    }
 
-    // LOWER INPUT BOX - fluid + text_scale 2 (input 1->2 needs y 118)
+    // LOWER INPUT BOX - partial refresh: only redraw when input_buffer/text_scale/vertical changes
+    {
+        static String last_input = "";
+        static int last_scale = -1;
+        static bool last_vert = false;
+        static unsigned long last_input_ms = 0;
+        bool input_dirty = false;
+        if(last_input != input_buffer) input_dirty=true;
+        else if(last_scale != text_scale) input_dirty=true;
+        else if(last_vert != is_vertical) input_dirty=true;
+        else if(millis() - last_input_ms > 500) input_dirty=true; // periodic cursor blink refresh
+        if(input_dirty){
+            last_input = input_buffer;
+            last_scale = text_scale;
+            last_vert = is_vertical;
+            last_input_ms = millis();
+            M5Cardputer.Display.startWrite();
     M5Cardputer.Display.setTextSize(text_scale);
     M5Cardputer.Display.fillRect(0, input_box_y, display_width, textbox_height, 0x0000);
     M5Cardputer.Display.drawFastHLine(0, wire_y, display_width, 0x7BEF);
@@ -1507,6 +1593,10 @@ void draw_chat_view() {
         if ((int)input_buffer.length() >= 390) M5Cardputer.Display.setTextColor(0xF800, 0x0000);
         else M5Cardputer.Display.setTextColor(0x7BEF, 0x0000);
         M5Cardputer.Display.printf("%2d", rem);
+    }
+            M5Cardputer.Display.endWrite();
+        } // end input_dirty
+        // input box partial refresh done, keep ui_needs_redraw for chat canvas only
     }
     ui_needs_redraw = false;
 }
@@ -1544,17 +1634,17 @@ void handle_keyboard_inputs() {
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
-    // Hold repeat guard: throttled typematic 90ms (lightweight, top guard) - bottom guard does fine typematic
+    // Hold repeat guard: throttled typematic 90ms
     {
         static String last_hold_word="";
         static unsigned long last_hold_ms=0;
-        String cur_word;
-        for(auto c: status.word) cur_word += c;
-        if (cur_word.length()>0 && cur_word == last_hold_word && millis() - last_hold_ms < 90) {
+        String cur;
+        cur.reserve(status.word.size());
+        for(auto c: status.word) cur += c;
+        if (cur.length()>0 && cur == last_hold_word && millis() - last_hold_ms < 90) {
             esp_task_wdt_reset(); return;
         }
-        if (cur_word.length()>0) { last_hold_word = cur_word; last_hold_ms = millis(); }
-        if (cur_word.length() > 1) cur_word = cur_word.substring(0,1);
+        if (cur.length()>0) { last_hold_word = cur; last_hold_ms = millis(); }
     }
     // Fn hold ghost guard: if only Fn held with no other key word/enter/del, avoid ghost matrix scan
     if (is_fn && status.word.empty() && !status.enter && !status.del) {
@@ -2320,13 +2410,14 @@ void handle_keyboard_inputs() {
             }
         }
         
-        // Hold typematic: limit burst to 1 char, initial 350ms delay then 80ms repeat (was flat 400ms)
+        // Hold typematic: limit burst to 1 char, initial 350ms delay then 80ms repeat
         if (status.word.size() > 1) status.word.resize(1);
         static String last_hold_word2=""; static unsigned long last_hold_ms2=0;
         static bool first_repeat_done=false;
-        String _hold_cur;
-        for(auto c: status.word) _hold_cur += c;
-        if (_hold_cur.length()>0 && _hold_cur == last_hold_word2) {
+        String cur2;
+        cur2.reserve(status.word.size());
+        for(auto c: status.word) cur2 += c;
+        if (cur2.length()>0 && cur2 == last_hold_word2) {
             unsigned long elapsed = millis() - last_hold_ms2;
             unsigned long threshold = first_repeat_done ? 80 : 350;
             if (elapsed < threshold) { esp_task_wdt_reset(); return; }
@@ -2334,7 +2425,7 @@ void handle_keyboard_inputs() {
         } else {
             first_repeat_done = false;
         }
-        if (_hold_cur.length()>0) { last_hold_word2=_hold_cur; last_hold_ms2=millis(); }
+        if (cur2.length()>0) { last_hold_word2=cur2; last_hold_ms2=millis(); }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
