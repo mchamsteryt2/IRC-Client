@@ -1505,21 +1505,26 @@ void draw_chat_view() {
 }
 
 void handle_keyboard_inputs() {
-    if (M5Cardputer.Keyboard.isPressed()) {
-        last_user_keyboard_input_tick = millis(); // Refresh activity timer anchor
-        // Instant restore from 35% partial dimmer: request full brightness, let ui loop throttle actual setBrightness
-        if (current_app_mode == MODE_CHAT) {
+    static bool wasPressed = false;
+    bool isPressed = M5Cardputer.Keyboard.isPressed();
+    if (isPressed) {
+        last_user_keyboard_input_tick = millis(); // Refresh activity timer anchor (always while held)
+        // Throttled brightness restore: only on rising edge, not every 10ms while held (fixes flicker/SPI flood)
+        if (!wasPressed && current_app_mode == MODE_CHAT && g_backlight_level != 255) {
             g_backlight_level = 255;
-            // throttle avoids LE/Speaker clash, actual Display.setBrightness in ui loop
             ui_needs_redraw = true;
         }
+        wasPressed = true;
+    } else {
+        wasPressed = false;
+        return;
     }
-    if (!M5Cardputer.Keyboard.isPressed()) return;
-    // Explicit 180ms hardware bounce filter + WDT feed to stop flicker double-chatter
-    if (millis() - last_keypress_debounce < 180) { esp_task_wdt_reset(); return; }
+    // Hardware bounce filter 35ms (was 180ms which blocked legitimate repeat and still left unconditional redraw)
+    // Keep short so typematic repeat can be controlled by explicit hold guards below
+    if (millis() - last_keypress_debounce < 35) { esp_task_wdt_reset(); return; }
     last_keypress_debounce = millis();
     last_input_time = millis(); // Fresh backlight dim timer
-    // Fn mode debounce 300ms to stop holding Fn glitch
+    // Fn mode debounce 300ms to stop holding Fn glitch - mode switches are edge-triggered below, so hold won't flicker
     static unsigned long last_fn_debounce=0;
     bool is_fn_now = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
     if (is_fn_now && millis() - last_fn_debounce < 300) {
@@ -1532,13 +1537,13 @@ void handle_keyboard_inputs() {
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
-    // Hold repeat guard: if same word held, slow to 400ms
+    // Hold repeat guard: throttled typematic 90ms (lightweight, top guard) - bottom guard does fine typematic
     {
         static String last_hold_word="";
         static unsigned long last_hold_ms=0;
         String cur_word;
         for(auto c: status.word) cur_word += c;
-        if (cur_word.length()>0 && cur_word == last_hold_word && millis() - last_hold_ms < 400) {
+        if (cur_word.length()>0 && cur_word == last_hold_word && millis() - last_hold_ms < 90) {
             esp_task_wdt_reset(); return;
         }
         if (cur_word.length()>0) { last_hold_word = cur_word; last_hold_ms = millis(); }
@@ -1566,53 +1571,81 @@ void handle_keyboard_inputs() {
         if(cur_p) { esp_task_wdt_reset(); return; } // hold, don't fall through to other handlers
     }
 
-    // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O) + Theme
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('o')) {
-        if (current_app_mode == MODE_CHAT)       { current_app_mode = MODE_SETTINGS; }
-        else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
-        else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_THEME; }
-        else if (current_app_mode == MODE_THEME)    { current_app_mode = MODE_WIFI; }
-        else                                      { current_app_mode = MODE_CHAT; }
-        menu_selection_idx = 0;
-        ui_needs_redraw = true;
-        set_led_mode(18);
-        return;
-    }
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('i')) {
-        String who = "";
-        if (input_buffer.length()>0) {
-            int sp = input_buffer.lastIndexOf(' ');
-            who = (sp==-1)? input_buffer : input_buffer.substring(sp+1);
-            who.trim(); if(who.startsWith("/")) who="";
-        }
-        if (who.length()==0 && gTabs[current_tab_index].line_count>0) who = String(gTabs[current_tab_index].lines[gTabs[current_tab_index].line_count-1].nick);
-        who.trim(); if(who.length()>0 && who!="server" && who!="ClientCore"){
-            memset(&whois_cache,0,sizeof(whois_cache));
-            whois_pending=true;
-            const char* anet = gTabs[current_tab_index].server;
-            for(int i=0;i<discovered_network_count;i++) if(strcmp(discovered_networks[i], anet)==0 && clients[i].connected()){
-                clients[i].printf("WHOIS %s\r\n", who.c_str());
-                clients[i].flush();
-                strncpy(whois_cache.nick, who.c_str(), sizeof(whois_cache.nick)-1);
-                break;
-            }
+    // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O) + Theme - edge triggered to prevent hold flicker
+    {
+        static bool was_o_prev=false;
+        bool cur_o = is_fn && M5Cardputer.Keyboard.isKeyPressed('o');
+        if(cur_o && !was_o_prev){
+            if (current_app_mode == MODE_CHAT)       { current_app_mode = MODE_SETTINGS; }
+            else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
+            else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_THEME; }
+            else if (current_app_mode == MODE_THEME)    { current_app_mode = MODE_WIFI; }
+            else                                      { current_app_mode = MODE_CHAT; }
+            menu_selection_idx = 0;
+            ui_needs_redraw = true;
             set_led_mode(18);
-            ui_needs_redraw=true;
+            was_o_prev=true;
+            return;
         }
-        return;
+        if(!cur_o) was_o_prev=false;
+        if(cur_o) { esp_task_wdt_reset(); return; }
+    }
+    {
+        static bool was_i_prev=false;
+        bool cur_i = is_fn && M5Cardputer.Keyboard.isKeyPressed('i');
+        if(cur_i && !was_i_prev){
+            String who = "";
+            if (input_buffer.length()>0) {
+                int sp = input_buffer.lastIndexOf(' ');
+                who = (sp==-1)? input_buffer : input_buffer.substring(sp+1);
+                who.trim(); if(who.startsWith("/")) who="";
+            }
+            if (who.length()==0 && gTabs[current_tab_index].line_count>0) who = String(gTabs[current_tab_index].lines[gTabs[current_tab_index].line_count-1].nick);
+            who.trim(); if(who.length()>0 && who!="server" && who!="ClientCore"){
+                memset(&whois_cache,0,sizeof(whois_cache));
+                whois_pending=true;
+                const char* anet = gTabs[current_tab_index].server;
+                for(int i=0;i<discovered_network_count;i++) if(strcmp(discovered_networks[i], anet)==0 && clients[i].connected()){
+                    clients[i].printf("WHOIS %s\r\n", who.c_str());
+                    clients[i].flush();
+                    strncpy(whois_cache.nick, who.c_str(), sizeof(whois_cache.nick)-1);
+                    break;
+                }
+                set_led_mode(18);
+                ui_needs_redraw=true;
+            }
+            was_i_prev=true;
+            return;
+        }
+        if(!cur_i) was_i_prev=false;
+        if(cur_i) { esp_task_wdt_reset(); return; }
     }
     // Fn+B dBm toggle removed - keep sparkline only per user
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('q')) {
-        show_mentions_peek = !show_mentions_peek;
-        ui_needs_redraw=true;
-        return;
+    {
+        static bool was_q_prev=false;
+        bool cur_q = is_fn && M5Cardputer.Keyboard.isKeyPressed('q');
+        if(cur_q && !was_q_prev){
+            show_mentions_peek = !show_mentions_peek;
+            ui_needs_redraw=true;
+            was_q_prev=true;
+            return;
+        }
+        if(!cur_q) was_q_prev=false;
+        if(cur_q) { esp_task_wdt_reset(); return; }
     }
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('l')) {
-        current_app_mode = (current_app_mode == MODE_LOGS) ? MODE_CHAT : MODE_LOGS;
-        menu_selection_idx = 0;
-        ui_needs_redraw = true;
-        set_led_mode(18);
-        return;
+    {
+        static bool was_l_prev=false;
+        bool cur_l = is_fn && M5Cardputer.Keyboard.isKeyPressed('l');
+        if(cur_l && !was_l_prev){
+            current_app_mode = (current_app_mode == MODE_LOGS) ? MODE_CHAT : MODE_LOGS;
+            menu_selection_idx = 0;
+            ui_needs_redraw = true;
+            set_led_mode(18);
+            was_l_prev=true;
+            return;
+        }
+        if(!cur_l) was_l_prev=false;
+        if(cur_l) { esp_task_wdt_reset(); return; }
     }
 
 
@@ -1677,34 +1710,48 @@ void handle_keyboard_inputs() {
     // On the Cardputer layout, Fn+Arrows outputs direct character values:
     // Fn+Left = ';' | Fn+Right = '/' | Fn+Up = ',' | Fn+Down = '.'
     if (current_app_mode == MODE_CHAT) {
-        // Rotation Lock Toggle (Fn + Space) + Auto-Rotate
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(' ')) {
-            rotation_locked = !rotation_locked;
-            if (rotation_locked) locked_rotation = M5Cardputer.Display.getRotation();
-            queueLed(40, 500); // Mode 40 lock blip
-            // Visual lock persists in navbar, no canvas resize needed on lock alone
-            g_backlight_level = 255;
-            last_user_keyboard_input_tick = millis();
-            last_input_time = millis();
-            ui_needs_redraw = true;
-            return;
+        // Rotation Lock Toggle (Fn + Space) + Auto-Rotate - edge triggered to prevent hold flicker
+        {
+            static bool was_space_prev=false;
+            bool cur_space = is_fn && M5Cardputer.Keyboard.isKeyPressed(' ');
+            if(cur_space && !was_space_prev){
+                rotation_locked = !rotation_locked;
+                if (rotation_locked) locked_rotation = M5Cardputer.Display.getRotation();
+                queueLed(40, 500); // Mode 40 lock blip
+                g_backlight_level = 255;
+                last_user_keyboard_input_tick = millis();
+                last_input_time = millis();
+                ui_needs_redraw = true;
+                was_space_prev=true;
+                return;
+            }
+            if(!cur_space) was_space_prev=false;
+            if(cur_space) { esp_task_wdt_reset(); return; }
         }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn + UP Arrow
-            Tab &t = gTabs[current_tab_index];
-            is_scrollback_active = true;
-            scrollback_mode_active = true;
-            if (scrollback_offset < t.line_count - 1) scrollback_offset++;
-            if (scrollback_offset_idx < t.line_count - 1) scrollback_offset_idx++;
-            ui_needs_redraw = true;
-            return;
-        }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn + DOWN Arrow
-            if (scrollback_offset > 0) scrollback_offset--;
-            if (scrollback_offset_idx > 0) scrollback_offset_idx--;
-            if (scrollback_offset == 0) is_scrollback_active = false;
-            if (scrollback_offset_idx == 0) scrollback_mode_active = false;
-            ui_needs_redraw = true;
-            return;
+        // Scrollback up/down and tab swap are intentionally repeatable but throttled to 90ms to avoid SPI/UI flood
+        {
+            static unsigned long last_scroll_ms=0;
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed(';')) { // Fn + UP Arrow
+                if(millis() - last_scroll_ms < 90) { esp_task_wdt_reset(); return; }
+                last_scroll_ms = millis();
+                Tab &t = gTabs[current_tab_index];
+                is_scrollback_active = true;
+                scrollback_mode_active = true;
+                if (scrollback_offset < t.line_count - 1) scrollback_offset++;
+                if (scrollback_offset_idx < t.line_count - 1) scrollback_offset_idx++;
+                ui_needs_redraw = true;
+                return;
+            }
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn + DOWN Arrow
+                if(millis() - last_scroll_ms < 90) { esp_task_wdt_reset(); return; }
+                last_scroll_ms = millis();
+                if (scrollback_offset > 0) scrollback_offset--;
+                if (scrollback_offset_idx > 0) scrollback_offset_idx--;
+                if (scrollback_offset == 0) is_scrollback_active = false;
+                if (scrollback_offset_idx == 0) scrollback_mode_active = false;
+                ui_needs_redraw = true;
+                return;
+            }
         }
         // Fn + Backspace Panic Flush Macro
         if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0x08)) {
@@ -1728,38 +1775,41 @@ void handle_keyboard_inputs() {
             ui_needs_redraw = true;
         }
 
-        // Horizontal Quick-Tab Swapper (Fn + Comma = Previous Tab | Fn + Slash = Next Tab)
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Previous Tab
-            if (gTabCount > 1) {
-                current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount;
-                scrollback_offset_idx = 0;
-                ui_needs_redraw = true;
-                // Non-intrusive session state append with 2s debounce, keep Y=120 empty
-                save_session_state();
-                // Trigger auto-cleaning on quick-swapping left
-                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    Tab &current_view_tab = gTabs[current_tab_index];
-                    for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
-                    xSemaphoreGive(irc_mutex);
+        // Horizontal Quick-Tab Swapper (Fn + Comma = Previous Tab | Fn + Slash = Next Tab) - throttled 120ms repeat
+        {
+            static unsigned long last_tab_ms=0;
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed(',')) { // Previous Tab
+                if(millis() - last_tab_ms < 120) { esp_task_wdt_reset(); return; }
+                last_tab_ms = millis();
+                if (gTabCount > 1) {
+                    current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount;
+                    scrollback_offset_idx = 0;
+                    ui_needs_redraw = true;
+                    save_session_state();
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        Tab &current_view_tab = gTabs[current_tab_index];
+                        for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
+                        xSemaphoreGive(irc_mutex);
+                    }
                 }
+                return;
             }
-            return;
-        }
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Next Tab
-            if (gTabCount > 1) {
-                current_tab_index = (current_tab_index + 1) % gTabCount;
-                scrollback_offset_idx = 0;
-                ui_needs_redraw = true;
-                // Non-intrusive session state append with 2s debounce, keep Y=120 empty
-                save_session_state();
-                // Trigger auto-cleaning on quick-swapping right
-                if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                    Tab &current_view_tab = gTabs[current_tab_index];
-                    for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
-                    xSemaphoreGive(irc_mutex);
+            if (is_fn && M5Cardputer.Keyboard.isKeyPressed('/')) { // Next Tab
+                if(millis() - last_tab_ms < 120) { esp_task_wdt_reset(); return; }
+                last_tab_ms = millis();
+                if (gTabCount > 1) {
+                    current_tab_index = (current_tab_index + 1) % gTabCount;
+                    scrollback_offset_idx = 0;
+                    ui_needs_redraw = true;
+                    save_session_state();
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                        Tab &current_view_tab = gTabs[current_tab_index];
+                        for (int l = 0; l < current_view_tab.line_count; l++) current_view_tab.lines[l].is_highlight = false;
+                        xSemaphoreGive(irc_mutex);
+                    }
                 }
+                return;
             }
-            return;
         }
     } else {
         // Navigator Hub override: side-by-side Server & Channel navigation
@@ -2115,23 +2165,35 @@ void handle_keyboard_inputs() {
             }
         }
 
-    // Nicklist drawer toggle: Fn+Enter in chat (does not send)
-    if (current_app_mode == MODE_CHAT && is_fn && status.enter) {
-        // Delay to ensure Fn+Space orientation switcher already handled
-        if (!M5Cardputer.Keyboard.isKeyPressed(' ')) {
+    // Nicklist drawer toggle: Fn+Enter in chat (does not send) - edge triggered
+    {
+        static bool was_nick_prev=false;
+        bool cur_nick = (current_app_mode == MODE_CHAT && is_fn && status.enter && !M5Cardputer.Keyboard.isKeyPressed(' '));
+        if(cur_nick && !was_nick_prev){
             show_nicklist = !show_nicklist;
             ui_needs_redraw = true;
             set_led_mode(18);
+            was_nick_prev=true;
             return;
         }
+        if(!cur_nick) was_nick_prev=false;
+        if(cur_nick) { esp_task_wdt_reset(); return; }
     }
 
-    // Search bar Fn+S in chat, Copy last line Fn+C
-    if (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('s')) {
-        search_active = !search_active;
-        if (!search_active) search_query[0]='\0';
-        else search_query[0]='\0';
-        ui_needs_redraw=true; return;
+    // Search bar Fn+S in chat, Copy last line Fn+C - edge triggered
+    {
+        static bool was_s_prev=false;
+        bool cur_s = (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('s'));
+        if(cur_s && !was_s_prev){
+            search_active = !search_active;
+            if (!search_active) search_query[0]='\0';
+            else search_query[0]='\0';
+            ui_needs_redraw=true;
+            was_s_prev=true;
+            return;
+        }
+        if(!cur_s) was_s_prev=false;
+        if(cur_s) { esp_task_wdt_reset(); return; }
     }
     if (search_active && current_app_mode == MODE_CHAT) {
         if (status.del && strlen(search_query)>0) { search_query[strlen(search_query)-1]='\0'; ui_needs_redraw=true; return; }
@@ -2140,35 +2202,49 @@ void handle_keyboard_inputs() {
         if (M5Cardputer.Keyboard.isKeyPressed('`')) { search_active=false; search_query[0]='\0'; ui_needs_redraw=true; return; }
         ui_needs_redraw=true; return;
     }
-    if (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('r')) {
-        // Reload bouncer networks (re-trigger Available: discovery)
-        request_network_reload = true;
-        set_led_mode(13);
-        add_message_to_buffer("ClientCore", "Reloading bouncer networks...", 0x7BEF);
-        ui_needs_redraw=true;
-        return;
-    }
-    if (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('c')) {
-        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE) {
-            Tab &t = gTabs[current_tab_index];
-            if (t.line_count>0) {
-                const char* lastMsg = t.lines[t.line_count-1].message;
-                strncpy(search_query, lastMsg, 15); // reuse as clipboard preview
-                input_buffer = String(lastMsg);
-                ui_needs_redraw=true;
-            }
-            xSemaphoreGive(irc_mutex);
+    {
+        static bool was_r_prev=false;
+        bool cur_r = (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('r'));
+        if(cur_r && !was_r_prev){
+            request_network_reload = true;
+            set_led_mode(13);
+            add_message_to_buffer("ClientCore", "Reloading bouncer networks...", 0x7BEF);
+            ui_needs_redraw=true;
+            was_r_prev=true;
+            return;
         }
-        set_led_mode(10);
-        return;
+        if(!cur_r) was_r_prev=false;
+        if(cur_r) { esp_task_wdt_reset(); return; }
     }
-    // History recall with plain ;/. (non-Fn) while in chat - separate from Fn+;/ scrollback
+    {
+        static bool was_c_prev=false;
+        bool cur_c = (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('c'));
+        if(cur_c && !was_c_prev){
+            if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE) {
+                Tab &t = gTabs[current_tab_index];
+                if (t.line_count>0) {
+                    const char* lastMsg = t.lines[t.line_count-1].message;
+                    strncpy(search_query, lastMsg, 15);
+                    input_buffer = String(lastMsg);
+                    ui_needs_redraw=true;
+                }
+                xSemaphoreGive(irc_mutex);
+            }
+            set_led_mode(10);
+            was_c_prev=true;
+            return;
+        }
+        if(!cur_c) was_c_prev=false;
+        if(cur_c) { esp_task_wdt_reset(); return; }
+    }
+    // History recall with plain ;/. (non-Fn) while in chat - throttled 120ms repeat
     if (current_app_mode == MODE_CHAT && !is_fn) {
+        static unsigned long last_hist_ms=0;
         if (M5Cardputer.Keyboard.isKeyPressed(';') && input_history_len>0) {
-            // Up = older
+            if(millis() - last_hist_ms < 120) { esp_task_wdt_reset(); return; }
+            last_hist_ms = millis();
             if (input_history_pos==-1) input_history_pos = (input_history_head -1 +10)%10;
             else {
-                // move one older if not at oldest
                 int oldest = (input_history_head - input_history_len +10)%10;
                 if (input_history_pos != oldest) input_history_pos = (input_history_pos -1 +10)%10;
             }
@@ -2177,7 +2253,8 @@ void handle_keyboard_inputs() {
             return;
         }
         if (M5Cardputer.Keyboard.isKeyPressed('.') && input_history_len>0 && input_history_pos!=-1) {
-            // Down = newer, -1 wraps to live
+            if(millis() - last_hist_ms < 120) { esp_task_wdt_reset(); return; }
+            last_hist_ms = millis();
             int newest = (input_history_head -1 +10)%10;
             if (input_history_pos == newest) { input_history_pos=-1; input_buffer=""; }
             else { input_history_pos = (input_history_pos +1)%10; input_buffer = String(input_history[input_history_pos]); }
@@ -2223,26 +2300,32 @@ void handle_keyboard_inputs() {
                 return;
             }
         }
-        // Handle Backspace deletions safely with synchronous empty telemetry triggers
+        // Handle Backspace deletions - throttled 80ms repeat to avoid hold flood
         if (status.del) { 
+            static unsigned long last_del_ms=0;
+            if(millis() - last_del_ms < 80) { esp_task_wdt_reset(); return; }
+            last_del_ms = millis();
             if (input_buffer.length() > 0) {
                 input_buffer.remove(input_buffer.length() - 1); 
                 ui_needs_redraw = true; 
             } else {
-                // Tapping backspace on an empty textbox triggers our hardware-level red warning alert
                 set_led_mode(5); 
             }
         }
         
-        // Hold glitch guard: limit burst to 1 char when holding + WDT feed
+        // Hold typematic: limit burst to 1 char, initial 350ms delay then 80ms repeat (was flat 400ms)
         if (status.word.size() > 1) status.word.resize(1);
         static String last_hold_word2=""; static unsigned long last_hold_ms2=0;
+        static bool first_repeat_done=false;
         String _hold_cur;
         for(auto c: status.word) _hold_cur += c;
-        if (_hold_cur.length()>0 && _hold_cur == last_hold_word2 && millis() - last_hold_ms2 < 400) {
-            // same char held, slow repeat to 400ms, suppress flicker redraw
-            ui_needs_redraw=false; esp_task_wdt_reset();
-            return;
+        if (_hold_cur.length()>0 && _hold_cur == last_hold_word2) {
+            unsigned long elapsed = millis() - last_hold_ms2;
+            unsigned long threshold = first_repeat_done ? 80 : 350;
+            if (elapsed < threshold) { esp_task_wdt_reset(); return; }
+            first_repeat_done = true;
+        } else {
+            first_repeat_done = false;
         }
         if (_hold_cur.length()>0) { last_hold_word2=_hold_cur; last_hold_ms2=millis(); }
         // Append standard printable characters into the buffer
