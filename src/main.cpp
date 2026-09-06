@@ -91,6 +91,7 @@ int ignore_count = 0;
 char highlight_words[8][32] = {{0}};
 int highlight_count = 0;
 bool is_away = false;
+bool show_dBm = false;
 bool show_mentions_peek = false;
 unsigned long last_away_tick = 0;
 unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
@@ -1396,7 +1397,7 @@ void draw_chat_view() {
         if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
         else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
     }
-    // RSSI sparkline 8-step ( -90→-50 ) update history
+    // RSSI sparkline 8-step ( -90→-50 ) update history - toggle Fn+B to numeric dBm
     {
         int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
         static unsigned long last_hist = 0;
@@ -1404,6 +1405,9 @@ void draw_chat_view() {
     }
     if (WiFi.status() != WL_CONNECTED) {
         M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2); M5Cardputer.Display.print("---");
+    } else if (show_dBm) {
+        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2);
+        M5Cardputer.Display.printf("%ddBm", WiFi.RSSI());
     } else {
         // 8 bars anchored at rssi_anchor_x, 1px wide 2px gap, height 1-6
         for(int i=0;i<8;i++){
@@ -1556,6 +1560,11 @@ void handle_keyboard_inputs() {
             set_led_mode(18);
             ui_needs_redraw=true;
         }
+        return;
+    }
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('b')) {
+        show_dBm = !show_dBm;
+        ui_needs_redraw=true;
         return;
     }
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('q')) {
