@@ -386,14 +386,16 @@ void sync_new_nick_to_sd(const char* new_nick) {
 void purge_old_logs() {
     if (safe_mode_active) return;
     Serial.println("[STORAGE] Launching automated 7-day log cleanup pass...");
-    // System logs 30d purge
+    // System logs 30d purge (char-only, wdt fed)
     File sdir = SD.open("/irc/system");
     if (sdir && sdir.isDirectory()) {
         File sf = sdir.openNextFile();
         while(sf){ 
-            // keep 30d: if file older than 30 days (approx via name date), or >512KB, remove
-            if(!sf.isDirectory() && sf.size()>512000){ String p=String(sf.path()); sf.close(); SD.remove(p.c_str()); }
-            else sf.close();
+            esp_task_wdt_reset(); yield();
+            if(!sf.isDirectory() && sf.size()>512000){
+                char p[128]={0}; strncpy(p, sf.path(), sizeof(p)-1);
+                sf.close(); SD.remove(p);
+            } else sf.close();
             sf = sdir.openNextFile();
         }
         sdir.close();
@@ -406,15 +408,12 @@ void purge_old_logs() {
     
     File file = dir.openNextFile();
     while (file) {
-        yield(); // Hardware watchdog timer starvation safeguard inside file loops
-        
-        // Simple linear rolling recovery check: if file tables reporting size footprints 
-        // exceeding normal field limits, run manual truncation resets to free block sectors
+        esp_task_wdt_reset(); yield();
         if (!file.isDirectory() && file.size() > 512000) { // Hard 500KB cap per channel window log
-            String dead_path = file.path();
+            char dead_path[128]={0}; strncpy(dead_path, file.path(), sizeof(dead_path)-1);
             file.close();
-            SD.remove(dead_path.c_str()); // Erase maxed out log chunk cleanly
-            Serial.printf("[PURGE] Erased maxed log file to reclaim card blocks: %s\n", dead_path.c_str());
+            SD.remove(dead_path);
+            Serial.printf("[PURGE] Erased maxed log file to reclaim card blocks: %s\n", dead_path);
         } else {
             file.close();
         }
@@ -572,11 +571,13 @@ void save_wifi_vault_lru(const char* ssid, const char* pass) {
 void handle_vault_scan_complete() {
     int n = WiFi.scanComplete();
     if (n < 0) return; // -2 scanning, -1 idle
-    // Compare discovered SSIDs against vault history
+    // Compare discovered SSIDs against vault history (char-only)
     for(int i=0;i<wifi_vault_count;i++){
         for(int s=0;s<n;s++){
-            String tmpSeen = WiFi.SSID(s);
-            if(tmpSeen == wifi_vault_ssid[i]){
+            String tmpSeenStr = WiFi.SSID(s);
+            char tmpSeen[64]={0};
+            strncpy(tmpSeen, tmpSeenStr.c_str(), sizeof(tmpSeen)-1);
+            if(strcmp(tmpSeen, wifi_vault_ssid[i])==0){
                 Serial.printf("[VAULT-ROAM] Matched historical SSID: %s\n", wifi_vault_ssid[i]);
                 WiFi.scanDelete();
                 queueLed(41, 800);
@@ -636,9 +637,19 @@ void load_session_state() {
 }
 
 void sync_ntp_timezone() {
+    static unsigned long last_ntp_ms = 0;
+    static int last_tz = 9999;
+    static int last_dst = -1;
     if (WiFi.status() != WL_CONNECTED) return;
+    bool tz_changed = (current_tz_idx != last_tz || use_dst != last_dst);
+    if (!tz_changed && last_ntp_ms != 0 && millis() - last_ntp_ms < 3600000UL) return; // 1h throttle
+    last_ntp_ms = millis();
+    last_tz = current_tz_idx;
+    last_dst = use_dst;
     long gmt = (long)current_tz_idx * 3600L;
     long dst = use_dst ? 3600L : 0L;
+    // Reset WDT before configTime (can block)
+    esp_task_wdt_reset();
     configTime(gmt, dst, "pool.ntp.org", "time.nist.gov", "time.google.com");
 }
 void load_ignore_list() {
@@ -837,57 +848,15 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             is_scrollback_active = false;
             scrollback_mode_active = false;
         }
+        // Snapshot log info before releasing mutex (avoid holding irc during SD)
+        char snap_server[32]={0}, snap_room[32]={0}, snap_time[6]={0}, snap_nick[16]={0}, snap_msg[128]={0};
+        strncpy(snap_server, t.server, sizeof(snap_server)-1);
+        strncpy(snap_room, t.name, sizeof(snap_room)-1);
+        strncpy(snap_time, cl.timeStr, sizeof(snap_time)-1);
+        strncpy(snap_nick, cl.nick, sizeof(snap_nick)-1);
+        strncpy(snap_msg, cl.message, sizeof(snap_msg)-1);
 
-    // Dynamic Session Log Rotator with High-Speed Write Caching (256-byte sector cache)
-    if (channel_log_enabled == 1 && safe_mode_active == false) {
-        unsigned long current_sync_sec = (millis() / 1000) + adj_time;
-        uint32_t active_yr  = 2026; 
-        uint32_t active_mon = ((current_sync_sec / 2629743) % 12) + 1; 
-        uint32_t active_day = ((current_sync_sec / 86400) % 31) + 1;   
-
-        char safe_server[32]={0}, safe_room[32]={0};
-        strncpy(safe_server, t.server, 31); strncpy(safe_room, t.name, 31);
-        for(char *p=safe_server;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
-        for(char *p=safe_room;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
-        // trim
-        { char *s=safe_server; while(*s==' '||*s=='\t') s++; if(s!=safe_server) memmove(safe_server,s,strlen(s)+1);
-          for(int i=strlen(safe_server)-1;i>=0 && (safe_server[i]==' '||safe_server[i]=='\t');i--) safe_server[i]='\0'; }
-        { char *s=safe_room; while(*s==' '||*s=='\t') s++; if(s!=safe_room) memmove(safe_room,s,strlen(s)+1);
-          for(int i=strlen(safe_room)-1;i>=0 && (safe_room[i]==' '||safe_room[i]=='\t');i--) safe_room[i]='\0'; }
-
-        char dir_path_buffer[64] = {0};
-        snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server);
-        if (!SD.exists(dir_path_buffer)) SD.mkdir(dir_path_buffer);
-        char file_path_buffer[128] = {0};
-        snprintf(file_path_buffer, sizeof(file_path_buffer), "/irc/logs/%s/%s_%04d_%02d_%02d.log", safe_server, safe_room, active_yr, active_mon, active_day);
-
-        // If path changed, flush previous cache first
-        if (strcmp(log_sector_current_path, file_path_buffer) != 0) {
-            if (log_sector_cache_len > 0) flush_log_cache();
-            strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
-        }
-
-        // Accumulate into 256-byte sector cache
-        char line_buf[160] = {0};
-        int line_len = snprintf(line_buf, sizeof(line_buf), "[%s] <%s>: %s\r\n", cl.timeStr, cl.nick, cl.message);
-        if (log_sector_cache_len + line_len >= 256) {
-            flush_log_cache();
-            strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
-        }
-        if (line_len < 256) {
-            memcpy(log_sector_cache + log_sector_cache_len, line_buf, line_len);
-            log_sector_cache_len += line_len;
-        } else {
-            // Fallback direct write for oversized line
-            set_led_mode(4);
-            File f = SD.open(file_path_buffer, FILE_APPEND);
-            if (f) { f.write((uint8_t*)line_buf, line_len); f.close(); } else set_led_mode(28);
-        }
-        // Flush only on sector full, channel switch, or critical battery handled via external triggers
-        if (log_sector_cache_len >= 256 - 160) flush_log_cache();
-    }
-
-        // Cross-Network Highlights Duplicator Pass - fixed: only true PRIVMSG mentions, not server/status noise
+        // Cross-Network Highlights Duplicator Pass - fixed: only true PRIVMSG mentions, not server/status noise (still under irc_mutex)
         if (is_mention(msg, irc_nick) && current_tab_index != 0 && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0) {
             Tab &mentions_tab = gTabs[0]; // Isolate Tab 0 explicitly
             if (mentions_tab.line_count >= MSG_BUFFER_SIZE) {
@@ -898,14 +867,79 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             if (timeStr) strncpy(ml.timeStr, timeStr, sizeof(ml.timeStr)-1);
             else strncpy(ml.timeStr, "00:00", sizeof(ml.timeStr)-1);
             // Prefix source context block clearly as: [Network]User
-            snprintf(ml.nick, sizeof(ml.nick), "[%s]%s", t.server, source);
+            snprintf(ml.nick, sizeof(ml.nick), "[%s]%s", snap_server, source);
             strncpy(ml.message, msg, sizeof(ml.message)-1);
             ml.color = 0xFD20; // Pure high-visibility Amber
             ml.is_highlight = true;
             mentions_tab.line_count++;
         }
-        append_line_to_sd_log(t.name, source, msg);
+        append_line_to_sd_log(snap_room, source, msg);
+        bool needHeapLog = false; int heapLargest = 0;
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 20000) {
+            heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            needHeapLog = true;
+            set_led_mode(34);
+        }
         xSemaphoreGive(irc_mutex);
+        ui_needs_redraw = true;
+        if (needHeapLog) {
+            Serial.printf("[HEAP] largest free %d <20KB\n", heapLargest);
+            log_system("HEAP largest %d <20KB", heapLargest);
+        }
+        // SD logging outside irc_mutex to avoid priority inversion / TWDT stall
+        if (channel_log_enabled == 1 && safe_mode_active == false) {
+            unsigned long current_sync_sec = (millis() / 1000) + adj_time;
+            uint32_t active_yr  = 2026; 
+            uint32_t active_mon = ((current_sync_sec / 2629743) % 12) + 1; 
+            uint32_t active_day = ((current_sync_sec / 86400) % 31) + 1;   
+            char safe_server[32]={0}, safe_room[32]={0};
+            strncpy(safe_server, snap_server, 31); strncpy(safe_room, snap_room, 31);
+            for(char *p=safe_server;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
+            for(char *p=safe_room;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
+            { char *s=safe_server; while(*s==' '||*s=='\t') s++; if(s!=safe_server) memmove(safe_server,s,strlen(s)+1);
+              for(int i=strlen(safe_server)-1;i>=0 && (safe_server[i]==' '||safe_server[i]=='\t');i--) safe_server[i]='\0'; }
+            { char *s=safe_room; while(*s==' '||*s=='\t') s++; if(s!=safe_room) memmove(safe_room,s,strlen(s)+1);
+              for(int i=strlen(safe_room)-1;i>=0 && (safe_room[i]==' '||safe_room[i]=='\t');i--) safe_room[i]='\0'; }
+            char dir_path_buffer[64] = {0};
+            snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server);
+            bool needMkdir = false;
+            // Check exists without holding irc; SD ops use sd_mutex inside flush
+            // Use short timeout check to avoid blocking
+            if (!SD.exists(dir_path_buffer)) needMkdir = true;
+            if (needMkdir) {
+                bool sd_locked=false;
+                if(sd_mutex) sd_locked=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(20))==pdTRUE); else sd_locked=true;
+                if(sd_locked){ SD.mkdir(dir_path_buffer); if(sd_mutex) xSemaphoreGive(sd_mutex); }
+            }
+            char file_path_buffer[128] = {0};
+            snprintf(file_path_buffer, sizeof(file_path_buffer), "/irc/logs/%s/%s_%04d_%02d_%02d.log", safe_server, safe_room, active_yr, active_mon, active_day);
+            if (strcmp(log_sector_current_path, file_path_buffer) != 0) {
+                if (log_sector_cache_len > 0) flush_log_cache();
+                strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
+            }
+            char line_buf[160] = {0};
+            int line_len = snprintf(line_buf, sizeof(line_buf), "[%s] <%s>: %s\r\n", snap_time, snap_nick, snap_msg);
+            if (log_sector_cache_len + line_len >= 256) {
+                flush_log_cache();
+                strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
+            }
+            if (line_len < 256) {
+                memcpy(log_sector_cache + log_sector_cache_len, line_buf, line_len);
+                log_sector_cache_len += line_len;
+            } else {
+                set_led_mode(4);
+                bool sd_locked=false;
+                if(sd_mutex) sd_locked=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(20))==pdTRUE); else sd_locked=true;
+                if(sd_locked){
+                    File f = SD.open(file_path_buffer, FILE_APPEND);
+                    if (f) { f.write((uint8_t*)line_buf, line_len); f.close(); } else set_led_mode(28);
+                    if(sd_mutex) xSemaphoreGive(sd_mutex);
+                }
+            }
+            if (log_sector_cache_len >= 256 - 160) flush_log_cache();
+        }
+    } else {
+        // Mutex busy - still try to set redraw but skip log to avoid loss
         ui_needs_redraw = true;
     }
 
@@ -2783,22 +2817,23 @@ void irc_network_task(void* pvParameters) {
         }
         last_wifi_fail_tick = 0; // Reset ticker once connection settles healthy
         sync_ntp_timezone();
-        // LRU cache rotator: on successful auth via Wi-Fi Manager, vault learns new AP
+        // LRU cache rotator: on successful auth via Wi-Fi Manager, vault learns new AP (char-only to avoid String fragmentation)
         {
-            static String lastConnectedSSID = "";
-            String cur = WiFi.SSID();
-            if (cur.length()>0 && cur != lastConnectedSSID) {
+            static char lastConnectedSSID[64] = {0};
+            String curTmp = WiFi.SSID();
+            char cur[64] = {0};
+            strncpy(cur, curTmp.c_str(), sizeof(cur)-1);
+            if (cur[0]!='\0' && strcmp(cur, lastConnectedSSID)!=0) {
                 bool known=false;
-                for(int i=0;i<wifi_vault_count;i++) if(cur == wifi_vault_ssid[i]) known=true;
+                for(int i=0;i<wifi_vault_count;i++) if(strcmp(cur, wifi_vault_ssid[i])==0) known=true;
                 if(!known){
                     const char* pass = "";
-                    // try to resolve pass from config or vault
-                    if (cur == String(wifi_ssid)) pass = wifi_pass;
-                    else if (cur == String(wifi_ssid2)) pass = wifi_pass2;
-                    save_wifi_vault_lru(cur.c_str(), pass);
-                    Serial.printf("[VAULT-LRU] Learned new AP %s\n", cur.c_str());
+                    if (strcmp(cur, wifi_ssid)==0) pass = wifi_pass;
+                    else if (strcmp(cur, wifi_ssid2)==0) pass = wifi_pass2;
+                    save_wifi_vault_lru(cur, pass);
+                    Serial.printf("[VAULT-LRU] Learned new AP %s\n", cur);
                 }
-                lastConnectedSSID = cur;
+                strncpy(lastConnectedSSID, cur, sizeof(lastConnectedSSID)-1);
             }
         }
 
@@ -2806,7 +2841,12 @@ void irc_network_task(void* pvParameters) {
         if (!master_scan_complete_global) {
             if (!master_client.connected()) {
                 master_client.setInsecure();
-                if (master_client.connect(bnc_host, bnc_port)) {
+                master_client.setHandshakeTimeout(5);
+                master_client.setTimeout(2000);
+                esp_task_wdt_reset();
+                bool ok = master_client.connect(bnc_host, bnc_port);
+                esp_task_wdt_reset();
+                if (ok) {
                     // Send raw root credentials to trigger the bouncer's available network notice
                     master_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
                     master_client.printf("NICK %s\r\n", irc_nick);
@@ -2815,7 +2855,20 @@ void irc_network_task(void* pvParameters) {
             }
 
             if (master_client.connected() && master_client.available()) {
-                String line = master_client.readStringUntil('\n');
+                // Use char buffer instead of String to avoid heap fragmentation
+                char lineBuf[256] = {0};
+                int blen = master_client.readBytesUntil('\n', lineBuf, sizeof(lineBuf)-1);
+                esp_task_wdt_reset();
+                if (blen <= 0) { continue; }
+                lineBuf[blen] = '\0';
+                // trim
+                {
+                    char *s = lineBuf; while(*s==' '||*s=='\t'||*s=='\r'||*s=='\n') s++;
+                    if(s!=lineBuf) memmove(lineBuf,s,strlen(s)+1);
+                    size_t ll=strlen(lineBuf); while(ll>0 && (lineBuf[ll-1]=='\r'||lineBuf[ll-1]=='\n'||lineBuf[ll-1]==' '||lineBuf[ll-1]=='\t')){lineBuf[ll-1]='\0'; ll--;}
+                }
+                // For remaining String-based parsing below, create temporary String (only once per discovery, not hot path)
+                String line = String(lineBuf);
                 line.trim(); line.replace("\r", "");
 
                 // Intercept the bouncer's active listing notification string at runtime
@@ -2915,8 +2968,11 @@ void irc_network_task(void* pvParameters) {
                 if (channel_log_enabled == 1) {
                     Serial.printf("[NET] Attempting secure link pass for slot: %s\n", discovered_networks[i]);
                 }
-                
-                if (net_client.connect(bnc_host, bnc_port)) {
+                net_client.setTimeout(2000);
+                esp_task_wdt_reset();
+                bool n_ok = net_client.connect(bnc_host, bnc_port);
+                esp_task_wdt_reset();
+                if (n_ok) {
                     net_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
                     net_client.print("CAP REQ :server-time\r\n");
                     net_client.printf("NICK %s\r\n", irc_nick);
@@ -3088,7 +3144,10 @@ void irc_network_task(void* pvParameters) {
                     }
                 }
 
-                String line = String(cLine);
+                // Heap fix: skip String allocation for hot PRIVMSG path (handled later via char-only)
+                bool isPrivmsgQuick = (strstr(cLine," PRIVMSG ") != nullptr);
+                if (!isPrivmsgQuick) {
+                    String line = String(cLine);
                 // WHOIS numeric cache (311/312/317/318/319/330/671)
                 if (line.indexOf(" 311 ") != -1) {
                     int p311 = line.indexOf(" 311 ");
@@ -3404,76 +3463,88 @@ void irc_network_task(void* pvParameters) {
                         network_context.trim();
                     }
                 }
+                } // end if(!isPrivmsgQuick) - String line scope
 
-                // --- OPTIMIZED CHAT PAYLOAD ROUTING ENGINE ---
+                // --- OPTIMIZED CHAT PAYLOAD ROUTING ENGINE (char-only, no String) ---
                 if (strstr(cLine, " PRIVMSG ") != nullptr) {
-                    String line2 = String(cLine);
-                    int priv_idx = line2.indexOf(" PRIVMSG ");
-                    int colon_idx = line2.indexOf(" :", priv_idx);
-                    
-                    if (priv_idx != -1 && colon_idx != -1) {
-                        String target_recipient = line2.substring(priv_idx + 9, colon_idx);
-                        target_recipient.trim();
-                        
-                        // EXPLICIT NETWORK EXTRACTOR: Isolate the true upstream bouncer network tag signature
-                        String isolated_packet_server = "";
-                        int network_slash_idx = target_recipient.indexOf('/');
-                        int hash_pos = target_recipient.indexOf('#');
-                        
-                        if (network_slash_idx != -1 && (hash_pos == -1 || network_slash_idx < hash_pos)) {
-                            isolated_packet_server = target_recipient.substring(0, network_slash_idx);
+                    char *priv = strstr(cLine, " PRIVMSG ");
+                    char *colon = priv ? strstr(priv, " :") : nullptr;
+                    if (priv && colon) {
+                        // target_recipient = priv+9 .. colon
+                        char target_recipient[128]={0};
+                        size_t tr_len = (size_t)(colon - (priv+9));
+                        if (tr_len >= sizeof(target_recipient)) tr_len = sizeof(target_recipient)-1;
+                        memcpy(target_recipient, priv+9, tr_len);
+                        target_recipient[tr_len]='\0';
+                        // trim
+                        { char *ts=target_recipient; while(*ts==' '||*ts=='\t') ts++; if(ts!=target_recipient) memmove(target_recipient, ts, strlen(ts)+1); char *te=target_recipient+strlen(target_recipient)-1; while(te>=target_recipient && (*te==' '||*te=='\t')){*te='\0'; te--;} }
+                        // isolate server / clean room - char logic
+                        char isolated_packet_server[32]={0};
+                        char clean_target_room[128]={0};
+                        char *slash = strchr(target_recipient,'/');
+                        char *hash = strchr(target_recipient,'#'); if(!hash) hash=strchr(target_recipient,'&');
+                        bool hasSlash = slash!=nullptr; bool hasHash = hash!=nullptr;
+                        int slashPos = hasSlash ? (int)(slash - target_recipient) : -1;
+                        int hashPos = hasHash ? (int)(hash - target_recipient) : -1;
+                        if (hasSlash && hasHash && slashPos < hashPos) {
+                            size_t iso_len = (size_t)slashPos;
+                            if(iso_len >= sizeof(isolated_packet_server)) iso_len=sizeof(isolated_packet_server)-1;
+                            memcpy(isolated_packet_server, target_recipient, iso_len); isolated_packet_server[iso_len]='\0';
+                            strncpy(clean_target_room, hash, sizeof(clean_target_room)-1);
+                        } else if (hasHash) {
+                            strncpy(isolated_packet_server, discovered_networks[i], sizeof(isolated_packet_server)-1);
+                            if(isolated_packet_server[0]=='\0') strncpy(isolated_packet_server, "BNC", sizeof(isolated_packet_server)-1);
+                            strncpy(clean_target_room, hash, sizeof(clean_target_room)-1);
                         } else {
-                            // Fallback: If no explicit slash exists, default directly to this socket slot's pre-saved name
-                            isolated_packet_server = String(discovered_networks[i]);
+                            strncpy(clean_target_room, target_recipient, sizeof(clean_target_room)-1);
+                            strncpy(isolated_packet_server, discovered_networks[i], sizeof(isolated_packet_server)-1);
+                            if(isolated_packet_server[0]=='\0') strncpy(isolated_packet_server, "BNC", sizeof(isolated_packet_server)-1);
                         }
-                        isolated_packet_server.trim();
-                        
-                        String clean_target_room = (hash_pos != -1) ? target_recipient.substring(hash_pos) : target_recipient;
-                        if (clean_target_room.indexOf('/') != -1 && hash_pos != -1) {
-                            // Strip any trailing network tags trailing behind channel tags
-                            int structural_slash = clean_target_room.indexOf('/');
-                            clean_target_room = clean_target_room.substring(0, structural_slash);
+                        // strip trailing slash in clean
+                        { char *sl2=strchr(clean_target_room,'/'); if(sl2) *sl2='\0'; }
+                        { char *ts=clean_target_room; while(*ts==' '||*ts=='\t') ts++; if(ts!=clean_target_room) memmove(clean_target_room, ts, strlen(ts)+1); char *te=clean_target_room+strlen(clean_target_room)-1; while(te>=clean_target_room && (*te==' '||*te=='\t')){*te='\0'; te--;} }
+                        { char *ts=isolated_packet_server; while(*ts==' '||*ts=='\t') ts++; if(ts!=isolated_packet_server) memmove(isolated_packet_server, ts, strlen(ts)+1); char *te=isolated_packet_server+strlen(isolated_packet_server)-1; while(te>=isolated_packet_server && (*te==' '||*te=='\t')){*te='\0'; te--;} }
+                        // sender nick - from prefix :nick! before priv
+                        char sender_nick[32]="Server";
+                        if(cLine[0]==':'){
+                            char *bang = strchr(cLine,'!');
+                            if(bang && bang < priv){
+                                size_t nl = (size_t)(bang - (cLine+1));
+                                if(nl >= sizeof(sender_nick)) nl=sizeof(sender_nick)-1;
+                                memcpy(sender_nick, cLine+1, nl); sender_nick[nl]='\0';
+                            }
                         }
-                        clean_target_room.trim();
-                        
-                        int prefix_start_idx = line.lastIndexOf(':', priv_idx);
-                        int bang_idx = line.indexOf('!', prefix_start_idx);
-                        String sender_nick = "Server";
-                        if (prefix_start_idx != -1 && bang_idx != -1 && bang_idx > prefix_start_idx) {
-                            sender_nick = line.substring(prefix_start_idx + 1, bang_idx);
-                        }
-                        sender_nick.trim();
                         // clear away on activity
                         if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
-                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], sender_nick.c_str())==0) gTabs[t].nicks_away[k]=false;
+                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], sender_nick)==0) gTabs[t].nicks_away[k]=false;
                             xSemaphoreGive(irc_mutex);
                         }
-                        String actual_msg = line.substring(colon_idx + 2);
+                        char actual_msg[128]={0};
+                        strncpy(actual_msg, colon+2, sizeof(actual_msg)-1);
+                        // trim actual_msg leading/trailing? keep as is for display, but strip \r
+                        { size_t al=strlen(actual_msg); while(al>0 && (actual_msg[al-1]=='\r'||actual_msg[al-1]=='\n')){actual_msg[al-1]='\0'; al--;} }
                             // --- CTCP PROTOCOL INTERCEPT ENGINE ---
-                            // Check if the message string contains hidden CTCP delimiter tags (\x01)
-                            if (actual_msg.startsWith("\x01") && actual_msg.endsWith("\x01")) {
-                                String ctcp_cmd = actual_msg.substring(1, actual_msg.length() - 1);
-                                ctcp_cmd.trim();
-
-                                if (ctcp_cmd.equalsIgnoreCase("VERSION")) {
-                                    Serial.printf("[CTCP] Version query intercepted from user handle: %s\n", sender_nick.c_str());
-                                    
-                                    // Target our 42-mode diagnostic desk to flash a bright Pearl White Strobe (Mode 23)
+                            if (actual_msg[0]=='\x01' && strlen(actual_msg)>=2 && actual_msg[strlen(actual_msg)-1]=='\x01') {
+                                // extract ctcp cmd inside \x01 ... \x01
+                                char ctcp_cmd[64]={0};
+                                size_t clen=strlen(actual_msg);
+                                if(clen>=2){ size_t inner=clen-2; if(inner>=sizeof(ctcp_cmd)) inner=sizeof(ctcp_cmd)-1; memcpy(ctcp_cmd, actual_msg+1, inner); ctcp_cmd[inner]='\0'; }
+                                // trim
+                                { char *ts=ctcp_cmd; while(*ts==' '||*ts=='\t') ts++; if(ts!=ctcp_cmd) memmove(ctcp_cmd, ts, strlen(ts)+1); char *te=ctcp_cmd+strlen(ctcp_cmd)-1; while(te>=ctcp_cmd && (*te==' '||*te=='\t')){*te='\0'; te--;} }
+                                if (strcasecmp(ctcp_cmd,"VERSION")==0) {
+                                    Serial.printf("[CTCP] Version query intercepted from user handle: %s\n", sender_nick);
                                     set_led_mode(23); 
-                                    
-                                    // Transmit a custom, sanitized identification string back down the secure socket
-                                    net_client.printf("NOTICE %s :\x01VERSION Cardputer ADV IRC (ESP32-S3FN8)\x01\r\n", sender_nick.c_str());
-                                    net_client.flush(); // Force immediate packet delivery down the wire
-                                    
-                                    continue; // Drop the packet out of processing execution so it never clutters chat logs
+                                    net_client.printf("NOTICE %s :\x01VERSION Cardputer ADV IRC (ESP32-S3FN8)\x01\r\n", sender_nick);
+                                    net_client.flush();
+                                    continue;
                                 }
                             }
 
                         // Match Target Context FIRST completely free of loop variable confusion
                         int target_tab_slot = -1;
                         for (int t = 0; t < gTabCount; t++) {
-                            if (strcmp(gTabs[t].name, clean_target_room.c_str()) == 0 && 
-                                strcasecmp(gTabs[t].server, isolated_packet_server.c_str()) == 0) {
+                            if (strcmp(gTabs[t].name, clean_target_room) == 0 && 
+                                strcasecmp(gTabs[t].server, isolated_packet_server) == 0) {
                                 target_tab_slot = t;
                                 break;
                             }
@@ -3492,11 +3563,11 @@ void irc_network_task(void* pvParameters) {
                             }
                             ChatLine &cl = *clp2;
                             strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
-                            strncpy(cl.nick, sender_nick.c_str(), sizeof(cl.nick)-1);
-                            if (is_ignored(sender_nick.c_str())) { xSemaphoreGive(irc_mutex); ui_needs_redraw=true; continue; }
-                            strncpy(cl.message, actual_msg.c_str(), sizeof(cl.message)-1);
+                            strncpy(cl.nick, sender_nick, sizeof(cl.nick)-1);
+                            if (is_ignored(sender_nick)) { xSemaphoreGive(irc_mutex); ui_needs_redraw=true; continue; }
+                            strncpy(cl.message, actual_msg, sizeof(cl.message)-1);
                             cl.color = 0xFFFF;
-                            cl.is_highlight = is_mention(actual_msg.c_str(), irc_nick) && !t.muted;
+                            cl.is_highlight = is_mention(actual_msg, irc_nick) && !t.muted;
                             if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
                             if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
                             // Auto-update and keep scroll at bottom on new messages
@@ -3513,26 +3584,40 @@ void irc_network_task(void* pvParameters) {
                     }
                 }
                 if (strstr(cLine, " PRIVMSG ") == nullptr && strlen(cLine) > 0) {
-                    String line3 = String(cLine);
+                    // char-only fallback for non-PRIVMSG server messages (no String) with server-time parsing
+                    char useTime[6]="00:00";
+                    char *effectiveLine = cLine;
+                    if (cLine[0]=='@') {
+                        char *timePos = strstr(cLine, "time=");
+                        if (timePos) {
+                            char *T = strchr(timePos, 'T');
+                            if (T && strlen(T) >= 6) { memcpy(useTime, T+1, 5); useTime[5]='\0'; }
+                        }
+                        char *sp = strchr(cLine, ' ');
+                        if (sp) { effectiveLine = sp+1; while(*effectiveLine==' ') effectiveLine++; }
+                    }
                     char dispNick[16] = "server";
-                    if (line3.charAt(0) == ':') {
-                        int sp = line3.indexOf(' ');
-                        if (sp != -1) {
-                            String pref = line3.substring(1, sp);
-                            int bang = pref.indexOf('!');
-                            if (bang != -1) pref = pref.substring(0, bang);
-                            strncpy(dispNick, pref.c_str(), sizeof(dispNick)-1);
+                    if (effectiveLine[0] == ':') {
+                        char *sp = strchr(effectiveLine,' ');
+                        if (sp) {
+                            size_t prefLen = (size_t)(sp - (effectiveLine+1));
+                            char pref[32]={0};
+                            if(prefLen >= sizeof(pref)) prefLen=sizeof(pref)-1;
+                            memcpy(pref, effectiveLine+1, prefLen); pref[prefLen]='\0';
+                            char *bang=strchr(pref,'!');
+                            if(bang) *bang='\0';
+                            strncpy(dispNick, pref, sizeof(dispNick)-1);
                             dispNick[sizeof(dispNick)-1] = '\0';
                         }
                     }
-                    add_message_to_buffer(dispNick, line.c_str(), 0xFFFF, parsed_time);
+                    add_message_to_buffer(dispNick, effectiveLine, 0xFFFF, useTime);
                     if (gLogQueue) {
                         if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
                             char dummy[128];
                             xQueueReceive(gLogQueue, &dummy, 0);
                         }
                         char qLine[128];
-                        strncpy(qLine, line3.c_str(), sizeof(qLine)-1);
+                        strncpy(qLine, effectiveLine, sizeof(qLine)-1);
                         qLine[sizeof(qLine)-1] = '\0';
                         xQueueSend(gLogQueue, &qLine, 0);
                     }
@@ -3697,6 +3782,7 @@ void custom_ui_loop_task(void* pvParameters) {
             if (ui_scroll_y_interpolation > 0.0f) {
                 ui_scroll_y_interpolation = 0.0f;
             }
+            esp_task_wdt_reset();
             if (ui_needs_redraw || chrome_needs_redraw || input_needs_redraw || sparkline_needs_redraw) draw_chat_view();
             esp_task_wdt_reset(); // TWDT heartbeat for Core1 UI task (4s)
         }
@@ -3723,20 +3809,21 @@ void custom_ui_loop_task(void* pvParameters) {
                     set_led_mode(1);
                 }
                 sync_ntp_timezone();
-                // LRU cache rotator on successful auth (SD-only, <Y=120 open)
+                // LRU cache rotator on successful auth (char-only, no String fragmentation)
                 {
-                    static String lastVaultLearn = "";
-                    String cur = WiFi.SSID();
-                    if (cur.length()>0 && cur != lastVaultLearn) {
+                    static char lastVaultLearn[64]={0};
+                    String curTmp = WiFi.SSID();
+                    char cur[64]={0}; strncpy(cur, curTmp.c_str(), sizeof(cur)-1);
+                    if (cur[0]!='\0' && strcmp(cur, lastVaultLearn)!=0) {
                         bool known=false;
-                        for(int i=0;i<wifi_vault_count;i++) if(cur == wifi_vault_ssid[i]) known=true;
+                        for(int i=0;i<wifi_vault_count;i++) if(strcmp(cur, wifi_vault_ssid[i])==0) known=true;
                         if(!known){
                             const char* pass = "";
-                            if (cur == String(wifi_ssid)) pass = wifi_pass;
-                            else if (cur == String(wifi_ssid2)) pass = wifi_pass2;
-                            save_wifi_vault_lru(cur.c_str(), pass);
+                            if (strcmp(cur, wifi_ssid)==0) pass = wifi_pass;
+                            else if (strcmp(cur, wifi_ssid2)==0) pass = wifi_pass2;
+                            save_wifi_vault_lru(cur, pass);
                         }
-                        lastVaultLearn = cur;
+                        strncpy(lastVaultLearn, cur, sizeof(lastVaultLearn)-1);
                     }
                 }
             }
@@ -3797,7 +3884,7 @@ void setup() {
     // Cardputer SD uses SCK=40, MISO=39, MOSI=14, CS=12 per official example
     SPI.begin(40, 39, 14, 12);
     bool sd_ok=false;
-    for(int i=0;i<3;i++){ if(SD.begin(12, SPI, 10000000)){ sd_ok=true; break; } vTaskDelay(pdMS_TO_TICKS(200)); }
+    for(int i=0;i<3;i++){ esp_task_wdt_reset(); if(SD.begin(12, SPI, 10000000)){ sd_ok=true; break; } vTaskDelay(pdMS_TO_TICKS(200)); esp_task_wdt_reset(); }
     if(!sd_ok){ safe_mode_active=true; set_led_mode(11); Serial.println("[STORAGE] SD self-heal failed 3x, safe_mode"); log_system("STORAGE SD self-heal fail 3x"); }
     // SD Wi-Fi Vault boot ingestion: parse /irc/wifi_cache.txt into transient vault array
     load_wifi_vault_from_sd();
