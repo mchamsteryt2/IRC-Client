@@ -56,6 +56,8 @@ struct WhoisCache {
 volatile bool safe_mode_active = false;
 volatile bool system_booted = false;
 volatile bool ui_needs_redraw = true;
+volatile bool chrome_needs_redraw = true;
+volatile bool input_needs_redraw = true;
 volatile uint8_t current_tab_index = 0;
 volatile uint8_t gTabCount = 0;
 int screen_brightness = 120;
@@ -818,18 +820,12 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         cl.is_highlight = is_mention(msg, irc_nick) && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0 && !is_ignored(source) && !t.muted;
         if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
         t.line_count++;
-        // Preserve scrollback viewport: if user is scrolled back, keep view pinned by bumping offset
-        if ((is_scrollback_active || scrollback_mode_active) && target_idx == current_tab_index) {
-            int eff = t.line_count;
-            if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
-            // bump offset so new message doesn't shift visible window (unless already at live edge)
-            if (scrollback_offset < eff - 1) {
-                scrollback_offset++;
-                scrollback_offset_idx = scrollback_offset;
-            }
-        } else {
-            // no bounce animation - keep at 0 to avoid flicker on flood
-            // ui_scroll_y_interpolation = 12.0f; // disabled for flicker
+        // Auto-update and keep scroll at bottom on new messages (requested)
+        if (target_idx == current_tab_index) {
+            scrollback_offset = 0;
+            scrollback_offset_idx = 0;
+            is_scrollback_active = false;
+            scrollback_mode_active = false;
         }
 
     // Dynamic Session Log Rotator with High-Speed Write Caching (512-byte sector cache)
@@ -967,7 +963,7 @@ bool is_mention(const char* msg, const char* nick) {
 // 🎬 RETRO-TERMINAL GRAPHICS RENDERING ENGINE
 // ==========================================
 void draw_chat_view() {
-    if (!ui_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
+    if (!ui_needs_redraw && !chrome_needs_redraw && !input_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
     canvas.setTextSize(text_scale);
     // Fluid geometry anchored to active rotation (135x240 vertical vs 240x135 landscape)
     int display_width = M5Cardputer.Display.width();
@@ -1104,7 +1100,10 @@ void draw_chat_view() {
             canvas.setCursor(6, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print(";/. Scroll | Enter:Open Fn+F Find Fn+S Pin");
         }
         canvas.pushSprite(0, 0); 
+        if (canvas.height()==109) M5Cardputer.Display.fillRect(0, 109, 240, 26, 0x0000);
         ui_needs_redraw = false; 
+        chrome_needs_redraw = false;
+        input_needs_redraw = false;
         return; 
     }
 
@@ -1197,7 +1196,10 @@ void draw_chat_view() {
         canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
         canvas.setCursor(10, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print("Esc: Exit | ,/. Adjust Value");
         canvas.pushSprite(0, 0); 
+        if (canvas.height()==109) M5Cardputer.Display.fillRect(0, 109, 240, 26, 0x0000);
         ui_needs_redraw = false; 
+        chrome_needs_redraw = false;
+        input_needs_redraw = false;
         return;
     }
 
@@ -1242,8 +1244,13 @@ void draw_chat_view() {
         // mutex busy - skip frame to avoid tearing, will retry next 20ms
         return;
     }
+    bool chat_dirty = ui_needs_redraw;
+    bool chrome_dirty = chrome_needs_redraw;
+    bool input_dirty = input_needs_redraw;
+    if (ui_scroll_y_interpolation != 0.0f) chat_dirty = true;
     {
-        canvas.fillSprite(0x0000);
+        if (chat_dirty) {
+        canvas.fillRect(0, 12, display_width, wire_y-12, 0x0000);
         Tab &t = snapTab;
         int effective_count = t.line_count;
         if (effective_count > MSG_BUFFER_SIZE) effective_count = MSG_BUFFER_SIZE;
@@ -1449,9 +1456,11 @@ void draw_chat_view() {
         if (is_vertical) {
             canvas.fillRect(0, 225, display_width, display_height - 225, 0x0000);
         }
+        } // chat_dirty
         if(is_fullscreen){
             // --- Fullscreen atomic path (PSRAM): navbar+input into canvas, single push at 0,0 eliminates flicker ---
             // (rssi_history updated in custom_ui_loop_task every 500ms, not here to avoid double)
+            if (chrome_dirty) {
             // Navbar (0,0,240,12) - drawn into canvas
             canvas.fillRect(0, 0, display_width, 12, 0x0841);
             {
@@ -1535,6 +1544,8 @@ void draw_chat_view() {
                     else if (has_unread_msg) canvas.fillRect(dot_x, 10, 3, 2, 0x07FF);
                 }
             }
+            } // chrome_dirty
+            if (input_dirty) {
             // Input box - drawn into canvas
             {
                 canvas.setTextSize(text_scale);
@@ -1561,6 +1572,7 @@ void draw_chat_view() {
                 }
                 canvas.setTextSize(text_scale);
             }
+            } // chrome_dirty
         } else {
             // --- No-PSRAM fallback: middle viewport only (rssi updated in loop) ---
         }
@@ -1569,9 +1581,10 @@ void draw_chat_view() {
         canvas.pushSprite(0, 0);
     } else {
         // push middle viewport at 0,12, then batch navbar/input via Display
-        canvas.pushSprite(0, 12);
+        if (chat_dirty) canvas.pushSprite(0, 12);
         // batch navbar+input in single startWrite to reduce SPI transactions
-        M5Cardputer.Display.waitDisplay();
+        if (chrome_dirty || input_dirty) {
+            M5Cardputer.Display.waitDisplay();
         M5Cardputer.Display.startWrite();
         // navbar
         M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
@@ -1677,8 +1690,11 @@ void draw_chat_view() {
             M5Cardputer.Display.setTextSize(text_scale);
         }
         M5Cardputer.Display.endWrite();
+            } // chrome_dirty
     }
-    ui_needs_redraw = false;
+    if (chat_dirty) ui_needs_redraw = false;
+    if (chrome_dirty) chrome_needs_redraw = false;
+    if (input_dirty) input_needs_redraw = false;
 }
 
 void handle_keyboard_inputs() {
@@ -2469,7 +2485,7 @@ void handle_keyboard_inputs() {
                 } else {
                     input_buffer = input_buffer.substring(0, last_space + 1) + discovered_match + ": ";
                 }
-                ui_needs_redraw = true;
+                input_needs_redraw = true;
                 set_led_mode(21); // Cool Indigo Flare for autocomplete success
                 return;
             }
@@ -2481,7 +2497,7 @@ void handle_keyboard_inputs() {
             last_del_ms = millis();
             if (input_buffer.length() > 0) {
                 input_buffer.remove(input_buffer.length() - 1); 
-                ui_needs_redraw = true; 
+                input_needs_redraw = true; 
             } else {
                 set_led_mode(5); 
             }
@@ -2510,7 +2526,7 @@ void handle_keyboard_inputs() {
             if (input_buffer.length() < 200) { 
                 input_buffer += c; 
                 input_history_pos=-1;
-                ui_needs_redraw = true; 
+                input_needs_redraw = true; 
             }
         }
         // Close nicklist drawer on plain Enter when open (no send)
@@ -2656,6 +2672,7 @@ void handle_keyboard_inputs() {
             push_input_history(input_buffer.c_str());
             input_buffer = "";
             input_history_pos=-1;
+            input_needs_redraw = true;
             ui_needs_redraw = true;
         }
     }
@@ -3432,16 +3449,12 @@ void irc_network_task(void* pvParameters) {
                             cl.is_highlight = is_mention(actual_msg.c_str(), irc_nick) && !t.muted;
                             if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
                             if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
-                            // preserve scrollback viewport
-                            if ((is_scrollback_active || scrollback_mode_active) && target_tab_slot == current_tab_index) {
-                                int eff = t.line_count;
-                                if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
-                                if (scrollback_offset < eff - 1) {
-                                    scrollback_offset++;
-                                    scrollback_offset_idx = scrollback_offset;
-                                }
-                            } else {
-                                // disabled bounce animation to avoid flood flicker
+                            // Auto-update and keep scroll at bottom on new messages
+                            if (target_tab_slot == current_tab_index) {
+                                scrollback_offset = 0;
+                                scrollback_offset_idx = 0;
+                                is_scrollback_active = false;
+                                scrollback_mode_active = false;
                             }
                             
                             xSemaphoreGive(irc_mutex);
@@ -3597,19 +3610,19 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
-        // Periodic UI refresh for sparkline/battery/time - ensures auto-update even when idle (was blocked by ui_needs_redraw gate)
+        // Periodic UI refresh for sparkline/battery/time - chrome only, not full chat hard refresh
         {
             static unsigned long last_rssi_tick = 0;
             if (millis() - last_rssi_tick >= 500) {
                 last_rssi_tick = millis();
                 int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
                 rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
-                if (current_app_mode == MODE_CHAT) ui_needs_redraw = true;
+                if (current_app_mode == MODE_CHAT) chrome_needs_redraw = true;
             }
             static unsigned long last_time_tick = 0;
             if (millis() - last_time_tick >= 1000) {
                 last_time_tick = millis();
-                if (current_app_mode == MODE_CHAT) ui_needs_redraw = true;
+                if (current_app_mode == MODE_CHAT) chrome_needs_redraw = true;
             }
         }
         // Hardware Frame-Rate Governor Shield - 30 FPS (33ms) reduces SPI load and flood flicker, atomic push eliminates tearing
@@ -3621,7 +3634,7 @@ void custom_ui_loop_task(void* pvParameters) {
             if (ui_scroll_y_interpolation > 0.0f) {
                 ui_scroll_y_interpolation = 0.0f;
             }
-            if (ui_needs_redraw) draw_chat_view();
+            if (ui_needs_redraw || chrome_needs_redraw || input_needs_redraw) draw_chat_view();
             esp_task_wdt_reset(); // TWDT heartbeat for Core1 UI task (4s)
         }
 
