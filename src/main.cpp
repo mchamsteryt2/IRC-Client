@@ -1862,7 +1862,7 @@ void handle_keyboard_inputs() {
                 if (menu_selection_idx == 0) { // Screen Backlight Scaler
                     screen_brightness += forward ? 30 : -30;
                     if (screen_brightness > 255) screen_brightness = 255;
-                    if (screen_brightness < 15)  screen_brightness = 15;
+                    if (screen_brightness < 40)  screen_brightness = 40;
                 }
                 else if (menu_selection_idx == 1) { // Timezone Offset Index
                     current_tz_idx += forward ? 1 : -1;
@@ -1938,11 +1938,11 @@ void handle_keyboard_inputs() {
     // Layer E: Configuration Menu Form Row Value-Changing Handlers
     if (current_app_mode == MODE_SETTINGS && status.enter) {
         if (menu_selection_idx == 0) { // Row 1: Cycle Brightness Level (Off -> Dim -> Med -> Max)
-            if (screen_brightness == 10) screen_brightness = 60;
-            else if (screen_brightness == 60) screen_brightness = 120;
+            if (screen_brightness == 40) screen_brightness = 80;
+            else if (screen_brightness == 80) screen_brightness = 120;
             else if (screen_brightness == 120) screen_brightness = 200;
             else if (screen_brightness == 200) screen_brightness = 255;
-            else screen_brightness = 10;
+            else screen_brightness = 40;
             M5Cardputer.Display.setBrightness(screen_brightness);
         }
         else if (menu_selection_idx == 1) { // Row 2: Shift Timezone Indicator Offset index
@@ -3050,7 +3050,7 @@ void custom_ui_loop_task(void* pvParameters) {
         if (current_battery_pct <= 5.0f) {
             // CRITICAL GUARD: Drop backlight to 10% minimal draw, turn off power switch to cut LED drain completely
             digitalWrite(38, LOW);
-            target_backlight_level = 10;
+            target_backlight_level = 30; // keep visible, was 10 black
             flush_log_cache();
             was_dimmed = false;
         } else if (current_battery_pct <= 20.0f) {
@@ -3071,7 +3071,7 @@ void custom_ui_loop_task(void* pvParameters) {
                     ui_needs_redraw = true;
                     was_dimmed = false;
                 } else {
-                    if (screen_brightness < 15) screen_brightness = 15;
+                    if (screen_brightness < 40) screen_brightness = 40;
                     target_backlight_level = screen_brightness;
                     // pin 38 tied to backlight via scaling (no forced HIGH)
                 }
@@ -3259,6 +3259,7 @@ void setup() {
     }
     
     load_settings_from_sd();
+    if (screen_brightness < 40) { screen_brightness = 80; sync_new_nick_to_sd(irc_nick); }
     if (!safe_mode_active) purge_old_logs();
 
     irc_mutex = xSemaphoreCreateMutex();
