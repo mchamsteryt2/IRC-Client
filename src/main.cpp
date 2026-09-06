@@ -1122,14 +1122,6 @@ void draw_chat_view() {
 
     // ==========================================
     // STATE 2: CONFIGURATION MENUS (Fn + O)
-        ui_needs_redraw = false; 
-        chrome_needs_redraw = false;
-        input_needs_redraw = false;
-        return; 
-    }
-
-    // ==========================================
-    // STATE 2: CONFIGURATION MENUS (Fn + O)
     // ==========================================
     if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_THEME || current_app_mode == MODE_LOGS || current_app_mode == MODE_WHOIS || current_app_mode == MODE_WIFI) {
         canvas.fillSprite(0x0000); 
