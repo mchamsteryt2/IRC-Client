@@ -1186,17 +1186,34 @@ void draw_chat_view() {
     // ==========================================
     // STATE 3: LIVE TERMINAL CHAT VIEWPORT
     // ==========================================
-    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        if(canvas.width()==0 || canvas.height()==0){
-            Serial.println("[GFX] canvas 0 in draw, recreating viewport");
-            canvas.deleteSprite();
-            canvas.createSprite(240,135);
+    // Ensure canvas valid without holding mutex (allocation may block)
+    if(canvas.width()==0 || canvas.height()==0){
+        Serial.println("[GFX] canvas 0 in draw, recreating viewport");
+        canvas.deleteSprite();
+        if(!canvas.createSprite(240,135)){
+            canvas.createSprite(240,109);
         }
+    }
+    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         canvas.fillSprite(0x0000);
+        // Clamp tab index and line_count to avoid OOB when network task overflowed count
+        if (current_tab_index >= MAX_TABS) current_tab_index = 0;
+        if (current_tab_index >= gTabCount && gTabCount > 0) current_tab_index = gTabCount - 1;
         Tab &t = gTabs[current_tab_index];
+        int effective_count = t.line_count;
+        if (effective_count > MSG_BUFFER_SIZE) effective_count = MSG_BUFFER_SIZE;
+        if (effective_count < 0) effective_count = 0;
+        // clamp scrollback to valid window
+        if (scrollback_offset >= effective_count) {
+            scrollback_offset = effective_count > 0 ? effective_count - 1 : 0;
+            scrollback_offset_idx = scrollback_offset;
+        }
+        if (scrollback_mode_active && scrollback_offset < 0) scrollback_offset = 0;
         int current_y = baseline_y; 
-        int starting_index = (t.line_count - 1) - scrollback_offset;
+        int starting_index = (effective_count - 1) - scrollback_offset;
         if (starting_index < 0) starting_index = 0;
+        if (starting_index >= effective_count) starting_index = effective_count - 1;
+        if (effective_count == 0) starting_index = -1;
         scrollback_offset_idx = scrollback_offset;
         is_scrollback_active = scrollback_mode_active;
 
@@ -1242,14 +1259,16 @@ void draw_chat_view() {
                     char shortened_nick[9] = {0};
                     if (strlen(curLine.nick) > 8) {
                         strncpy(shortened_nick, curLine.nick, 6);
+                        shortened_nick[6] = '\0';
                         strcat(shortened_nick, "..");
                     } else {
-                        strncpy(shortened_nick, t.lines[i].nick, 8);
+                        strncpy(shortened_nick, curLine.nick, 8);
+                        shortened_nick[8] = '\0';
                     }
                     if (curLine.is_highlight) { 
                         canvas.fillRect(2, current_y - 1, 36, 11, 0xFD20); canvas.setTextColor(0xFFFF); 
                     } else { 
-                        canvas.setTextColor(get_nick_palette_color(t.lines[i].nick)); 
+                        canvas.setTextColor(get_nick_palette_color(curLine.nick)); 
                     }
                     canvas.setCursor(2, current_y);
                     if (current_tab_index == 0) canvas.printf("%s", shortened_nick);
@@ -1607,15 +1626,8 @@ void handle_keyboard_inputs() {
     if (millis() - last_keypress_debounce < 35) { esp_task_wdt_reset(); return; }
     last_keypress_debounce = millis();
     last_input_time = millis(); // Fresh backlight dim timer
-    // Fn mode debounce 300ms to stop holding Fn glitch - mode switches are edge-triggered below, so hold won't flicker
-    static unsigned long last_fn_debounce=0;
-    bool is_fn_now = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
-    if (is_fn_now && millis() - last_fn_debounce < 300) {
-        // allow only scrollback/history which need repeat, but not mode switches
-        bool isModeKey = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('r');
-        if (isModeKey) { esp_task_wdt_reset(); return; }
-    }
-    if (is_fn_now) last_fn_debounce = millis();
+    // Fn edge-triggered mode switches already debounce via was_*_prev, no extra 300ms block
+    // (previous 300ms window blocked rapid Fn+P/O presses and made them appear "does nothing")
     
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
@@ -1734,8 +1746,8 @@ void handle_keyboard_inputs() {
 
     
     // Layer B: Master Emergency Escape Back to Main Chat Workspace
-    // Captures (Alt + Backspace [0x08]) OR the literal physical Esc key char mapping ('`')
-    if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
+    // Captures (Alt + Backspace) OR the literal physical Esc key char mapping ('`')
+    if ((is_alt && (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE) || status.del)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
         // Auto-export updated parameters safely to card storage upon form exit
         if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_WIFI) {
             if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1758,7 +1770,7 @@ void handle_keyboard_inputs() {
         return;
     }
     // Fn+Esc quick ~mentions jump (faster than Fn+,/ swapper)
-    if (is_fn && (M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed(0x1B))) {
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('`')) {
         current_tab_index = 0;
         scrollback_offset = 0; scrollback_offset_idx = 0;
         is_scrollback_active = false; scrollback_mode_active = false;
@@ -1776,7 +1788,7 @@ void handle_keyboard_inputs() {
     {
         static unsigned long last_esc_ms=0;
         static bool was_esc=false;
-        bool cur_esc = M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed(0x1B);
+        bool cur_esc = M5Cardputer.Keyboard.isKeyPressed('`');
         if (cur_esc && !was_esc) {
             if (millis() - last_esc_ms < 500) { was_esc=cur_esc; return; }
             last_esc_ms = millis();
@@ -1802,8 +1814,12 @@ void handle_keyboard_inputs() {
                 Tab &t = gTabs[current_tab_index];
                 is_scrollback_active = true;
                 scrollback_mode_active = true;
-                if (scrollback_offset < t.line_count - 1) scrollback_offset++;
-                if (scrollback_offset_idx < t.line_count - 1) scrollback_offset_idx++;
+                {
+                    int eff = t.line_count;
+                    if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
+                    if (scrollback_offset < eff - 1) scrollback_offset++;
+                    if (scrollback_offset_idx < eff - 1) scrollback_offset_idx++;
+                }
                 ui_needs_redraw = true;
                 return;
             }
@@ -1819,10 +1835,11 @@ void handle_keyboard_inputs() {
             }
         }
         // Fn + Backspace Panic Flush Macro
-        if (is_fn && M5Cardputer.Keyboard.isKeyPressed(0x08)) {
+        if (is_fn && (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE) || status.del)) {
             Tab &t = gTabs[current_tab_index];
             if (xNetworkTaskHandle != NULL) vTaskSuspend(xNetworkTaskHandle);
             t.line_count = 0;
+            t.head = 0;
             scrollback_offset = 0;
             scrollback_offset_idx = 0;
             is_scrollback_active = false;
@@ -1832,7 +1849,7 @@ void handle_keyboard_inputs() {
             ui_needs_redraw = true;
             return;
         }
-        if ((is_alt && M5Cardputer.Keyboard.isKeyPressed(0x08)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
+        if ((is_alt && (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE) || status.del)) || M5Cardputer.Keyboard.isKeyPressed('`')) {
             scrollback_offset = 0;
             scrollback_offset_idx = 0;
             is_scrollback_active = false;
@@ -1848,6 +1865,7 @@ void handle_keyboard_inputs() {
                 last_tab_ms = millis();
                 if (gTabCount > 1) {
                     current_tab_index = (current_tab_index - 1 + gTabCount) % gTabCount;
+                    scrollback_offset = 0;
                     scrollback_offset_idx = 0;
                     ui_needs_redraw = true;
                     save_session_state();
@@ -1864,6 +1882,7 @@ void handle_keyboard_inputs() {
                 last_tab_ms = millis();
                 if (gTabCount > 1) {
                     current_tab_index = (current_tab_index + 1) % gTabCount;
+                    scrollback_offset = 0;
                     scrollback_offset_idx = 0;
                     ui_needs_redraw = true;
                     save_session_state();
@@ -1902,13 +1921,23 @@ void handle_keyboard_inputs() {
             }
             if (is_fn && M5Cardputer.Keyboard.isKeyPressed('.')) { // Fn+Down
                 if (nav_focus_column == 0) {
-                    if (nav_server_select_idx < (int)discovered_network_count - 1) nav_server_select_idx++;
+                    if (nav_server_select_idx < (int)discovered_network_count) nav_server_select_idx++;
                     // clamp channel index when server changes
                     nav_channel_select_idx = 0;
                 } else {
-                    // count channels for selected server
+                    // count channels for selected server (handle ALL case)
                     int ch_cnt = 0;
-                    for (int i = 0; i < gTabCount; i++) if (strcmp(gTabs[i].server, discovered_networks[nav_server_select_idx]) == 0) ch_cnt++;
+                    for (int i = 0; i < gTabCount; i++) {
+                        if (strcmp(gTabs[i].name, "~mentions")==0) continue;
+                        bool vis = (nav_server_select_idx == 0) || strcasecmp(gTabs[i].server, discovered_networks[nav_server_select_idx - 1]) == 0;
+                        if (vis && nav_filter[0]) {
+                            char ln[32]; strncpy(ln, gTabs[i].name,31); ln[31]='\0'; for(char*p=ln;*p;p++) *p=tolower(*p);
+                            char lf[16]; strncpy(lf, nav_filter,15); lf[15]='\0'; for(char*p=lf;*p;p++) *p=tolower(*p);
+                            char ls[32]; strncpy(ls, gTabs[i].server,31); ls[31]='\0'; for(char*p=ls;*p;p++) *p=tolower(*p);
+                            if (!strstr(ln, lf) && !strstr(ls, lf)) vis=false;
+                        }
+                        if (vis) ch_cnt++;
+                    }
                     if (nav_channel_select_idx < ch_cnt - 1) nav_channel_select_idx++;
                 }
                 ui_needs_redraw = true;
@@ -2332,8 +2361,8 @@ void handle_keyboard_inputs() {
     // 💬 CHAT MODE PROCESSING PIPELINE (ONLY RUNS IF MODE_CHAT IS ACTIVE)
     // ==========================================
     if (current_app_mode == MODE_CHAT) {
-        // Layer G: Tab Autocomplete Key Intercept Matrix (Physical Tab = 0xB9)
-        if (M5Cardputer.Keyboard.isKeyPressed(0xB9) && input_buffer.length() > 0) {
+        // Layer G: Tab Autocomplete Key Intercept Matrix (Physical Tab)
+        if ((status.tab || M5Cardputer.Keyboard.isKeyPressed(KEY_TAB)) && input_buffer.length() > 0) {
             int last_space = input_buffer.lastIndexOf(' ');
             String partial_token = (last_space == -1) ? input_buffer : input_buffer.substring(last_space + 1);
             partial_token.toLowerCase();
@@ -2342,14 +2371,19 @@ void handle_keyboard_inputs() {
             String discovered_match = "";
 
             // Scan backwards through recent channel lines to find a matching nickname handle
-            for (int line_scan = active_tab.line_count - 1; line_scan >= 0; line_scan--) {
-                String candidate_nick = String(active_tab.lines[line_scan].nick);
+            // Clamp line_count and use ring head for correct lookup
+            {
+                int eff = active_tab.line_count;
+                if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
+                for (int line_scan = eff - 1; line_scan >= 0; line_scan--) {
+                    String candidate_nick = String(active_tab.lines[(active_tab.head + line_scan) % MSG_BUFFER_SIZE].nick);
                 String lookup_lower = candidate_nick;
                 lookup_lower.toLowerCase();
 
                 if (lookup_lower.startsWith(partial_token) && candidate_nick != String(irc_nick)) {
                     discovered_match = candidate_nick;
                     break;
+                }
                 }
             }
 
@@ -2396,7 +2430,8 @@ void handle_keyboard_inputs() {
         if (cur2.length()>0) { last_hold_word2=cur2; last_hold_ms2=millis(); }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
-            if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
+            // Filter all Fn combos to avoid polluting input when Fn is held (Fn+P/O/I/Q/L/R/S/C/B/M/F etc plus arrows ,./;)
+            if (is_fn && (c == ';' || c == '/' || c == ',' || c == '.' || c == 'p' || c == 'o' || c == 'i' || c == 'q' || c == 'l' || c == 'r' || c == 's' || c == 'c' || c == 'b' || c == 'm' || c == 'f')) continue;
             if (input_buffer.length() < 200) { 
                 input_buffer += c; 
                 input_history_pos=-1;
@@ -3180,7 +3215,7 @@ void irc_network_task(void* pvParameters) {
                             cl.color = 0xFFFF;
                             cl.is_highlight = is_mention(actual_msg.c_str(), irc_nick) && !t.muted;
                             if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
-                            t.line_count++;
+                            if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
                             if (!is_scrollback_active && !scrollback_mode_active) ui_scroll_y_interpolation = 12.0f;
                             
                             xSemaphoreGive(irc_mutex);
@@ -3482,7 +3517,7 @@ void setup() {
         M5Cardputer.update();
         
         // Scan if clicky Backspace key is physically held down to activate safe mode safely
-        if (M5Cardputer.Keyboard.isKeyPressed(0x08)) { // Safely catches held backspace clicks on cold boot
+        if (M5Cardputer.Keyboard.isKeyPressed(KEY_BACKSPACE)) { // Safely catches held backspace clicks on cold boot
             safe_mode_active = true;
         }
     }
@@ -3525,7 +3560,7 @@ void setup() {
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
     
-    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 8192, NULL, 1, &xNetworkTaskHandle, 0);
+    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 16384, NULL, 1, &xNetworkTaskHandle, 0);
     xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 16384, NULL, 1, &xUITaskHandle, 1);
     // Register core tasks into TWDT (4s timeout, panic + emergency flush)
     esp_task_wdt_add(xNetworkTaskHandle);
