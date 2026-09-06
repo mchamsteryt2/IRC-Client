@@ -771,6 +771,11 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             memmove(&t.lines[0], &t.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
             t.line_count = MSG_BUFFER_SIZE - 1; // Open up the absolute bottom slot row for our incoming text
         }
+        // Heap guard: log largest free block <20KB
+        if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 20000) {
+            Serial.printf("[HEAP] largest free %d <20KB\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            set_led_mode(34);
+        }
         
         ChatLine &cl = t.lines[t.line_count];
         if (timeStr) strncpy(cl.timeStr, timeStr, sizeof(cl.timeStr)-1);
@@ -1590,6 +1595,21 @@ void handle_keyboard_inputs() {
         current_app_mode = MODE_CHAT;
         input_buffer = ""; // Cleanly flush stray menu characters out of memory registers
         ui_needs_redraw = true;
+        return;
+    }
+    // Fn+Esc quick ~mentions jump (faster than Fn+,/ swapper)
+    if (is_fn && (M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed(0x1B))) {
+        current_tab_index = 0;
+        scrollback_offset = 0; scrollback_offset_idx = 0;
+        is_scrollback_active = false; scrollback_mode_active = false;
+        // clear highlight dots for mentions view
+        if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
+            for(int l=0;l<gTabs[0].line_count;l++) gTabs[0].lines[l].is_highlight=false;
+            xSemaphoreGive(irc_mutex);
+        }
+        current_app_mode = MODE_CHAT;
+        ui_needs_redraw = true;
+        set_led_mode(18);
         return;
     }
     // Global Scrollback Panic Reset (Esc or `) - restores real-time view from any mode
@@ -2750,6 +2770,13 @@ void irc_network_task(void* pvParameters) {
                     Serial.printf("[NET-SYNC] Handshake finalized for network: %s. Releasing channels.\n", discovered_networks[i]);
                     continue;
                 }
+                // SASL 900/901 + WHO 352 cache (no flood)
+                if (line.indexOf(" 900 ") != -1) { network_handshake_complete[i]=true; Serial.printf("[SASL] 900 success %s\n", discovered_networks[i]); continue; }
+                if (line.indexOf(" 901 ") != -1) { Serial.printf("[SASL] 901 fail %s\n", discovered_networks[i]); set_led_mode(37); continue; }
+                if (line.indexOf(" 352 ") != -1) {
+                    // :server 352 mynick #chan user host server nick H :0 real
+                    int p352=line.indexOf(" 352 "); int s1=line.indexOf(' ', p352+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); int s5=line.indexOf(' ', s4+1); int s6=line.indexOf(' ', s5+1); String nick=line.substring(s6+1, line.indexOf(' ', s6+1)); nick.trim(); int colon=line.indexOf(" :", s6); String chan=line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){ for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chan.c_str())==0 && strcasecmp(gTabs[t].server, isolated_packet_server.c_str())==0){ bool exists=false; for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], nick.c_str())==0) exists=true; if(!exists && gTabs[t].nick_count<12){ strncpy(gTabs[t].nicks[gTabs[t].nick_count], nick.c_str(),15); gTabs[t].nicks_away[gTabs[t].nick_count]=false; gTabs[t].nick_count++; } break; } xSemaphoreGive(irc_mutex); } } }}
+                }
 
                 // LAYER B: DYNAMIC CHANNEL SYNC - PART EVENT EXTRACTION (STATE MACHINE DELETION ENGINE)
                 if (line.indexOf(" PART ") != -1) {
@@ -3194,10 +3221,12 @@ void setup() {
     pinMode(38, OUTPUT);
     // pin 38 tied to backlight via scaling (no forced HIGH)
     
-    // Open clean cooperative SPI bus lane pipelines
+    // Open clean cooperative SPI bus lane pipelines with SD self-heal 3x retry
     // Cardputer SD uses SCK=40, MISO=39, MOSI=14, CS=12 per official example
     SPI.begin(40, 39, 14, 12);
-    SD.begin(12, SPI, 10000000);
+    bool sd_ok=false;
+    for(int i=0;i<3;i++){ if(SD.begin(12, SPI, 10000000)){ sd_ok=true; break; } vTaskDelay(pdMS_TO_TICKS(200)); }
+    if(!sd_ok){ safe_mode_active=true; set_led_mode(11); Serial.println("[STORAGE] SD self-heal failed 3x, safe_mode"); }
     // SD Wi-Fi Vault boot ingestion: parse /irc/wifi_cache.txt into transient vault array
     load_wifi_vault_from_sd();
     if (wifi_vault_count > 0) {
