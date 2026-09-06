@@ -244,7 +244,6 @@ void set_led_mode(uint8_t mode) {
         
         case 55: // Mode 55: Low Battery Warning Override (Solid Pure Red)
             // Gently pulse GPIO 38 just long enough to blit the color register safely down the pixel line
-            digitalWrite(38, HIGH); 
             r = 95; g = 0; b = 0; 
             break;
         case 37: // Mode 37: Configuration Corrupt / Default Restore (Flashing Laser Red/Yellow)
@@ -3054,8 +3053,7 @@ void custom_ui_loop_task(void* pvParameters) {
         // pin 38 tied to backlight via scaling (no forced HIGH)
         if (current_battery_pct <= 5.0f) {
             // CRITICAL GUARD: Drop backlight to 10% minimal draw, turn off power switch to cut LED drain completely
-            digitalWrite(38, LOW);
-            target_backlight_level = 30; // keep visible, was 10 black
+            target_backlight_level = 30; // keep visible, was 10 black (no pin LOW, brightness handles)
             flush_log_cache();
             was_dimmed = false;
         } else if (current_battery_pct <= 20.0f) {
