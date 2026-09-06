@@ -2556,7 +2556,7 @@ void irc_network_task(void* pvParameters) {
     static WiFiClientSecure master_client;
 
     while (true) {
-        yield(); vTaskDelay(pdMS_TO_TICKS(50)); // Prevent core starvation
+        yield(); vTaskDelay(pdMS_TO_TICKS(10)); // 10ms poll for low-latency bouncer relay (was 50ms -> long delays)
         if (request_network_reload) {
             request_network_reload=false;
             master_scan_complete_global=false;
@@ -2681,13 +2681,13 @@ void irc_network_task(void* pvParameters) {
             {
                 static unsigned long scan_start_ms = 0;
                 if (scan_start_ms==0) scan_start_ms=millis();
-                if (!master_scan_complete_global && discovered_network_count==0 && millis()-scan_start_ms>10000) {
+                if (!master_scan_complete_global && discovered_network_count==0 && millis()-scan_start_ms>3000) {
                     strncpy(discovered_networks[0], bnc_host, 31);
                     if (strlen(bnc_host)==0) strncpy(discovered_networks[0], "BNC", 31);
                     discovered_network_count=1;
                     master_scan_complete_global=true;
                     master_client.stop();
-                    Serial.println("[NET] Available timeout fallback to bnc_host (10s)");
+                    Serial.println("[NET] Available timeout fallback to bnc_host (3s)");
                     log_system("NET fallback bnc_host");
                 }
                 if (master_scan_complete_global) scan_start_ms=0;
@@ -2704,8 +2704,8 @@ void irc_network_task(void* pvParameters) {
                 network_authenticated[i] = false;
                 network_handshake_complete[i] = false;
                 
-                // Rate-Limiter Shield: Force a strict 5000ms cooldown wait period before retrying a dropped socket connection
-                if (millis() - network_reconnect_cooldown[i] < 5000) {
+                // Rate-Limiter Shield: 2500ms cooldown (was 5000ms -> very long reconnect delays)
+                if (millis() - network_reconnect_cooldown[i] < 2500) {
                     continue; // Skip this network index slot until its 5-second connection cooldown expires
                 }
                 
@@ -2739,7 +2739,6 @@ void irc_network_task(void* pvParameters) {
                     Serial.printf("[NET] Attempting secure link pass for slot: %s\n", discovered_networks[i]);
                 }
                 
-                if (net_client.connect(bnc_host, bnc_port)) {
                 if (net_client.connect(bnc_host, bnc_port)) {
                     net_client.printf("PASS %s:%s\r\n", bnc_user, bnc_pass);
                     net_client.print("CAP REQ :server-time\r\n");
@@ -3217,7 +3216,6 @@ void irc_network_task(void* pvParameters) {
         }
         esp_task_wdt_reset(); // idle heartbeat ensures 4s TWDT never fires spuriously
     }
-}
 }
 
 void custom_ui_loop_task(void* pvParameters) {
