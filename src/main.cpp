@@ -35,6 +35,7 @@ struct Tab {
     bool pinned;
     bool muted;
     char modes[16];
+    bool nicks_away[12];
 };
 struct WhoisCache {
     char nick[32];
@@ -87,7 +88,10 @@ char search_query[16] = {0};
 bool search_active = false;
 char ignore_list[8][16] = {{0}};
 int ignore_count = 0;
+char highlight_words[8][32] = {{0}};
+int highlight_count = 0;
 bool is_away = false;
+bool show_mentions_peek = false;
 unsigned long last_away_tick = 0;
 unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
 
@@ -145,6 +149,10 @@ int sound_profile = 1; // 0 off, 1 mention only, 2 all events
 char alias_names[5][16] = {{0}};
 char alias_cmds[5][64] = {{0}};
 int alias_count = 0;
+volatile bool request_network_reload = false;
+volatile bool master_scan_complete_global = false;
+char chan_list_cache[10][32] = {{0}};
+int chan_list_count = 0;
 unsigned long adj_time = 0; // Sync offset for wall-clock
 int use_12_hour_format  = 1;
 
@@ -418,9 +426,11 @@ static char log_sector_current_path[128] = {0};
 
 void flush_log_cache() {
     if (log_sector_cache_len == 0 || log_sector_current_path[0] == '\0') return;
-    // Use sd_mutex if available
+    // Use sd_mutex if available - tryTake defer to avoid 50ms stall during PRIVMSG flood
     bool sd_locked = false;
-    if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE);
+    if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(5)) == pdTRUE);
+    else sd_locked = true;
+    if (!sd_locked) return; // defer to next loop
     else sd_locked = true;
     if (sd_locked) {
         File f = SD.open(log_sector_current_path, FILE_APPEND);
@@ -622,6 +632,53 @@ bool is_ignored(const char* nick){
     for(int i=0;i<ignore_count;i++) if(strcasecmp(ignore_list[i], nick)==0) return true;
     return false;
 }
+bool is_highlight_word(const char* msg){
+    if(!msg) return false;
+    char lowMsg[128]; strncpy(lowMsg, msg,127); lowMsg[127]='\0'; for(char*p=lowMsg;*p;p++) *p=tolower(*p);
+    for(int i=0;i<highlight_count;i++){
+        const char* w=highlight_words[i];
+        size_t wl=strlen(w);
+        if(wl==0) continue;
+        char lowW[32]; strncpy(lowW, w,31); lowW[31]='\0'; for(char*p=lowW;*p;p++) *p=tolower(*p);
+        const char* star=strchr(lowW, '*');
+        if(star){
+            size_t pre=star-lowW;
+            if(pre>0 && strncmp(lowMsg, lowW, pre)==0) return true;
+            const char* suf=star+1;
+            if(*suf && strstr(lowMsg, suf)) return true;
+        } else {
+            if(strstr(lowMsg, lowW)) return true;
+        }
+    }
+    return false;
+}
+void load_highlight_list(){
+    highlight_count=0;
+    bool sd_locked=false;
+    if(sd_mutex) sd_locked=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sd_locked=true;
+    if(!sd_locked) return;
+    File f=SD.open("/irc/highlight.txt", FILE_READ);
+    if(!f){ if(sd_mutex) xSemaphoreGive(sd_mutex); return; }
+    char line[32];
+    while(f.available() && highlight_count<8){
+        int len=f.readBytesUntil('\n', line, sizeof(line)-1);
+        if(len<=0){ if(f.available()) f.read(); continue; }
+        line[len]='\0'; if(len>0 && line[len-1]=='\r') line[len-1]='\0';
+        if(!*line) continue;
+        strncpy(highlight_words[highlight_count], line,31); highlight_words[highlight_count][31]='\0';
+        highlight_count++;
+    }
+    f.close(); if(sd_mutex) xSemaphoreGive(sd_mutex);
+}
+void save_highlight_list(){
+    bool sd_locked=false;
+    if(sd_mutex) sd_locked=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sd_locked=true;
+    if(!sd_locked) return;
+    SD.mkdir("/irc");
+    File f=SD.open("/irc/highlight.txt", FILE_WRITE);
+    if(f){ for(int i=0;i<highlight_count;i++) f.println(highlight_words[i]); f.close(); }
+    if(sd_mutex) xSemaphoreGive(sd_mutex);
+}
 void load_alias_list(){
     alias_count=0;
     bool sd_locked=false;
@@ -709,12 +766,9 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         int target_idx = (gTabCount > 0 && current_tab_index < gTabCount) ? current_tab_index : 0;
         Tab &t = gTabs[target_idx];
         
-        // Auto-Scrolling Rolling Viewport Shifter Engine
+        // Auto-Scrolling Rolling Viewport Shifter Engine (memmove)
         if (t.line_count >= MSG_BUFFER_SIZE) {
-            // Shift every single text row upward by one index offset slot
-            for (int m = 1; m < MSG_BUFFER_SIZE; m++) {
-                t.lines[m - 1] = t.lines[m];
-            }
+            memmove(&t.lines[0], &t.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
             t.line_count = MSG_BUFFER_SIZE - 1; // Open up the absolute bottom slot row for our incoming text
         }
         
@@ -778,7 +832,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         if (is_mention(msg, irc_nick) && current_tab_index != 0 && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0) {
             Tab &mentions_tab = gTabs[0]; // Isolate Tab 0 explicitly
             if (mentions_tab.line_count >= MSG_BUFFER_SIZE) {
-                for (int i = 1; i < MSG_BUFFER_SIZE; i++) mentions_tab.lines[i-1] = mentions_tab.lines[i];
+                memmove(&mentions_tab.lines[0], &mentions_tab.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
                 mentions_tab.line_count = MSG_BUFFER_SIZE - 1;
             }
             ChatLine &ml = mentions_tab.lines[mentions_tab.line_count];
@@ -834,6 +888,7 @@ uint16_t get_nick_palette_color(const char* nick) {
     return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
 bool is_mention(const char* msg, const char* nick) {
+    if (is_highlight_word(msg)) return true;
     if (!msg || !nick || !*nick) return false;
     size_t nlen = strlen(nick);
     if (nlen==0) return false;
@@ -1232,7 +1287,8 @@ void draw_chat_view() {
             canvas.drawRect(drawer_x, 12, drawer_w, wire_y-12, 0x7BEF);
             canvas.setTextColor(0xFD20); canvas.setCursor(drawer_x+4, 14); canvas.print("NICKS");
             for(int n=0;n<t.nick_count && n<10; n++){
-                canvas.setTextColor(get_nick_palette_color(t.nicks[n]));
+                if(t.nicks_away[n]) canvas.setTextColor(0x4208);
+                else canvas.setTextColor(get_nick_palette_color(t.nicks[n]));
                 canvas.setCursor(drawer_x+4, 26+n*10);
                 char nd[12]={0}; strncpy(nd, t.nicks[n], 10);
                 canvas.print(nd);
@@ -1245,6 +1301,23 @@ void draw_chat_view() {
             canvas.drawRect(0, wire_y-12, display_width-6, 12, 0xFFE0);
             canvas.setTextColor(0xFFFF); canvas.setCursor(4, wire_y-10);
             canvas.printf("?%s_", search_query);
+        }
+        // Split mentions peek Fn+Q 3-line strip above wire_y
+        if (show_mentions_peek && gTabs[0].line_count>0 && current_app_mode==MODE_CHAT) {
+            int peek_h = 30;
+            int peek_y = wire_y - peek_h - 2;
+            if(peek_y < 12) peek_y = 12;
+            canvas.fillRect(0, peek_y, display_width-6, peek_h, 0x0841);
+            canvas.drawRect(0, peek_y, display_width-6, peek_h, 0x7BEF);
+            canvas.setTextColor(0xFFE0); canvas.setCursor(4, peek_y+2); canvas.print("~mentions peek");
+            for(int i=0;i<3 && i<gTabs[0].line_count;i++){
+                int idx=gTabs[0].line_count-1-i;
+                ChatLine &ml=gTabs[0].lines[idx];
+                canvas.setCursor(4, peek_y+12+i*8);
+                canvas.setTextColor(0xFFFF);
+                char tmp[22]={0}; strncpy(tmp, ml.message,20);
+                canvas.print(tmp);
+            }
         }
         // Slim 6px sidebar vertical indicators (right edge, 12-wire_y)
         {
@@ -1478,6 +1551,11 @@ void handle_keyboard_inputs() {
             set_led_mode(18);
             ui_needs_redraw=true;
         }
+        return;
+    }
+    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('q')) {
+        show_mentions_peek = !show_mentions_peek;
+        ui_needs_redraw=true;
         return;
     }
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('l')) {
@@ -1999,6 +2077,14 @@ void handle_keyboard_inputs() {
         if (M5Cardputer.Keyboard.isKeyPressed('`')) { search_active=false; search_query[0]='\0'; ui_needs_redraw=true; return; }
         ui_needs_redraw=true; return;
     }
+    if (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('r')) {
+        // Reload bouncer networks (re-trigger Available: discovery)
+        request_network_reload = true;
+        set_led_mode(13);
+        add_message_to_buffer("ClientCore", "Reloading bouncer networks...", 0x7BEF);
+        ui_needs_redraw=true;
+        return;
+    }
     if (current_app_mode == MODE_CHAT && is_fn && M5Cardputer.Keyboard.isKeyPressed('c')) {
         if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE) {
             Tab &t = gTabs[current_tab_index];
@@ -2180,6 +2266,30 @@ void handle_keyboard_inputs() {
                             }
                         }
                     }
+                    else if (cmd == "LIST") {
+                        chan_list_count=0;
+                        target_socket->printf("LIST\r\n");
+                        target_socket->flush();
+                        add_message_to_buffer("ClientCore", "Listing channels (10 max)...", 0x07E0);
+                    }
+                    else if (cmd == "HIGHLIGHT" && args.length() > 0) {
+                        String w = args; w.trim();
+                        if (w.startsWith("add ")) w = w.substring(4);
+                        else if (w.startsWith("del ")) {
+                            String del = w.substring(4); del.trim();
+                            for(int i=0;i<highlight_count;i++) if(strcasecmp(highlight_words[i], del.c_str())==0){
+                                for(int j=i;j<highlight_count-1;j++) strncpy(highlight_words[j], highlight_words[j+1],32);
+                                highlight_count--; save_highlight_list(); add_message_to_buffer("ClientCore", "Highlight removed", 0xFFFF); break;
+                            }
+                            w="";
+                        }
+                        w.trim();
+                        if(w.length()>0 && w.length()<32 && highlight_count<8){
+                            bool exists=false; for(int i=0;i<highlight_count;i++) if(strcasecmp(highlight_words[i], w.c_str())==0) exists=true;
+                            if(!exists){ strncpy(highlight_words[highlight_count], w.c_str(),31); highlight_count++; save_highlight_list(); add_message_to_buffer("ClientCore", ("Highlight added: "+w).c_str(), 0x07E0); }
+                        } else if(w.length()>=32) add_message_to_buffer("ClientCore", "Highlight too long", 0xF800);
+                        else if(highlight_count>=8) add_message_to_buffer("ClientCore", "Highlight list full (8)", 0xF800);
+                    }
                     else if (cmd == "IGNORE" && args.length() > 0) {
                         bool found=false; int idx=-1;
                         for(int i=0;i<ignore_count;i++) if(strcasecmp(ignore_list[i], args.c_str())==0){ found=true; idx=i; break; }
@@ -2220,11 +2330,21 @@ void handle_keyboard_inputs() {
 
 void irc_network_task(void* pvParameters) {
     static bool wifi_initialized = false;
-    static bool master_scan_complete = false;
     static WiFiClientSecure master_client;
 
     while (true) {
         yield(); vTaskDelay(pdMS_TO_TICKS(50)); // Prevent core starvation
+        if (request_network_reload) {
+            request_network_reload=false;
+            master_scan_complete_global=false;
+            discovered_network_count=0;
+            memset(discovered_networks,0,sizeof(discovered_networks));
+            master_client.stop();
+            for(int i=0;i<MAX_NETWORKS;i++){ clients[i].stop(); network_handshake_complete[i]=false; network_reconnect_cooldown[i]=0; }
+            add_message_to_buffer("ClientCore", "Network cache cleared, rediscovering...", 0x7BEF);
+            ui_needs_redraw=true;
+            set_led_mode(13);
+        }
         if (safe_mode_active || bnc_port == 0) continue;
 
         // STEP 0: ASYNCHRONOUS BACKGROUND WI-FI INITIALIZATION
@@ -2283,7 +2403,7 @@ void irc_network_task(void* pvParameters) {
         }
 
         // STEP 1: INITIAL PASS - EXTRACT NETWORKS DYNAMICALLY FROM THE BOUNCER
-        if (!master_scan_complete) {
+        if (!master_scan_complete_global) {
             if (!master_client.connected()) {
                 master_client.setInsecure();
                 if (master_client.connect(bnc_host, bnc_port)) {
@@ -2324,7 +2444,7 @@ void irc_network_task(void* pvParameters) {
                         start_pos = comma_idx + 1;
                     }
                     master_client.stop(); // Close the discovery probe safely
-                    master_scan_complete = true;
+                    master_scan_complete_global = true;
                     Serial.printf("[NET] Dynamic discovery complete. Isolated %d networks from bouncer.\n", discovered_network_count);
                 }
             }
@@ -2521,6 +2641,25 @@ void irc_network_task(void* pvParameters) {
                 } else if (line.indexOf(" 318 ") != -1) {
                     if(whois_pending){ whois_pending=false; current_app_mode=MODE_WHOIS; ui_needs_redraw=true; if(speaker_enabled && sound_profile>=1) M5.Speaker.tone(600,100); queueLed(18,500); }
                     continue;
+                } else if (line.indexOf(" 301 ") != -1) {
+                    int p301=line.indexOf(" 301 "); int s1=line.indexOf(' ', p301+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); String target=line.substring(s2+1,s3); target.trim();
+                        if(target.length() && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
+                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], target.c_str())==0) gTabs[t].nicks_away[k]=true;
+                            xSemaphoreGive(irc_mutex); ui_needs_redraw=true;
+                        }
+                    }}
+                } else if (line.indexOf(" 322 ") != -1) {
+                    // Minimal chan list cache (10 max, light)
+                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<10){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } add_message_to_buffer(chan.c_str(), line.substring(line.indexOf(" :", s4)+2).c_str(), 0x7BEF); }}
+                } else if (line.indexOf(" 323 ") != -1) {
+                    if(chan_list_count>0){
+                        String sum="Channels: ";
+                        for(int i=0;i<chan_list_count && i<5;i++){ if(i) sum+=" "; sum+=chan_list_cache[i]; }
+                        add_message_to_buffer("ClientCore", sum.c_str(), 0x07E0);
+                        // also push to log browser cache is already via SD, no extra
+                    }
+                    chan_list_count=0;
+                }
                 }
                 // ==========================================
                 // 🛑 PROTOCOL DROP SHIELD MASK + NICKLIST/TOPIC CAPTURE
@@ -2730,6 +2869,11 @@ void irc_network_task(void* pvParameters) {
                             sender_nick = line.substring(prefix_start_idx + 1, bang_idx);
                         }
                         sender_nick.trim();
+                        // clear away on activity
+                        if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
+                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], sender_nick.c_str())==0) gTabs[t].nicks_away[k]=false;
+                            xSemaphoreGive(irc_mutex);
+                        }
                         String actual_msg = line.substring(colon_idx + 2);
                             // --- CTCP PROTOCOL INTERCEPT ENGINE ---
                             // Check if the message string contains hidden CTCP delimiter tags (\x01)
@@ -2766,7 +2910,7 @@ void irc_network_task(void* pvParameters) {
                             Tab &t = gTabs[target_tab_slot];
                             
                             if (t.line_count >= MSG_BUFFER_SIZE) {
-                                for (int m = 1; m < MSG_BUFFER_SIZE; m++) t.lines[m-1] = t.lines[m];
+                                memmove(&t.lines[0], &t.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
                                 t.line_count = MSG_BUFFER_SIZE - 1;
                             }
                             
@@ -3103,6 +3247,7 @@ void setup() {
     load_input_history();
     load_ignore_list();
     load_alias_list();
+    load_highlight_list();
 
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
