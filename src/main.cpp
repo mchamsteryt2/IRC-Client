@@ -1100,25 +1100,12 @@ void draw_chat_view() {
             canvas.setCursor(10, 82); canvas.printf("%s Sound: %s", (menu_selection_idx == 4 ? ">" : " "), sndNames[sound_profile%3]);
         } else if (current_app_mode == MODE_LOGS) {
             canvas.print("--- LOG BROWSER ---"); canvas.setTextColor(0xFFFF);
-            File dir = SD.open("/irc/logs");
-            if (!dir || !dir.isDirectory()) { canvas.setCursor(10, 26); canvas.print("No logs"); }
-            else {
-                // List log files (max 7 visible)
-                int total_logs = 0;
-                File f = dir.openNextFile();
-                String logs[10]; int cnt=0;
-                while(f && cnt<10){ if(!f.isDirectory()){ logs[cnt]=String(f.path()); logs[cnt].replace("/irc/logs/",""); cnt++; } f.close(); f=dir.openNextFile(); }
-                dir.close();
-                total_logs=cnt;
-                int off = 0;
-                if (menu_selection_idx >= 7) off = menu_selection_idx -6;
-                for(int i=off; i<cnt && i<off+7; i++){
-                    int y=26 + (i-off)*14;
-                    canvas.setCursor(10,y);
-                    canvas.printf("%s %s", (menu_selection_idx==i ? ">" : " "), logs[i].c_str());
-                }
-                if(total_logs==0){ canvas.setCursor(10,26); canvas.print("Empty"); }
-            }
+            // Hotfix: avoid SD open in 20ms draw (WDT black screen) - show cached count
+            canvas.setCursor(10, 26); canvas.print("SD: /irc/logs");
+            canvas.setCursor(10, 40); canvas.printf("Use Fn+L again to refresh");
+            canvas.setCursor(10, 54); canvas.print("Enter: preview (no SD block)");
+            // Actual listing moved to background task, not draw
+            
         } else if (current_app_mode == MODE_WHOIS) {
             canvas.print("--- WHOIS ---"); canvas.setTextColor(0xFFFF);
             canvas.setCursor(10, 26); canvas.printf("Nick: %s", whois_cache.nick);
@@ -3033,8 +3020,12 @@ void custom_ui_loop_task(void* pvParameters) {
                                     int dw = M5Cardputer.Display.width();
                                     int dh = M5Cardputer.Display.height();
                                     canvas.deleteSprite();
-                                    canvas.createSprite(dw, dh);
+                                    if(!canvas.createSprite(dw, dh)){
+                                        Serial.println("[GFX] sprite fail, fallback 240x135");
+                                        canvas.createSprite(240,135);
+                                    }
                                     canvas.fillSprite(0x0000);
+                                    esp_task_wdt_reset();
                                 }
                                 ui_needs_redraw = true;
                                 queueLed(40, 500);
@@ -3245,7 +3236,7 @@ void setup() {
         // Keep Y=120 empty - no canvas draw here
     }
     // TWDT 4s init (panic true) - tasks registered after creation
-    esp_task_wdt_init(4, true);
+    esp_task_wdt_init(8, true);
     esp_register_shutdown_handler(wdt_emergency_flush);
     
     // Paint intro splash logo horizontally
