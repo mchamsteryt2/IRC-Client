@@ -924,15 +924,9 @@ void draw_chat_view() {
     int display_width = M5Cardputer.Display.width();
     int display_height = M5Cardputer.Display.height();
     bool is_vertical = (display_width < display_height);
-    // Spec tight clamp: if rotation reports 1 or 3 treat as vertical too (fallback)
-    uint8_t rot = M5Cardputer.Display.getRotation();
-    if (rot == 1 || rot == 3) {
-        // Honor spec: Orientation 1 or 3 = vertical 135x240 (overrides width check if driver remaps)
-        if (display_width == 240 && display_height == 135) is_vertical = true;
-    }
     int navbar_clamp_x = is_vertical ? 65 : 115;
-    int rssi_anchor_x = is_vertical ? 75 : 120;
-    int battery_anchor_x = is_vertical ? 110 : 208;
+    int rssi_anchor_x = is_vertical ? 85 : 120;
+    int battery_anchor_x = is_vertical ? 110 : 225;
     int wire_y = is_vertical ? 224 : 121;
     int input_box_y = is_vertical ? 225 : 121;
     int baseline_y = is_vertical ? 208 : (97 + (int)ui_scroll_y_interpolation);
@@ -1161,7 +1155,7 @@ void draw_chat_view() {
             canvas.deleteSprite();
             canvas.createSprite(240,135);
         }
-        canvas.fillSprite(use_light_theme ? 0xFFFF : 0x0000);
+        canvas.fillSprite(0x0000);
         Tab &t = gTabs[current_tab_index];
         int current_y = baseline_y; 
         int starting_index = (t.line_count - 1) - scrollback_offset;
@@ -1380,7 +1374,7 @@ void draw_chat_view() {
     M5Cardputer.Display.print(truncated_name);
 
     // Connection indicator
-    int conn_x = is_vertical ? 75 : 142;
+    int conn_x = is_vertical ? 75 : 145;
     // RSSI anchor already at rssi_anchor_x, but keep conn indicator near RSSI for compact vertical
     if (!is_vertical) {
         M5Cardputer.Display.setCursor(conn_x, 2);
@@ -1419,14 +1413,14 @@ void draw_chat_view() {
             }
         }
     }
-    // Vertical also needs W/D indicator near RSSI if not drawn above
+    // Vertical also needs W/D indicator near RSSI if not drawn above (more spacing)
     if (is_vertical) {
-        M5Cardputer.Display.setCursor(90, 2);
+        M5Cardputer.Display.setCursor(95, 2);
         if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
         else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
     }
-    // Rotation lock indicator l/u (unicode lock fails on builtin font)
-    M5Cardputer.Display.setCursor(battery_anchor_x - 10, 2);
+    // Rotation lock indicator l/u (more spacing)
+    M5Cardputer.Display.setCursor(battery_anchor_x - 12, 2);
     if (rotation_locked) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("L"); }
     else { M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.print("U"); }
     M5Cardputer.Display.setCursor(battery_anchor_x, 2); 
@@ -1439,15 +1433,13 @@ void draw_chat_view() {
         if (getLocalTime(&timeinfo, 30)) { hh=timeinfo.tm_hour; mm=timeinfo.tm_min; }
         else { unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60; }
         if (use_12_hour_format) { int h12 = hh%12; if(h12==0) h12=12; hh=h12; }
-        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(155, 2);
+        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(150, 2);
         M5Cardputer.Display.printf("%02d:%02d", hh, mm);
         M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(185, 2);
         M5Cardputer.Display.printf("%d/%d", (int)current_tab_index+1, (int)gTabCount);
-        if (gTabs[current_tab_index].topic[0]) { M5Cardputer.Display.setTextColor(0xFD20,0x0841); M5Cardputer.Display.setCursor(200,2); M5Cardputer.Display.print("*"); }
+        if (gTabs[current_tab_index].topic[0]) { M5Cardputer.Display.setTextColor(0xFD20,0x0841); M5Cardputer.Display.setCursor(205,2); M5Cardputer.Display.print("*"); }
     } else {
-        // Vertical tight - show chan count at 60
-        M5Cardputer.Display.setTextColor(0x7BEF,0x0841); M5Cardputer.Display.setCursor(60,2);
-        M5Cardputer.Display.printf("%d/%d", (int)current_tab_index+1, (int)gTabCount);
+        // Vertical tight - keep ~mentions clear, skip chan count (already at 45)
     }
 
     // Low-Profile Navbar Activity Indicator Dots Engine
@@ -1507,6 +1499,11 @@ void handle_keyboard_inputs() {
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
+    // Fn hold ghost guard: if only Fn held with no other key word/enter/del, avoid ghost matrix scan
+    if (is_fn && status.word.empty() && !status.enter && !status.del) {
+        bool anyFnCombo = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('s') || M5Cardputer.Keyboard.isKeyPressed('c') || M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('.') || M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(' ') || M5Cardputer.Keyboard.isKeyPressed('f');
+        if (!anyFnCombo) return;
+    }
     
     // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P)
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('p')) {
@@ -2031,6 +2028,7 @@ void handle_keyboard_inputs() {
                     }
                 }
                 if (current_app_mode == MODE_LOGS) {
+                    bool sdL=false; if(sd_mutex) sdL=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sdL=true;
                     File dir = SD.open("/irc/logs");
                     if (dir && dir.isDirectory()) {
                         // collect up to 10 logs
@@ -2038,17 +2036,21 @@ void handle_keyboard_inputs() {
                         File f = dir.openNextFile();
                         while(f && cnt<10){ if(!f.isDirectory()){ logs[cnt]=String(f.path()); cnt++; } f.close(); f=dir.openNextFile(); }
                         dir.close();
+                        if(sdL && sd_mutex) xSemaphoreGive(sd_mutex);
                         if (menu_selection_idx < cnt) {
                             String p = logs[menu_selection_idx];
+                            bool sdL2=false; if(sd_mutex) sdL2=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sdL2=true;
                             File lf = SD.open(p);
                             if (lf) {
                                 for(int i=0;i<5 && lf.available(); i++){
                                     char line[128]; int len=lf.readBytesUntil('\n', line, sizeof(line)-1);
                                     if(len<=0) break; line[len]='\0';
                                     add_message_to_buffer("LOG", line, 0x7BEF);
+                                    esp_task_wdt_reset();
                                 }
                                 lf.close();
                             }
+                            if(sdL2 && sd_mutex) xSemaphoreGive(sd_mutex);
                             current_app_mode = MODE_CHAT;
                             ui_needs_redraw = true;
                             return;
@@ -3006,7 +3008,7 @@ void custom_ui_loop_task(void* pvParameters) {
                             if (tilt_hold_start==0 || target_rot != desired) { tilt_hold_start = millis(); target_rot = desired; }
                             if (millis() - tilt_hold_start >= 1000) {
                                 M5Cardputer.Display.setRotation(desired);
-                                {
+                                if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
                                     int dw = M5Cardputer.Display.width();
                                     int dh = M5Cardputer.Display.height();
                                     canvas.deleteSprite();
@@ -3015,6 +3017,7 @@ void custom_ui_loop_task(void* pvParameters) {
                                         canvas.createSprite(240,135);
                                     }
                                     canvas.fillSprite(0x0000);
+                                    xSemaphoreGive(irc_mutex);
                                     esp_task_wdt_reset();
                                 }
                                 ui_needs_redraw = true;
@@ -3186,6 +3189,7 @@ void setup() {
     
     // Safe initialization sequence passing native configurations to shield the Stamp-S3A
     auto cfg = m5::M5Unified::config();
+    cfg.internal_imu = true;
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
     // Create canvas sprite for middle viewport - must be done after Display init
