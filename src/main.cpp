@@ -169,8 +169,6 @@ volatile float ui_scroll_y_interpolation = 0.0f;
 volatile bool kb_interrupt_fired = false;
 void IRAM_ATTR kb_isr() { kb_interrupt_fired = true; last_user_keyboard_input_tick = millis(); }
 unsigned long last_input_time = 0;
-bool rotation_locked = false;
-uint8_t locked_rotation = 1;
 unsigned long last_server_activity = 0;
 String input_buffer;
 int input_buffer_len = 0;
@@ -1380,10 +1378,6 @@ void draw_chat_view() {
                 dot_y+=4;
                 if(dot_y > wire_y-8) break;
             }
-            // Lock indicator bottom
-            canvas.setTextColor(rotation_locked ? 0xF800 : 0x7BEF);
-            canvas.setCursor(sb_x+1, wire_y-8);
-            canvas.print(rotation_locked ? "L" : "U");
         }
         // TextBox Workspace Integrity: Y = 225 to 240 must remain empty - ensure cleared
         if (is_vertical) {
@@ -1406,7 +1400,6 @@ void draw_chat_view() {
         static int last_nav_rssi_hash = -999;
         static int last_nav_min = -1;
         static bool last_nav_vertical = false;
-        static bool last_nav_locked = false;
         static unsigned long last_nav_force_ms = 0;
         // compute current navbar state hash without drawing
         int cur_batt = (int)get_calibrated_battery_percentage();
@@ -1416,7 +1409,6 @@ void draw_chat_view() {
         if(getLocalTime(&ti, 5)) cur_min = ti.tm_hour*60 + ti.tm_min;
         else cur_min = (int)((millis()/1000 + adj_time)/60)%1440;
         bool cur_vertical = is_vertical;
-        bool cur_locked = rotation_locked;
         // topic dot
         bool cur_has_topic = gTabs[current_tab_index].topic[0];
         // highlight dots hash
@@ -1434,7 +1426,6 @@ void draw_chat_view() {
         else if(last_nav_rssi_hash != cur_rssi_hash) navbar_dirty=true;
         else if(last_nav_min != cur_min) navbar_dirty=true;
         else if(last_nav_vertical != cur_vertical) navbar_dirty=true;
-        else if(last_nav_locked != cur_locked) navbar_dirty=true;
         else if(cur_has_topic != (last_nav_min!=-1 && last_nav_min==cur_min && cur_has_topic)) {} // handled via redraw when topic changes
         else if(last_nav_force_ms==0 || millis()-last_nav_force_ms>1000) navbar_dirty=true; // periodic refresh 1Hz for sparkline/battery
         else if(cur_dot_hash != last_nav_batt) {} // already covered
@@ -1452,7 +1443,6 @@ void draw_chat_view() {
             last_nav_rssi_hash = cur_rssi_hash;
             last_nav_min = cur_min;
             last_nav_vertical = cur_vertical;
-            last_nav_locked = cur_locked;
             last_nav_force_ms = millis();
             // fall through to actual navbar draw
             M5Cardputer.Display.startWrite();
@@ -1511,10 +1501,6 @@ void draw_chat_view() {
         }
     }
     // Vertical W/D removed - sparkline only
-    // Rotation lock indicator l/u (more spacing)
-    M5Cardputer.Display.setCursor(battery_anchor_x - 12, 2);
-    if (rotation_locked) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("L"); }
-    else { M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.print("U"); }
     M5Cardputer.Display.setCursor(battery_anchor_x, 2); 
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
     M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
@@ -1807,24 +1793,6 @@ void handle_keyboard_inputs() {
     // On the Cardputer layout, Fn+Arrows outputs direct character values:
     // Fn+Left = ';' | Fn+Right = '/' | Fn+Up = ',' | Fn+Down = '.'
     if (current_app_mode == MODE_CHAT) {
-        // Rotation Lock Toggle (Fn + Space) + Auto-Rotate - edge triggered to prevent hold flicker
-        {
-            static bool was_space_prev=false;
-            bool cur_space = is_fn && M5Cardputer.Keyboard.isKeyPressed(' ');
-            if(cur_space && !was_space_prev){
-                rotation_locked = !rotation_locked;
-                if (rotation_locked) locked_rotation = M5Cardputer.Display.getRotation();
-                queueLed(40, 500); // Mode 40 lock blip
-                g_backlight_level = 255;
-                last_user_keyboard_input_tick = millis();
-                last_input_time = millis();
-                ui_needs_redraw = true;
-                was_space_prev=true;
-                return;
-            }
-            if(!cur_space) was_space_prev=false;
-            if(cur_space) { esp_task_wdt_reset(); return; }
-        }
         // Scrollback up/down and tab swap are intentionally repeatable but throttled to 90ms to avoid SPI/UI flood
         {
             static unsigned long last_scroll_ms=0;
@@ -3263,51 +3231,7 @@ void custom_ui_loop_task(void* pvParameters) {
         
         M5Cardputer.update(); // Polling matrix registers over un-lockable bus lane
         handle_keyboard_inputs();
-        // Auto-rotate with lock: Fn+Space locks, tilt only when !rotation_locked
-        {
-            static unsigned long last_tilt_poll = 0;
-            static unsigned long tilt_hold_start = 0;
-            static uint8_t target_rot = 0;
-            if (millis() - last_tilt_poll >= 200) {
-                last_tilt_poll = millis();
-                if (rotation_locked) { tilt_hold_start = 0; }
-                else {
-                    float ax, ay, az;
-                    if (M5.Imu.getAccel(&ax, &ay, &az)) {
-                        uint8_t desired = M5Cardputer.Display.getRotation();
-                        if (ay < -7.0f) desired = 0; // portrait 90
-                        else if (ay > 7.0f) desired = 2; // portrait 270
-                        else if (ax < -7.0f) desired = 3; // landscape inverted
-                        else if (ax > 7.0f) desired = 1; // landscape
-                        else { tilt_hold_start = 0; }
-                        if (desired != M5Cardputer.Display.getRotation()) {
-                            if (tilt_hold_start==0 || target_rot != desired) { tilt_hold_start = millis(); target_rot = desired; }
-                            if (millis() - tilt_hold_start >= 1000) {
-                                M5Cardputer.Display.setRotation(desired);
-                                if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
-                                    int dw = M5Cardputer.Display.width();
-                                    int dh = M5Cardputer.Display.height();
-                                    int vh = dh - 12 - 14; if(vh<100) vh=109; if(vh>214) vh=dh;
-                                    canvas.deleteSprite();
-                                    if(!canvas.createSprite(dw, vh)){
-                                        Serial.println("[GFX] sprite fail, fallback 240x109");
-                                        canvas.createSprite(240, 109);
-                                    }
-                                    canvas.fillSprite(0x0000);
-                                    xSemaphoreGive(irc_mutex);
-                                    esp_task_wdt_reset();
-                                }
-                                ui_needs_redraw = true;
-                                queueLed(40, 500);
-                                tilt_hold_start = 0;
-                            }
-                        } else {
-                            tilt_hold_start = 0;
-                        }
-                    }
-                }
-            }
-        }
+        // Auto-rotate and rotation lock (Fn+Space) removed - rotation fixed at boot (1).
         // Interrupt-driven idle check consumes kb_interrupt_fired flag to avoid polling churn
         if (kb_interrupt_fired) { kb_interrupt_fired = false; last_input_time = millis(); last_user_keyboard_input_tick = millis(); }
         
