@@ -13,7 +13,7 @@
 // ⚡ SYSTEM CONSTANTS & HARDWARE BUFFER BOUNDS
 // ==========================================
 #define MAX_TABS 10
-#define MSG_BUFFER_SIZE 30
+#define MSG_BUFFER_SIZE 20
 #define COLUMNS_MAX 38
 
 struct ChatLine {
@@ -97,10 +97,7 @@ int highlight_count = 0;
 bool is_away = false;
 bool show_dBm = false;
 bool show_mentions_peek = false;
-bool debug_log_enabled = false; // test toggle in settings only, RAM ring when enabled, no SD on WDT
-char debug_ring[20][128] = {{0}};
-uint8_t debug_ring_head = 0;
-uint8_t debug_ring_count = 0;
+bool debug_log_enabled = false; // test toggle in settings only - no RAM ring (512KB tight), Serial only when enabled
 unsigned long last_away_tick = 0;
 unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
 
@@ -433,8 +430,8 @@ void append_line_to_sd_log(const char* tab_name, const char* nick, const char* m
 }
 
 
-// Lightweight 512-byte static line cache for high-speed log write caching
-static char log_sector_cache[512] = {0};
+// Lightweight 256-byte static line cache for high-speed log write caching
+static char log_sector_cache[256] = {0};
 static int log_sector_cache_len = 0;
 static char log_sector_current_path[128] = {0};
 
@@ -443,7 +440,7 @@ void flush_log_cache() {
     if (log_sector_cache_len == 0 || log_sector_current_path[0] == '\0') return;
     // Use sd_mutex if available - tryTake defer to avoid 50ms stall during PRIVMSG flood
     bool sd_locked = false;
-    if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(5)) == pdTRUE);
+    if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(20)) == pdTRUE);
     else sd_locked = true;
     if (!sd_locked) return; // defer to next loop
     else sd_locked = true;
@@ -475,13 +472,8 @@ void wdt_emergency_flush() {
 void log_system(const char* fmt, ...) {
     char buf[160];
     va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
-    // RAM ring + Serial always (test safe, no SD on hard reboot when debug enabled)
-    strncpy(debug_ring[debug_ring_head], buf, 127);
-    debug_ring[debug_ring_head][127]='\0';
-    debug_ring_head = (debug_ring_head+1)%20;
-    if (debug_ring_count<20) debug_ring_count++;
     Serial.println(buf);
-    if (debug_log_enabled) return;
+    if (debug_log_enabled) return; // test mode: Serial only, no SD to avoid corruption on hard reboot
     // always log to SD, even in safe_mode (system logs are critical)
     unsigned long sec = millis()/1000 + adj_time;
     char path[64];
@@ -846,7 +838,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             scrollback_mode_active = false;
         }
 
-    // Dynamic Session Log Rotator with High-Speed Write Caching (512-byte sector cache)
+    // Dynamic Session Log Rotator with High-Speed Write Caching (256-byte sector cache)
     if (channel_log_enabled == 1 && safe_mode_active == false) {
         unsigned long current_sync_sec = (millis() / 1000) + adj_time;
         uint32_t active_yr  = 2026; 
@@ -875,14 +867,14 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
         }
 
-        // Accumulate into 512-byte sector cache
+        // Accumulate into 256-byte sector cache
         char line_buf[160] = {0};
         int line_len = snprintf(line_buf, sizeof(line_buf), "[%s] <%s>: %s\r\n", cl.timeStr, cl.nick, cl.message);
-        if (log_sector_cache_len + line_len >= 512) {
+        if (log_sector_cache_len + line_len >= 256) {
             flush_log_cache();
             strncpy(log_sector_current_path, file_path_buffer, sizeof(log_sector_current_path)-1);
         }
-        if (line_len < 512) {
+        if (line_len < 256) {
             memcpy(log_sector_cache + log_sector_cache_len, line_buf, line_len);
             log_sector_cache_len += line_len;
         } else {
@@ -892,7 +884,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
             if (f) { f.write((uint8_t*)line_buf, line_len); f.close(); } else set_led_mode(28);
         }
         // Flush only on sector full, channel switch, or critical battery handled via external triggers
-        if (log_sector_cache_len >= 512 - 160) flush_log_cache();
+        if (log_sector_cache_len >= 256 - 160) flush_log_cache();
     }
 
         // Cross-Network Highlights Duplicator Pass - fixed: only true PRIVMSG mentions, not server/status noise
@@ -1229,8 +1221,10 @@ void draw_chat_view() {
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] canvas 0 in draw, recreating viewport");
         canvas.deleteSprite();
+        canvas.setColorDepth(8);
         if(!canvas.createSprite(240,109)){
-            if(!canvas.createSprite(135,214)){
+            canvas.setColorDepth(8);
+        if(!canvas.createSprite(135,214)){
                 // last resort 240x135 will likely fail without PSRAM but try
                 canvas.createSprite(240,135);
             }
@@ -2902,7 +2896,7 @@ void irc_network_task(void* pvParameters) {
                             gTabs[t_idx].line_count=keep;
                         }
                     }
-                    heap_caps_check_integrity_all(true);
+                    // heap_caps_check_integrity_all removed for stability (was >500ms block on low heap)
                 } 
                 
                 net_client.stop(); // Forcefully purge old secure memory blocks first
@@ -2910,7 +2904,7 @@ void irc_network_task(void* pvParameters) {
                 
                 // Modern ESP32 Core 3.x Frame Stabilization: Set secure handshake window limits
                 // to give heavy certificate chains like MansionNET plenty of time to clear sockets natively
-                net_client.setHandshakeTimeout(15); 
+                net_client.setHandshakeTimeout(5); 
                 
                 if (channel_log_enabled == 1) {
                     Serial.printf("[NET] Attempting secure link pass for slot: %s\n", discovered_networks[i]);
@@ -3088,7 +3082,6 @@ void irc_network_task(void* pvParameters) {
                     }
                 }
 
-                // For remaining numeric replies, create String wrapper (one heap alloc per non-PRIVMSG packet, acceptable; hot PRIVMSG already handled via cLine)
                 String line = String(cLine);
                 // WHOIS numeric cache (311/312/317/318/319/330/671)
                 if (line.indexOf(" 311 ") != -1) {
@@ -3407,12 +3400,13 @@ void irc_network_task(void* pvParameters) {
                 }
 
                 // --- OPTIMIZED CHAT PAYLOAD ROUTING ENGINE ---
-                if (line.indexOf(" PRIVMSG ") != -1) {
-                    int priv_idx = line.indexOf(" PRIVMSG ");
-                    int colon_idx = line.indexOf(" :", priv_idx);
+                if (strstr(cLine, " PRIVMSG ") != nullptr) {
+                    String line2 = String(cLine);
+                    int priv_idx = line2.indexOf(" PRIVMSG ");
+                    int colon_idx = line2.indexOf(" :", priv_idx);
                     
                     if (priv_idx != -1 && colon_idx != -1) {
-                        String target_recipient = line.substring(priv_idx + 9, colon_idx);
+                        String target_recipient = line2.substring(priv_idx + 9, colon_idx);
                         target_recipient.trim();
                         
                         // EXPLICIT NETWORK EXTRACTOR: Isolate the true upstream bouncer network tag signature
@@ -3512,12 +3506,13 @@ void irc_network_task(void* pvParameters) {
                         }
                     }
                 }
-                if (line.indexOf(" PRIVMSG ") == -1 && line.length() > 0) {
+                if (strstr(cLine, " PRIVMSG ") == nullptr && strlen(cLine) > 0) {
+                    String line3 = String(cLine);
                     char dispNick[16] = "server";
-                    if (line.charAt(0) == ':') {
-                        int sp = line.indexOf(' ');
+                    if (line3.charAt(0) == ':') {
+                        int sp = line3.indexOf(' ');
                         if (sp != -1) {
-                            String pref = line.substring(1, sp);
+                            String pref = line3.substring(1, sp);
                             int bang = pref.indexOf('!');
                             if (bang != -1) pref = pref.substring(0, bang);
                             strncpy(dispNick, pref.c_str(), sizeof(dispNick)-1);
@@ -3531,7 +3526,7 @@ void irc_network_task(void* pvParameters) {
                             xQueueReceive(gLogQueue, &dummy, 0);
                         }
                         char qLine[128];
-                        strncpy(qLine, line.c_str(), sizeof(qLine)-1);
+                        strncpy(qLine, line3.c_str(), sizeof(qLine)-1);
                         qLine[sizeof(qLine)-1] = '\0';
                         xQueueSend(gLogQueue, &qLine, 0);
                     }
@@ -3604,7 +3599,7 @@ void custom_ui_loop_task(void* pvParameters) {
         // Periodic log flush every 1s to make channel logs visible (was only on 512B full)
         {
             static unsigned long last_log_flush=0;
-            if(channel_log_enabled==1 && millis()-last_log_flush>1000 && log_sector_cache_len>0){
+            if(channel_log_enabled==1 && millis()-last_log_flush>2000 && log_sector_cache_len>0){
                 last_log_flush=millis();
                 flush_log_cache();
             }
@@ -3745,11 +3740,13 @@ void setup() {
     use_light_theme=false; text_scale=1;
     // No PSRAM - use 240x109 middle viewport (52KB) bloat-free, never 240x135
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    canvas.setColorDepth(8);
     if(!canvas.createSprite(240, 109)){
         Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
         if(!canvas.createSprite(135, 214)){
             Serial.println("[GFX] 135x214 fail, trying 240x135 last resort");
+            canvas.setColorDepth(8);
             canvas.createSprite(240, 135);
         }
     }
@@ -3757,6 +3754,7 @@ void setup() {
         Serial.println("[GFX] sprite still 0, retry 240x109 after heap trim");
         for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
         canvas.deleteSprite();
+        canvas.setColorDepth(8);
         canvas.createSprite(240,109);
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
@@ -3800,7 +3798,7 @@ void setup() {
         SD.mkdir("/irc/system");
     }
     // TWDT 4s init (panic true) - tasks registered after creation
-    esp_task_wdt_init(8, true);
+    esp_task_wdt_init(10, true);
     esp_register_shutdown_handler(wdt_emergency_flush);
     
     // Paint intro splash logo horizontally
@@ -3860,8 +3858,8 @@ void setup() {
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
     
-    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 16384, NULL, 1, &xNetworkTaskHandle, 0);
-    xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 16384, NULL, 1, &xUITaskHandle, 1);
+    xTaskCreatePinnedToCore(irc_network_task, "NetworkTask", 12288, NULL, 1, &xNetworkTaskHandle, 0);
+    xTaskCreatePinnedToCore(custom_ui_loop_task, "CustomUITask", 12288, NULL, 1, &xUITaskHandle, 1);
     // Register core tasks into TWDT (4s timeout, panic + emergency flush)
     esp_task_wdt_add(xNetworkTaskHandle);
     esp_task_wdt_add(xUITaskHandle);
