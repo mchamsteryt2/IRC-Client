@@ -58,6 +58,7 @@ volatile bool system_booted = false;
 volatile bool ui_needs_redraw = true;
 volatile bool chrome_needs_redraw = true;
 volatile bool input_needs_redraw = true;
+volatile bool sparkline_needs_redraw = false;
 volatile uint8_t current_tab_index = 0;
 volatile uint8_t gTabCount = 0;
 int screen_brightness = 120;
@@ -96,6 +97,10 @@ int highlight_count = 0;
 bool is_away = false;
 bool show_dBm = false;
 bool show_mentions_peek = false;
+bool debug_log_enabled = false; // test toggle in settings only, RAM ring when enabled, no SD on WDT
+char debug_ring[20][128] = {{0}};
+uint8_t debug_ring_head = 0;
+uint8_t debug_ring_count = 0;
 unsigned long last_away_tick = 0;
 unsigned long last_keypress_debounce = 0; // Fixed key chatter metric
 
@@ -353,6 +358,7 @@ void load_settings_from_sd() {
         else if (strcmp(key, "theme_accent")==0) theme_accent = atoi(value);
         else if (strcmp(key, "text_scale")==0) text_scale = atoi(value);
         else if (strcmp(key, "speaker_enabled")==0) speaker_enabled = atoi(value);
+        else if (strcmp(key, "debug_log_enabled")==0) debug_log_enabled = atoi(value);
     }
     // Critical parameters validation – fire Mode 37 if bouncer host/port or wifi remains unassigned
     if (strlen(wifi_ssid) == 0 || strlen(bnc_host) == 0 || bnc_port == 0) {
@@ -373,7 +379,7 @@ void sync_new_nick_to_sd(const char* new_nick) {
     if (!file) { if (sd_mutex) xSemaphoreGive(sd_mutex); return; }
     file.printf("wifi_ssid=%s\nwifi_pass=%s\nirc_nick=%s\n", wifi_ssid, wifi_pass, irc_nick);
     file.printf("channel_log_enabled=%d\nscreen_brightness=%d\n", channel_log_enabled, screen_brightness);
-    file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\nuse_dst=%d\nuse_light_theme=%d\ntheme_accent=%d\ntext_scale=%d\nspeaker_enabled=%d\nbnc_host=%s\n", current_tz_idx, use_12_hour_format, use_dst, use_light_theme, theme_accent, text_scale, speaker_enabled, bnc_host);
+    file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\nuse_dst=%d\nuse_light_theme=%d\ntheme_accent=%d\ntext_scale=%d\nspeaker_enabled=%d\ndebug_log_enabled=%d\nbnc_host=%s\n", current_tz_idx, use_12_hour_format, use_dst, use_light_theme, theme_accent, text_scale, speaker_enabled, debug_log_enabled, bnc_host);
     file.printf("bnc_port=%d\nbnc_user=%s\nbnc_pass=%s\n", bnc_port, bnc_user, bnc_pass);
     file.close();
     if (sd_mutex) xSemaphoreGive(sd_mutex);
@@ -433,6 +439,7 @@ static int log_sector_cache_len = 0;
 static char log_sector_current_path[128] = {0};
 
 void flush_log_cache() {
+    if (debug_log_enabled) return; // test mode: no SD to avoid corruption on hard reboot
     if (log_sector_cache_len == 0 || log_sector_current_path[0] == '\0') return;
     // Use sd_mutex if available - tryTake defer to avoid 50ms stall during PRIVMSG flood
     bool sd_locked = false;
@@ -458,13 +465,24 @@ void flush_log_cache() {
 // Emergency TWDT flush - called from watchdog ISR before hardware restart
 void wdt_emergency_flush() {
     // Short non-blocking window, flush RAM cache to /irc/logs/ before S3 restart
+    if (debug_log_enabled) {
+        Serial.println("[WDT] panic flush skipped (debug RAM ring)");
+        return;
+    }
     log_system("WDT panic flush");
     flush_log_cache();
 }
 void log_system(const char* fmt, ...) {
-    // always log to SD, even in safe_mode (system logs are critical)
     char buf[160];
     va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
+    // RAM ring + Serial always (test safe, no SD on hard reboot when debug enabled)
+    strncpy(debug_ring[debug_ring_head], buf, 127);
+    debug_ring[debug_ring_head][127]='\0';
+    debug_ring_head = (debug_ring_head+1)%20;
+    if (debug_ring_count<20) debug_ring_count++;
+    Serial.println(buf);
+    if (debug_log_enabled) return;
+    // always log to SD, even in safe_mode (system logs are critical)
     unsigned long sec = millis()/1000 + adj_time;
     char path[64];
     struct tm ti;
@@ -963,7 +981,7 @@ bool is_mention(const char* msg, const char* nick) {
 // 🎬 RETRO-TERMINAL GRAPHICS RENDERING ENGINE
 // ==========================================
 void draw_chat_view() {
-    if (!ui_needs_redraw && !chrome_needs_redraw && !input_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
+    if (!ui_needs_redraw && !chrome_needs_redraw && !input_needs_redraw && !sparkline_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
     canvas.setTextSize(text_scale);
     // Fluid geometry anchored to active rotation (135x240 vertical vs 240x135 landscape)
     int display_width = M5Cardputer.Display.width();
@@ -1126,6 +1144,7 @@ void draw_chat_view() {
             canvas.setCursor(10, 40); canvas.printf("%s Format Layer: %s", (menu_selection_idx == 1 ? ">" : " "), use_12_hour_format ? "12-HR" : "24-HR");
             canvas.setCursor(10, 54); canvas.printf("%s DST Override: %s", (menu_selection_idx == 2 ? ">" : " "), use_dst ? "ON +1h" : "OFF");
             canvas.setCursor(10, 68); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
+            canvas.setCursor(10, 82); canvas.printf("%s Debug Log: %s", (menu_selection_idx == 4 ? ">" : " "), debug_log_enabled ? "ON (RAM)" : "OFF");
         } else if (current_app_mode == MODE_BOUNCER) {
             canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(0xFFFF);
             canvas.setCursor(10, 26); canvas.printf("%s Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
@@ -1247,10 +1266,12 @@ void draw_chat_view() {
     bool chat_dirty = ui_needs_redraw;
     bool chrome_dirty = chrome_needs_redraw;
     bool input_dirty = input_needs_redraw;
+    bool sparkline_dirty = sparkline_needs_redraw;
     if (ui_scroll_y_interpolation != 0.0f) chat_dirty = true;
     {
         if (chat_dirty) {
-        canvas.fillRect(0, 12, display_width, wire_y-12, 0x0000);
+        if (is_fullscreen) canvas.fillRect(0, 12, display_width, wire_y-12, 0x0000);
+        else canvas.fillRect(0, 0, display_width, canvas.height(), 0x0000);
         Tab &t = snapTab;
         int effective_count = t.line_count;
         if (effective_count > MSG_BUFFER_SIZE) effective_count = MSG_BUFFER_SIZE;
@@ -1544,7 +1565,29 @@ void draw_chat_view() {
                     else if (has_unread_msg) canvas.fillRect(dot_x, 10, 3, 2, 0x07FF);
                 }
             }
-            } // chrome_dirty
+            } else if (sparkline_dirty) {
+            // Sparkline only subtle - no hard fill of whole bar
+            for(int i=0;i<8;i++){
+                int idx = (rssi_history_idx + i) %8;
+                int8_t v = rssi_history[idx];
+                int h=0;
+                if(v != -127){
+                    if(v >= -50) h=6;
+                    else if(v >= -60) h=4;
+                    else if(v >= -75) h=3;
+                    else if(v >= -90) h=2;
+                    else h=1;
+                }
+                int x = rssi_anchor_x + i*2;
+                int y0 = 10;
+                if(x < battery_anchor_x -2){
+                    // clear only sparkline strip subtle
+                    canvas.fillRect(x, 0, 1, 12, 0x0841);
+                    if(h>0) canvas.fillRect(x, y0 - h, 1, h, 0x07E0);
+                    else canvas.fillRect(x, 9, 1, 1, 0x4208);
+                }
+            }
+            } // sparkline
             if (input_dirty) {
             // Input box - drawn into canvas
             {
@@ -1583,7 +1626,7 @@ void draw_chat_view() {
         // push middle viewport at 0,12, then batch navbar/input via Display
         if (chat_dirty) canvas.pushSprite(0, 12);
         // batch navbar+input in single startWrite to reduce SPI transactions
-        if (chrome_dirty || input_dirty) {
+        if (chrome_dirty || input_dirty || sparkline_dirty) {
             M5Cardputer.Display.waitDisplay();
         M5Cardputer.Display.startWrite();
         // navbar
@@ -1695,6 +1738,7 @@ void draw_chat_view() {
     if (chat_dirty) ui_needs_redraw = false;
     if (chrome_dirty) chrome_needs_redraw = false;
     if (input_dirty) input_needs_redraw = false;
+    if (sparkline_dirty) sparkline_needs_redraw = false;
 }
 
 void handle_keyboard_inputs() {
@@ -1847,7 +1891,7 @@ void handle_keyboard_inputs() {
                     file.printf("wifi_ssid=%s\nwifi_pass=%s\nirc_nick=%s\n", wifi_ssid, wifi_pass, irc_nick);
                     file.printf("bnc_host=%s\nbnc_port=%d\nbnc_user=%s\nbnc_pass=%s\n", bnc_host, bnc_port, bnc_user, bnc_pass);
                     file.printf("channel_log_enabled=%d\nscreen_brightness=%d\n", channel_log_enabled, screen_brightness);
-                    file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\nuse_dst=%d\nuse_light_theme=%d\ntheme_accent=%d\ntext_scale=%d\nspeaker_enabled=%d\n", current_tz_idx, use_12_hour_format, use_dst, use_light_theme, theme_accent, text_scale, speaker_enabled);
+                    file.printf("current_tz_idx=%d\nuse_12_hour_format=%d\nuse_dst=%d\nuse_light_theme=%d\ntheme_accent=%d\ntext_scale=%d\nspeaker_enabled=%d\ndebug_log_enabled=%d\n", current_tz_idx, use_12_hour_format, use_dst, use_light_theme, theme_accent, text_scale, speaker_enabled, debug_log_enabled);
                     file.close();
                     Serial.println("[STORAGE-SYNC] Configuration parameters permanently synchronized to micro-SD card.");
                     set_led_mode(19); // Lime Green Blip for auto-saver
@@ -2127,7 +2171,7 @@ void handle_keyboard_inputs() {
                 if (current_app_mode == MODE_WIFI) {
                     int sc = WiFi.scanComplete();
                     if (sc > 0) { if (sc>5) sc=5; max_limit = 4 + sc; } else max_limit = 4;
-                } else if (current_app_mode == MODE_SETTINGS) max_limit = 3;
+                } else if (current_app_mode == MODE_SETTINGS) max_limit = 4;
                 else if (current_app_mode == MODE_THEME) max_limit = 4;
                 else if (current_app_mode == MODE_LOGS) max_limit = 9;
                 else if (current_app_mode == MODE_WHOIS) max_limit = 0;
@@ -2158,6 +2202,7 @@ void handle_keyboard_inputs() {
                 else if (menu_selection_idx == 1) { use_12_hour_format = !use_12_hour_format; }
                 else if (menu_selection_idx == 2) { use_dst = !use_dst; sync_ntp_timezone(); }
                 else if (menu_selection_idx == 3) { channel_log_enabled = !channel_log_enabled; }
+                else if (menu_selection_idx == 4) { debug_log_enabled = !debug_log_enabled; if(debug_log_enabled) log_system("Debug ON"); else log_system("Debug OFF"); }
             } else if (current_app_mode == MODE_THEME) {
                 if (menu_selection_idx == 0) { use_light_theme = !use_light_theme; }
                 else if (menu_selection_idx == 1) { theme_accent = (theme_accent + (forward?1:-1) +4)%4; }
@@ -2235,6 +2280,11 @@ void handle_keyboard_inputs() {
         }
         else if (menu_selection_idx == 3) { // Row 4: Toggle Local Channel Log File Recording
             channel_log_enabled = !channel_log_enabled;
+        }
+        else if (menu_selection_idx == 4) { // Row 5: Debug Log RAM ring
+            debug_log_enabled = !debug_log_enabled;
+            if(debug_log_enabled) log_system("Debug ON RAM ring");
+            else log_system("Debug OFF");
         }
         ui_needs_redraw = true;
         return;
@@ -3610,14 +3660,14 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
-        // Periodic UI refresh for sparkline/battery/time - chrome only, not full chat hard refresh
+        // Periodic UI refresh - subtle: sparkline 500ms, time 60s, battery 5s
         {
             static unsigned long last_rssi_tick = 0;
             if (millis() - last_rssi_tick >= 500) {
                 last_rssi_tick = millis();
                 int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
                 rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
-                if (current_app_mode == MODE_CHAT) chrome_needs_redraw = true;
+                if (current_app_mode == MODE_CHAT) sparkline_needs_redraw = true;
             }
             static unsigned long last_time_tick = 0;
             if (millis() - last_time_tick >= 1000) {
@@ -3634,7 +3684,7 @@ void custom_ui_loop_task(void* pvParameters) {
             if (ui_scroll_y_interpolation > 0.0f) {
                 ui_scroll_y_interpolation = 0.0f;
             }
-            if (ui_needs_redraw || chrome_needs_redraw || input_needs_redraw) draw_chat_view();
+            if (ui_needs_redraw || chrome_needs_redraw || input_needs_redraw || sparkline_needs_redraw) draw_chat_view();
             esp_task_wdt_reset(); // TWDT heartbeat for Core1 UI task (4s)
         }
 
