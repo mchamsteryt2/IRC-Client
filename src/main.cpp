@@ -260,16 +260,21 @@ void set_led_mode(uint8_t mode) {
             
         default: r = 30; g = 30; b = 30; break;
     }
-    // LED on Cardputer Adv is hardware-tied to backlight rail (pin 21 supply follows
-    // Display.setBrightness PWM). Previous code double-dimmed: hardware PWM * software
-    // gamma (80 -> hw 31% * sw 7% = 2% -> off). Remove software scaling and let hardware
-    // handle dimming directly so idle heartbeat (b 0-24) at display 80 remains ~7 visible.
-    // Critical alerts will still pulse via hardware dim; no extra software scaling needed.
+    // LED on Cardputer Adv is hardware-tied to backlight rail (GPIO38). Hardware PWM at
+    // 80/100/150 caused WS2812 VCC ripple -> flicker (even at normal 80). Keep hardware
+    // rail at 255 for stable supply and do dimming in software via gamma, so heartbeat
+    // stays smooth. Floors keep idle visible even when display is logically dimmed.
     {
-        // Intentionally no br scaling - hardware tie already dims LED with backlight.
-        // Keep RGB as-is for correct hue; if constant brightness is desired, compensate
-        // with 1/br here, but for now let LED follow display for power saving.
-        (void)g_backlight_level;
+        float br = g_backlight_level / 255.0f;
+        if (br < 0) br = 0; if (br > 1) br = 1;
+        br = powf(br, 2.2f);
+        float floor = 0.40f;
+        if (mode == 1) floor = 0.60f; // idle heartbeat
+        if (mode == 6 || mode == 55 || mode == 9 || mode == 22 || mode == 7 || mode == 15) floor = 0.75f;
+        if (br < floor) br = floor;
+        r = (uint8_t)(r * br);
+        g = (uint8_t)(g * br);
+        b = (uint8_t)(b * br);
     }
     neopixelWrite(21, r, g, b); // Deliver bits down to physical Pin 21
 }
@@ -3246,14 +3251,17 @@ void custom_ui_loop_task(void* pvParameters) {
             }
         }
         g_backlight_level = target_backlight_level;
-        { static int last_bl=-1; static unsigned long last_bl_ms=0;
-          if(target_backlight_level!=last_bl && millis()-last_bl_ms>100){
-              // avoid LE DC clash with Speaker tone (shared timer)
-              if(!M5.Speaker.isPlaying()){
-                  M5Cardputer.Display.setBrightness(target_backlight_level);
-                  last_bl=target_backlight_level; last_bl_ms=millis();
-              }
+        // FIX: Keep hardware backlight rail at 255 (100% DC) to stop PWM flicker on both
+        // display and hardware-tied LED (GPIO38). At 80/100/150 PWM the rail pulses and
+        // WS2812 brown-out + display flicker. Dimming is now handled in software via
+        // g_backlight_level gamma in set_led_mode() and via pixel dimming, not hardware PWM.
+        { static bool hw_init=false;
+          if(!hw_init){
+              M5Cardputer.Display.setBrightness(255);
+              hw_init=true;
           }
+          // Intentionally do not drive Display.setBrightness(target) - would re-introduce flicker
+          (void)target_backlight_level;
         }
         // Periodic log flush every 1s to make channel logs visible (was only on 512B full)
         {
