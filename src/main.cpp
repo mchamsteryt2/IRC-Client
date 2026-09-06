@@ -167,7 +167,7 @@ bool network_handshake_complete[MAX_NETWORKS] = {false};
 unsigned long network_reconnect_cooldown[MAX_NETWORKS] = {0};
 volatile float ui_scroll_y_interpolation = 0.0f;
 volatile bool kb_interrupt_fired = false;
-void IRAM_ATTR kb_isr() { kb_interrupt_fired = true; last_user_keyboard_input_tick = millis(); }
+void IRAM_ATTR kb_isr() { kb_interrupt_fired = true; }
 unsigned long last_input_time = 0;
 unsigned long last_server_activity = 0;
 String input_buffer;
@@ -818,7 +818,19 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         cl.is_highlight = is_mention(msg, irc_nick) && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0 && !is_ignored(source) && !t.muted;
         if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
         t.line_count++;
-        if (!is_scrollback_active && !scrollback_mode_active) ui_scroll_y_interpolation = 12.0f;
+        // Preserve scrollback viewport: if user is scrolled back, keep view pinned by bumping offset
+        if ((is_scrollback_active || scrollback_mode_active) && target_idx == current_tab_index) {
+            int eff = t.line_count;
+            if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
+            // bump offset so new message doesn't shift visible window (unless already at live edge)
+            if (scrollback_offset < eff - 1) {
+                scrollback_offset++;
+                scrollback_offset_idx = scrollback_offset;
+            }
+        } else {
+            // no bounce animation - keep at 0 to avoid flicker on flood
+            // ui_scroll_y_interpolation = 12.0f; // disabled for flicker
+        }
 
     // Dynamic Session Log Rotator with High-Speed Write Caching (512-byte sector cache)
     if (channel_log_enabled == 1 && safe_mode_active == false) {
@@ -955,7 +967,7 @@ bool is_mention(const char* msg, const char* nick) {
 // 🎬 RETRO-TERMINAL GRAPHICS RENDERING ENGINE
 // ==========================================
 void draw_chat_view() {
-    if (!ui_needs_redraw) return;
+    if (!ui_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
     canvas.setTextSize(text_scale);
     // Fluid geometry anchored to active rotation (135x240 vertical vs 240x135 landscape)
     int display_width = M5Cardputer.Display.width();
@@ -966,7 +978,8 @@ void draw_chat_view() {
     int battery_anchor_x = is_vertical ? 110 : 225;
     int wire_y = is_vertical ? 224 : 121;
     int input_box_y = is_vertical ? 225 : 121;
-    int baseline_y = is_vertical ? 208 : (97 + (int)ui_scroll_y_interpolation);
+    // Disable scroll interpolation animation (was 97+interpolation causing 12px bounce flicker on every new message / flood)
+    int baseline_y = is_vertical ? 208 : 97;
     int viewport_top_y = 12;
     int textbox_height = is_vertical ? (display_height - input_box_y) : 14;
 
@@ -1186,36 +1199,68 @@ void draw_chat_view() {
     // ==========================================
     // STATE 3: LIVE TERMINAL CHAT VIEWPORT
     // ==========================================
-    // Ensure canvas valid without holding mutex (allocation may block)
+    // Ensure canvas valid - no PSRAM: keep whatever size succeeded at boot (240x109) to avoid 64KB alloc failure on 320KB heap
+    // PSRAM boards get 240x135 atomic full-screen; no-PSRAM keeps 240x109 middle viewport + separate navbar/input to save RAM
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] canvas 0 in draw, recreating viewport");
         canvas.deleteSprite();
-        if(!canvas.createSprite(240,135)){
-            canvas.createSprite(240,109);
+        bool psram = psramFound() && ESP.getPsramSize() > 0;
+        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        // Need ~65KB for 240x135*2 + overhead; require 70KB contiguous
+        if(psram || largest >= 70000){
+            if(!canvas.createSprite(240,135)) canvas.createSprite(240,109);
+        } else {
+            if(!canvas.createSprite(240,109)) canvas.createSprite(135,214);
         }
+        canvas.setTextSize(text_scale);
     }
+    bool is_fullscreen = (canvas.width()==240 && canvas.height()==135);
+    // Snapshot chat state under mutex (short critical section) to avoid holding mutex during heavy rendering
+    Tab snapTab;
+    uint8_t snap_gTabCount = 0;
+    uint8_t snap_current_tab = current_tab_index;
+    bool snap_is_scrollback = is_scrollback_active;
+    bool snap_scroll_active = scrollback_mode_active;
+    int snap_scrollback = scrollback_offset;
+    bool snap_has_data = false;
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        canvas.fillSprite(0x0000);
-        // Clamp tab index and line_count to avoid OOB when network task overflowed count
         if (current_tab_index >= MAX_TABS) current_tab_index = 0;
         if (current_tab_index >= gTabCount && gTabCount > 0) current_tab_index = gTabCount - 1;
-        Tab &t = gTabs[current_tab_index];
+        snap_current_tab = current_tab_index;
+        snap_gTabCount = gTabCount;
+        snap_is_scrollback = is_scrollback_active;
+        snap_scroll_active = scrollback_mode_active;
+        snap_scrollback = scrollback_offset;
+        // copy current tab
+        snapTab = gTabs[snap_current_tab];
+        // copy highlight state for overlay/sidebar (small snapshot)
+        snap_has_data = true;
+        xSemaphoreGive(irc_mutex);
+    } else {
+        // mutex busy - skip frame to avoid tearing, will retry next 20ms
+        return;
+    }
+    {
+        canvas.fillSprite(0x0000);
+        Tab &t = snapTab;
         int effective_count = t.line_count;
         if (effective_count > MSG_BUFFER_SIZE) effective_count = MSG_BUFFER_SIZE;
         if (effective_count < 0) effective_count = 0;
-        // clamp scrollback to valid window
-        if (scrollback_offset >= effective_count) {
-            scrollback_offset = effective_count > 0 ? effective_count - 1 : 0;
-            scrollback_offset_idx = scrollback_offset;
+        // keep scrollback sticky - if new messages arrived while scrolled back, effective_count grew but snap_scrollback is old; view should stay, NEW separator will show
+        int cur_scrollback = snap_scrollback;
+        if (cur_scrollback >= effective_count) {
+            cur_scrollback = effective_count > 0 ? effective_count - 1 : 0;
         }
-        if (scrollback_mode_active && scrollback_offset < 0) scrollback_offset = 0;
-        int current_y = baseline_y; 
-        int starting_index = (effective_count - 1) - scrollback_offset;
+        if (snap_scroll_active && cur_scrollback < 0) cur_scrollback = 0;
+        // sync globals for other subsystems (navbar uses global)
+        scrollback_offset = cur_scrollback;
+        scrollback_offset_idx = cur_scrollback;
+        is_scrollback_active = snap_is_scrollback;
+        int current_y = baseline_y;
+        int starting_index = (effective_count - 1) - cur_scrollback;
         if (starting_index < 0) starting_index = 0;
         if (starting_index >= effective_count) starting_index = effective_count - 1;
         if (effective_count == 0) starting_index = -1;
-        scrollback_offset_idx = scrollback_offset;
-        is_scrollback_active = scrollback_mode_active;
 
         for (int i = starting_index; i >= 0; i--) {
             if (current_y < viewport_top_y) break;
@@ -1400,208 +1445,247 @@ void draw_chat_view() {
         }
         // TextBox Workspace Integrity: Y = 225 to 240 must remain empty - ensure cleared
         if (is_vertical) {
-            // Reserve 225-240 completely empty wide-open for typed text across 135px portrait glass
             canvas.fillRect(0, 225, display_width, display_height - 225, 0x0000);
         }
-        xSemaphoreGive(irc_mutex);
-    }
-    canvas.pushSprite(0, 12);
-
-    // NAVBAR RENDERING SYSTEM - partial refresh: only redraw when data changes
-    // to avoid full-screen flicker every chat frame. Sidebar elements (battery, RSSI,
-    // lock, dots) are part of navbar region and update via same dirty check.
-    {
-        static int last_nav_tab = -1;
-        static int last_nav_gTabCount = -1;
-        static char last_nav_server[32]={0};
-        static char last_nav_chan[32]={0};
-        static int last_nav_batt = -1;
-        static int last_nav_rssi_hash = -999;
-        static int last_nav_min = -1;
-        static bool last_nav_vertical = false;
-        static unsigned long last_nav_force_ms = 0;
-        // compute current navbar state hash without drawing
-        int cur_batt = (int)get_calibrated_battery_percentage();
-        int cur_rssi_hash = 0;
-        for(int i=0;i<8;i++) cur_rssi_hash = cur_rssi_hash*31 + rssi_history[i];
-        struct tm ti; int cur_min = -1;
-        if(getLocalTime(&ti, 5)) cur_min = ti.tm_hour*60 + ti.tm_min;
-        else cur_min = (int)((millis()/1000 + adj_time)/60)%1440;
-        bool cur_vertical = is_vertical;
-        // topic dot
-        bool cur_has_topic = gTabs[current_tab_index].topic[0];
-        // highlight dots hash
-        int cur_dot_hash = 0;
-        for(int t=1; t<gTabCount && t<8; t++){
-            bool hi=false; for(int l=0;l<gTabs[t].line_count;l++) if(gTabs[t].lines[l].is_highlight){hi=true;break;}
-            cur_dot_hash = cur_dot_hash*7 + (hi?2: (gTabs[t].line_count>0?1:0));
-        }
-        bool navbar_dirty = false;
-        if(last_nav_tab != (int)current_tab_index) navbar_dirty=true;
-        else if(last_nav_gTabCount != (int)gTabCount) navbar_dirty=true;
-        else if(strcmp(last_nav_server, gTabs[current_tab_index].server)!=0) navbar_dirty=true;
-        else if(strcmp(last_nav_chan, gTabs[current_tab_index].name)!=0) navbar_dirty=true;
-        else if(last_nav_batt != cur_batt) navbar_dirty=true;
-        else if(last_nav_rssi_hash != cur_rssi_hash) navbar_dirty=true;
-        else if(last_nav_min != cur_min) navbar_dirty=true;
-        else if(last_nav_vertical != cur_vertical) navbar_dirty=true;
-        else if(cur_has_topic != (last_nav_min!=-1 && last_nav_min==cur_min && cur_has_topic)) {} // handled via redraw when topic changes
-        else if(last_nav_force_ms==0 || millis()-last_nav_force_ms>1000) navbar_dirty=true; // periodic refresh 1Hz for sparkline/battery
-        else if(cur_dot_hash != last_nav_batt) {} // already covered
-        // force if ui_needs_redraw was due to mode change (navigator/settings) - always redraw navbar then
-        if(current_app_mode != MODE_CHAT) navbar_dirty=true;
-        if(!navbar_dirty){
-            // skip navbar redraw, keep last frame's top 12px intact (no flicker)
+        if(is_fullscreen){
+            // --- Fullscreen atomic path (PSRAM): navbar+input into canvas, single push at 0,0 eliminates flicker ---
+            // RSSI history update (throttled 500ms, no draw yet)
+            {
+                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
+                static unsigned long last_hist = 0;
+                if (millis() - last_hist > 500) { last_hist = millis(); rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8; }
+            }
+            // Navbar (0,0,240,12) - drawn into canvas
+            canvas.fillRect(0, 0, display_width, 12, 0x0841);
+            {
+                char nav_server_str[32]={0}, nav_chan_str[32]={0};
+                strncpy(nav_server_str, snapTab.server,31); strncpy(nav_chan_str, snapTab.name,31);
+                char full_nav_str[70]={0}; snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",nav_server_str,nav_chan_str);
+                int nav_text_width = canvas.textWidth(full_nav_str);
+                char display_server[32]={0}; strncpy(display_server, nav_server_str,31);
+                if (nav_text_width > navbar_clamp_x) {
+                    int server_len = strlen(nav_server_str);
+                    if (server_len > 6) { strncpy(display_server, nav_server_str,4); display_server[4]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+                    else if (server_len > 4) { strncpy(display_server, nav_server_str,2); display_server[2]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+                    snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",display_server,nav_chan_str);
+                    nav_text_width = canvas.textWidth(full_nav_str);
+                    if (nav_text_width > navbar_clamp_x) {
+                        int max_chan = is_vertical ? 6 : 10;
+                        if ((int)strlen(nav_chan_str) > max_chan) { nav_chan_str[max_chan-3]='\0'; strcat(nav_chan_str,"..."); }
+                    }
+                }
+                canvas.setTextColor(0x7BEF, 0x0841); canvas.setCursor(2, 2);
+                canvas.printf("[%s]", display_server);
+                int chan_x = is_vertical ? 45 : 54;
+                canvas.setTextColor(0xFFFF, 0x0841); canvas.setCursor(chan_x, 2);
+                char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 8);
+                canvas.print(truncated_name);
+                if (WiFi.status() != WL_CONNECTED) {
+                    canvas.setTextColor(0x7BEF, 0x0841); canvas.setCursor(rssi_anchor_x, 2); canvas.print("---");
+                } else {
+                    for(int i=0;i<8;i++){
+                        int idx = (rssi_history_idx + i) %8;
+                        int8_t v = rssi_history[idx];
+                        int h=0;
+                        if(v != -127){
+                            if(v >= -50) h=6;
+                            else if(v >= -60) h=4;
+                            else if(v >= -75) h=3;
+                            else if(v >= -90) h=2;
+                            else h=1;
+                        }
+                        int x = rssi_anchor_x + i*2;
+                        int y0 = 10;
+                        if(x < battery_anchor_x -2){
+                            if(h>0) canvas.fillRect(x, y0 - h, 1, h, 0x07E0);
+                            else canvas.fillRect(x, 9, 1, 1, 0x4208);
+                        }
+                    }
+                }
+                canvas.setTextColor(0xFFFF, 0x0841); canvas.setCursor(battery_anchor_x, 2);
+                canvas.printf("%d%%", (int)get_calibrated_battery_percentage());
+                if (!is_vertical) {
+                    struct tm timeinfo;
+                    int hh, mm;
+                    if (getLocalTime(&timeinfo, 30)) { hh=timeinfo.tm_hour; mm=timeinfo.tm_min; }
+                    else {
+                        unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60;
+                    }
+                    if (use_12_hour_format) { int h12 = hh%12; if(h12==0) h12=12; hh=h12; }
+                    canvas.setTextColor(0x7BEF, 0x0841); canvas.setCursor(150, 2);
+                    canvas.printf("%02d:%02d", hh, mm);
+                    canvas.setTextColor(0xFFFF, 0x0841); canvas.setCursor(185, 2);
+                    canvas.printf("%d/%d", (int)snap_current_tab+1, (int)snap_gTabCount);
+                    if (snapTab.topic[0]) { canvas.setTextColor(0xFD20,0x0841); canvas.setCursor(205,2); canvas.print("*"); }
+                }
+                for (int t = 1; t < snap_gTabCount; t++) {
+                    if (t == snap_current_tab) continue;
+                    int dot_x = 2 + (t * 6);
+                    int dot_limit = is_vertical ? 60 : 130;
+                    if (dot_x > dot_limit) break;
+                    bool has_unread_highlight = false;
+                    bool has_unread_msg = false;
+                    if (t < MAX_TABS) {
+                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(2))==pdTRUE) {
+                            has_unread_msg = (gTabs[t].line_count > 0);
+                            for (int l = 0; l < gTabs[t].line_count; l++) if (gTabs[t].lines[l].is_highlight) { has_unread_highlight = true; break; }
+                            xSemaphoreGive(irc_mutex);
+                        } else {
+                            has_unread_msg = true;
+                        }
+                    }
+                    if (has_unread_highlight) canvas.fillRect(dot_x, 10, 3, 2, 0xFD20);
+                    else if (has_unread_msg) canvas.fillRect(dot_x, 10, 3, 2, 0x07FF);
+                }
+            }
+            // Input box - drawn into canvas
+            {
+                canvas.setTextSize(text_scale);
+                canvas.fillRect(0, input_box_y, display_width, textbox_height, 0x0000);
+                canvas.drawFastHLine(0, wire_y, display_width, 0x7BEF);
+                canvas.setTextColor(0xFD20, 0x0000);
+                int input_cursor_y = is_vertical ? (text_scale==2? 223 : 227) : (text_scale==2? 118 : 124);
+                canvas.setCursor(4, input_cursor_y);
+                canvas.print("> ");
+                canvas.setTextColor(0xFFFF, 0x0000);
+                { int l=input_buffer.length(); const char* s=input_buffer.c_str();
+                  int off=0; if(l>31) off=l-31;
+                  int dlen=l-off; if(is_vertical && dlen>18) off=l-18;
+                  if (l>0) canvas.print(s+off);
+                }
+                canvas.setTextSize(1);
+                {
+                    int rem = 200 - (int)input_buffer.length();
+                    int cnt_x = display_width - 26;
+                    canvas.setCursor(cnt_x, input_cursor_y);
+                    if ((int)input_buffer.length() >= 190) canvas.setTextColor(0xF800, 0x0000);
+                    else canvas.setTextColor(0x7BEF, 0x0000);
+                    canvas.printf("%2d", rem);
+                }
+                canvas.setTextSize(text_scale);
+            }
         } else {
-            // update cache
-            last_nav_tab = current_tab_index;
-            last_nav_gTabCount = gTabCount;
-            strncpy(last_nav_server, gTabs[current_tab_index].server,31);
-            strncpy(last_nav_chan, gTabs[current_tab_index].name,31);
-            last_nav_batt = cur_batt;
-            last_nav_rssi_hash = cur_rssi_hash;
-            last_nav_min = cur_min;
-            last_nav_vertical = cur_vertical;
-            last_nav_force_ms = millis();
-            // fall through to actual navbar draw
-            M5Cardputer.Display.startWrite();
-            M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
-    char nav_server_str[32]={0}, nav_chan_str[32]={0};
-    strncpy(nav_server_str, gTabs[current_tab_index].server,31); strncpy(nav_chan_str, gTabs[current_tab_index].name,31);
-    char full_nav_str[70]={0}; snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",nav_server_str,nav_chan_str);
-    int nav_text_width = canvas.textWidth(full_nav_str);
-    char display_server[32]={0}; strncpy(display_server, nav_server_str,31);
-    if (nav_text_width > navbar_clamp_x) {
-        int server_len = strlen(nav_server_str);
-        if (server_len > 6) { strncpy(display_server, nav_server_str,4); display_server[4]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
-        else if (server_len > 4) { strncpy(display_server, nav_server_str,2); display_server[2]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
-        snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",display_server,nav_chan_str);
-        nav_text_width = canvas.textWidth(full_nav_str);
-        if (nav_text_width > navbar_clamp_x) {
-            int max_chan = is_vertical ? 6 : 10;
-            if ((int)strlen(nav_chan_str) > max_chan) { nav_chan_str[max_chan-3]='\0'; strcat(nav_chan_str,"..."); }
-        }
-    }
-    M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(2, 2);
-    M5Cardputer.Display.printf("[%s]", display_server);
-    int chan_x = is_vertical ? 45 : 54;
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(chan_x, 2);
-    char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 8);
-    M5Cardputer.Display.print(truncated_name);
-
-    // Connection indicator removed - keep sparkline only per user (was bunched)
-    // RSSI sparkline 8-step ( -90→-50 ) update history - toggle Fn+B to numeric dBm
-    {
-        int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
-        static unsigned long last_hist = 0;
-        if (millis() - last_hist > 500) { last_hist = millis(); rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8; }
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2); M5Cardputer.Display.print("---");
-    } else {
-        // 8 bars sparkline only (dBm removed per user)
-        for(int i=0;i<8;i++){
-            int idx = (rssi_history_idx + i) %8;
-            int8_t v = rssi_history[idx];
-            int h=0;
-            if(v != -127){
-                if(v >= -50) h=6;
-                else if(v >= -60) h=4;
-                else if(v >= -75) h=3;
-                else if(v >= -90) h=2;
-                else h=1;
-            }
-            int x = rssi_anchor_x + i*2;
-            int y0 = 10;
-            if(x < battery_anchor_x -2){
-                if(h>0) M5Cardputer.Display.fillRect(x, y0 - h, 1, h, 0x07E0);
-                else M5Cardputer.Display.fillRect(x, 9, 1, 1, 0x4208);
+            // --- No-PSRAM fallback: middle viewport only, navbar/input via Display but with waitDisplay batching to reduce flicker ---
+            // RSSI update
+            {
+                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
+                static unsigned long last_hist = 0;
+                if (millis() - last_hist > 500) { last_hist = millis(); rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8; }
             }
         }
-    }
-    // Vertical W/D removed - sparkline only
-    M5Cardputer.Display.setCursor(battery_anchor_x, 2); 
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0841);
-    M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
-    // Repopulate navbar (landscape) - time HH:MM via NTP + tz, keep vertical tight
-    if (!is_vertical) {
-        struct tm timeinfo;
-        int hh, mm;
-        if (getLocalTime(&timeinfo, 30)) { hh=timeinfo.tm_hour; mm=timeinfo.tm_min; }
-        else { 
-            static bool ntpWarn=false;
-            if(!ntpWarn){ Serial.println("[NTP] pool blocked, fallback millis+adj_time drift"); ntpWarn=true; }
-            unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60; }
-        if (use_12_hour_format) { int h12 = hh%12; if(h12==0) h12=12; hh=h12; }
-        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(150, 2);
-        M5Cardputer.Display.printf("%02d:%02d", hh, mm);
-        M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(185, 2);
-        M5Cardputer.Display.printf("%d/%d", (int)current_tab_index+1, (int)gTabCount);
-        if (gTabs[current_tab_index].topic[0]) { M5Cardputer.Display.setTextColor(0xFD20,0x0841); M5Cardputer.Display.setCursor(205,2); M5Cardputer.Display.print("*"); }
+    } // end snapshot block
+    if(is_fullscreen){
+        canvas.pushSprite(0, 0);
     } else {
-        // Vertical tight - keep ~mentions clear, skip chan count (already at 45)
-    }
-
-    // Low-Profile Navbar Activity Indicator Dots Engine
-    for (int t = 1; t < gTabCount; t++) {
-        if (t == current_tab_index) continue;
-        int dot_x = 2 + (t * 6);
-        int dot_limit = is_vertical ? 60 : 130;
-        if (dot_x > dot_limit) break;
-        bool has_unread_highlight = false;
-        bool has_unread_msg = (gTabs[t].line_count > 0);
-        for (int l = 0; l < gTabs[t].line_count; l++) if (gTabs[t].lines[l].is_highlight) { has_unread_highlight = true; break; }
-        if (has_unread_highlight) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0xFD20);
-        else if (has_unread_msg) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0x07FF);
-    }
-            M5Cardputer.Display.endWrite();
-        } // end navbar_dirty else - skip redraw when not dirty (partial refresh)
-    }
-
-    // LOWER INPUT BOX - partial refresh: only redraw when input_buffer/text_scale/vertical changes
-    {
-        static String last_input = "";
-        static int last_scale = -1;
-        static bool last_vert = false;
-        static unsigned long last_input_ms = 0;
-        bool input_dirty = false;
-        if(last_input != input_buffer) input_dirty=true;
-        else if(last_scale != text_scale) input_dirty=true;
-        else if(last_vert != is_vertical) input_dirty=true;
-        else if(millis() - last_input_ms > 500) input_dirty=true; // periodic cursor blink refresh
-        if(input_dirty){
-            last_input = input_buffer;
-            last_scale = text_scale;
-            last_vert = is_vertical;
-            last_input_ms = millis();
-            M5Cardputer.Display.startWrite();
-    M5Cardputer.Display.setTextSize(text_scale);
-    M5Cardputer.Display.fillRect(0, input_box_y, display_width, textbox_height, 0x0000);
-    M5Cardputer.Display.drawFastHLine(0, wire_y, display_width, 0x7BEF);
-    M5Cardputer.Display.setTextColor(0xFD20, 0x0000);
-    int input_cursor_y = is_vertical ? (text_scale==2? 223 : 227) : (text_scale==2? 118 : 124);
-    M5Cardputer.Display.setCursor(4, input_cursor_y);
-    M5Cardputer.Display.print("> ");
-    M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
-    // For vertical 135px width, truncated preview without String heap (hold-safe)
-    { int l=input_buffer.length(); const char* s=input_buffer.c_str();
-      int off=0; if(l>31) off=l-31;
-      int dlen=l-off; if(is_vertical && dlen>18) off=l-18;
-      M5Cardputer.Display.print(s+off);
-    }
-    M5Cardputer.Display.setTextSize(1);
-    // Textbox counter at far-right, red at >390
-    {
-        int rem = 200 - (int)input_buffer.length();
-        int cnt_x = display_width - 26;
-        M5Cardputer.Display.setCursor(cnt_x, input_cursor_y);
-        if ((int)input_buffer.length() >= 390) M5Cardputer.Display.setTextColor(0xF800, 0x0000);
-        else M5Cardputer.Display.setTextColor(0x7BEF, 0x0000);
-        M5Cardputer.Display.printf("%2d", rem);
-    }
-            M5Cardputer.Display.endWrite();
-        } // end input_dirty
-        // input box partial refresh done, keep ui_needs_redraw for chat canvas only
+        // push middle viewport at 0,12, then batch navbar/input via Display
+        canvas.pushSprite(0, 12);
+        // batch navbar+input in single startWrite to reduce SPI transactions
+        M5Cardputer.Display.waitDisplay();
+        M5Cardputer.Display.startWrite();
+        // navbar
+        M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
+        {
+            char nav_server_str[32]={0}, nav_chan_str[32]={0};
+            strncpy(nav_server_str, snapTab.server,31); strncpy(nav_chan_str, snapTab.name,31);
+            char full_nav_str[70]={0}; snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",nav_server_str,nav_chan_str);
+            int nav_text_width = canvas.textWidth(full_nav_str);
+            char display_server[32]={0}; strncpy(display_server, nav_server_str,31);
+            if (nav_text_width > navbar_clamp_x) {
+                int server_len = strlen(nav_server_str);
+                if (server_len > 6) { strncpy(display_server, nav_server_str,4); display_server[4]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+                else if (server_len > 4) { strncpy(display_server, nav_server_str,2); display_server[2]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+                snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",display_server,nav_chan_str);
+                nav_text_width = canvas.textWidth(full_nav_str);
+                if (nav_text_width > navbar_clamp_x) {
+                    int max_chan = is_vertical ? 6 : 10;
+                    if ((int)strlen(nav_chan_str) > max_chan) { nav_chan_str[max_chan-3]='\0'; strcat(nav_chan_str,"..."); }
+                }
+            }
+            M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(2, 2);
+            M5Cardputer.Display.printf("[%s]", display_server);
+            int chan_x = is_vertical ? 45 : 54;
+            M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(chan_x, 2);
+            char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 8);
+            M5Cardputer.Display.print(truncated_name);
+            if (WiFi.status() != WL_CONNECTED) {
+                M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2); M5Cardputer.Display.print("---");
+            } else {
+                for(int i=0;i<8;i++){
+                    int idx = (rssi_history_idx + i) %8;
+                    int8_t v = rssi_history[idx];
+                    int h=0;
+                    if(v != -127){
+                        if(v >= -50) h=6;
+                        else if(v >= -60) h=4;
+                        else if(v >= -75) h=3;
+                        else if(v >= -90) h=2;
+                        else h=1;
+                    }
+                    int x = rssi_anchor_x + i*2;
+                    int y0 = 10;
+                    if(x < battery_anchor_x -2){
+                        if(h>0) M5Cardputer.Display.fillRect(x, y0 - h, 1, h, 0x07E0);
+                        else M5Cardputer.Display.fillRect(x, 9, 1, 1, 0x4208);
+                    }
+                }
+            }
+            M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(battery_anchor_x, 2);
+            M5Cardputer.Display.printf("%d%%", (int)get_calibrated_battery_percentage());
+            if (!is_vertical) {
+                struct tm timeinfo; int hh, mm;
+                if (getLocalTime(&timeinfo, 30)) { hh=timeinfo.tm_hour; mm=timeinfo.tm_min; }
+                else { unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60; }
+                if (use_12_hour_format) { int h12 = hh%12; if(h12==0) h12=12; hh=h12; }
+                M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(150, 2);
+                M5Cardputer.Display.printf("%02d:%02d", hh, mm);
+                M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(185, 2);
+                M5Cardputer.Display.printf("%d/%d", (int)snap_current_tab+1, (int)snap_gTabCount);
+                if (snapTab.topic[0]) { M5Cardputer.Display.setTextColor(0xFD20,0x0841); M5Cardputer.Display.setCursor(205,2); M5Cardputer.Display.print("*"); }
+            }
+            for (int t = 1; t < snap_gTabCount; t++) {
+                if (t == snap_current_tab) continue;
+                int dot_x = 2 + (t * 6);
+                int dot_limit = is_vertical ? 60 : 130;
+                if (dot_x > dot_limit) break;
+                bool hi=false; bool has=false;
+                if (t < MAX_TABS) {
+                    if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(2))==pdTRUE) {
+                        has = (gTabs[t].line_count > 0);
+                        for (int l=0;l<gTabs[t].line_count;l++) if(gTabs[t].lines[l].is_highlight){hi=true;break;}
+                        xSemaphoreGive(irc_mutex);
+                    } else has=true;
+                }
+                if (hi) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0xFD20);
+                else if (has) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0x07FF);
+            }
+        }
+        // input box via Display
+        {
+            M5Cardputer.Display.setTextSize(text_scale);
+            M5Cardputer.Display.fillRect(0, input_box_y, display_width, textbox_height, 0x0000);
+            M5Cardputer.Display.drawFastHLine(0, wire_y, display_width, 0x7BEF);
+            M5Cardputer.Display.setTextColor(0xFD20, 0x0000);
+            int input_cursor_y = is_vertical ? (text_scale==2? 223 : 227) : (text_scale==2? 118 : 124);
+            M5Cardputer.Display.setCursor(4, input_cursor_y);
+            M5Cardputer.Display.print("> ");
+            M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
+            { int l=input_buffer.length(); const char* s=input_buffer.c_str();
+              int off=0; if(l>31) off=l-31;
+              int dlen=l-off; if(is_vertical && dlen>18) off=l-18;
+              if(l>0) M5Cardputer.Display.print(s+off);
+            }
+            M5Cardputer.Display.setTextSize(1);
+            {
+                int rem = 200 - (int)input_buffer.length();
+                int cnt_x = display_width - 26;
+                M5Cardputer.Display.setCursor(cnt_x, input_cursor_y);
+                if ((int)input_buffer.length() >= 190) M5Cardputer.Display.setTextColor(0xF800, 0x0000);
+                else M5Cardputer.Display.setTextColor(0x7BEF, 0x0000);
+                M5Cardputer.Display.printf("%2d", rem);
+            }
+            M5Cardputer.Display.setTextSize(text_scale);
+        }
+        M5Cardputer.Display.endWrite();
     }
     ui_needs_redraw = false;
 }
@@ -3216,7 +3300,17 @@ void irc_network_task(void* pvParameters) {
                             cl.is_highlight = is_mention(actual_msg.c_str(), irc_nick) && !t.muted;
                             if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
                             if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
-                            if (!is_scrollback_active && !scrollback_mode_active) ui_scroll_y_interpolation = 12.0f;
+                            // preserve scrollback viewport
+                            if ((is_scrollback_active || scrollback_mode_active) && target_tab_slot == current_tab_index) {
+                                int eff = t.line_count;
+                                if (eff > MSG_BUFFER_SIZE) eff = MSG_BUFFER_SIZE;
+                                if (scrollback_offset < eff - 1) {
+                                    scrollback_offset++;
+                                    scrollback_offset_idx = scrollback_offset;
+                                }
+                            } else {
+                                // disabled bounce animation to avoid flood flicker
+                            }
                             
                             xSemaphoreGive(irc_mutex);
                             ui_needs_redraw = true;
@@ -3370,17 +3464,14 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
-        // Hardware Frame-Rate Governor Shield
-        // Locks sprite writes to exactly 50 FPS (20ms intervals) to completely eliminate diagonal CRT screen tearing!
+        // Hardware Frame-Rate Governor Shield - 30 FPS (33ms) reduces SPI load and flood flicker, atomic push eliminates tearing
         static unsigned long last_hardware_frame_tick = 0;
-        
-        if (millis() - last_hardware_frame_tick >= 20) {
+        // Coalesce flood: if many messages arrived, limit to 30fps; interpolation disabled (no bounce) to avoid extra frames
+        if (millis() - last_hardware_frame_tick >= 33) {
             last_hardware_frame_tick = millis();
-            // Fractional scroll interpolation decay step (12.0f -> 0)
+            // interpolation disabled - keep at 0
             if (ui_scroll_y_interpolation > 0.0f) {
-                ui_scroll_y_interpolation -= 2.0f;
-                if (ui_scroll_y_interpolation < 0.0f) ui_scroll_y_interpolation = 0.0f;
-                ui_needs_redraw = true;
+                ui_scroll_y_interpolation = 0.0f;
             }
             if (ui_needs_redraw) draw_chat_view();
             esp_task_wdt_reset(); // TWDT heartbeat for Core1 UI task (4s)
@@ -3441,23 +3532,21 @@ void setup() {
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
     use_light_theme=false; text_scale=1;
-    // Create canvas sprite for middle viewport - must be done after Display init
-    // Check heap and fallback if 240x135 fails (black screen)
+    // Create full-screen canvas (240x135) for atomic push - eliminates navbar/input flicker
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
-    if(!canvas.createSprite(240, 109)){
-        Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
+    if(!canvas.createSprite(240, 135)){
+        Serial.println("[GFX] 240x135 sprite fail, trying 240x109 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
-        if(!canvas.createSprite(135, 214)){
-            Serial.println("[GFX] 135x214 fail, trying 240x100");
-            canvas.createSprite(240, 100);
+        if(!canvas.createSprite(240, 109)){
+            Serial.println("[GFX] 240x109 fail, trying 135x214");
+            canvas.createSprite(135, 214);
         }
     }
     if(canvas.width()==0 || canvas.height()==0){
-        Serial.println("[GFX] sprite still 0, retry 240x109 after heap trim");
-        // trim gTabs to free heap then retry
+        Serial.println("[GFX] sprite still 0, retry 240x135 after heap trim");
         for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
         canvas.deleteSprite();
-        canvas.createSprite(240,109);
+        canvas.createSprite(240,135);
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
     canvas.fillSprite(0x0000);
@@ -3552,10 +3641,10 @@ void setup() {
     // Force visible brightness at boot (180 keeps LED rail alive, was 80 -> LED off)
     M5Cardputer.Display.setBrightness(180);
     g_backlight_level=180;
-    // Ensure canvas is valid before boot (viewport 109)
+    // Ensure canvas is valid before boot (full-screen 135)
     if(canvas.width()==0 || canvas.height()==0){
         canvas.deleteSprite();
-        canvas.createSprite(240,109);
+        canvas.createSprite(240,135);
     }
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
