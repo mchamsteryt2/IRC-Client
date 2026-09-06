@@ -29,6 +29,7 @@ struct Tab {
     char server[32];
     ChatLine lines[MSG_BUFFER_SIZE];
     int line_count;
+    int head;
     char topic[64];
     char nicks[12][16];
     uint8_t nick_count;
@@ -375,7 +376,18 @@ void sync_new_nick_to_sd(const char* new_nick) {
 void purge_old_logs() {
     if (safe_mode_active) return;
     Serial.println("[STORAGE] Launching automated 7-day log cleanup pass...");
-    
+    // System logs 30d purge
+    File sdir = SD.open("/irc/system");
+    if (sdir && sdir.isDirectory()) {
+        File sf = sdir.openNextFile();
+        while(sf){ 
+            // keep 30d: if file older than 30 days (approx via name date), or >512KB, remove
+            if(!sf.isDirectory() && sf.size()>512000){ String p=String(sf.path()); sf.close(); SD.remove(p.c_str()); }
+            else sf.close();
+            sf = sdir.openNextFile();
+        }
+        sdir.close();
+    }
     File dir = SD.open("/irc/logs");
     if (!dir || !dir.isDirectory()) {
         SD.mkdir("/irc/logs"); // Force self-heal and mount missing tracking folders on boot
@@ -443,7 +455,7 @@ void wdt_emergency_flush() {
     flush_log_cache();
 }
 void log_system(const char* fmt, ...) {
-    if (safe_mode_active) return;
+    // always log to SD, even in safe_mode (system logs are critical)
     char buf[160];
     va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
     unsigned long sec = millis()/1000 + adj_time;
@@ -1184,7 +1196,8 @@ void draw_chat_view() {
             
             uint16_t row_bg = (i % 2 == 0) ? 0x0000 : 0x0841;
             int text_start_x = is_vertical ? 45 : ((current_tab_index == 0) ? 110 : 70);
-            String msg_text = t.lines[i].message;
+            ChatLine &curLine = t.lines[(t.head + i) % MSG_BUFFER_SIZE];
+            String msg_text = curLine.message;
             int current_char_pos = 0;
             bool first_line_pass = true;
             while (current_char_pos < msg_text.length()) {
@@ -1211,13 +1224,13 @@ void draw_chat_view() {
                     int vline_h = is_vertical ? wire_y : 120;
                     canvas.drawFastVLine(40, 0, vline_h, 0x7BEF); 
                     char shortened_nick[9] = {0};
-                    if (strlen(t.lines[i].nick) > 8) {
-                        strncpy(shortened_nick, t.lines[i].nick, 6);
+                    if (strlen(curLine.nick) > 8) {
+                        strncpy(shortened_nick, curLine.nick, 6);
                         strcat(shortened_nick, "..");
                     } else {
                         strncpy(shortened_nick, t.lines[i].nick, 8);
                     }
-                    if (t.lines[i].is_highlight) { 
+                    if (curLine.is_highlight) { 
                         canvas.fillRect(2, current_y - 1, 36, 11, 0xFD20); canvas.setTextColor(0xFFFF); 
                     } else { 
                         canvas.setTextColor(get_nick_palette_color(t.lines[i].nick)); 
@@ -1228,7 +1241,7 @@ void draw_chat_view() {
                     first_line_pass = false;
                 }
                 
-                canvas.setTextColor(t.lines[i].color); 
+                canvas.setTextColor(curLine.color); 
                 canvas.setCursor(active_render_x, current_y);
                 canvas.print(sub_line);
                 current_y -= 12 * text_scale; 
@@ -1388,14 +1401,7 @@ void draw_chat_view() {
     char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str.c_str(), is_vertical ? 6 : 8);
     M5Cardputer.Display.print(truncated_name);
 
-    // Connection indicator
-    int conn_x = is_vertical ? 75 : 145;
-    // RSSI anchor already at rssi_anchor_x, but keep conn indicator near RSSI for compact vertical
-    if (!is_vertical) {
-        M5Cardputer.Display.setCursor(conn_x, 2);
-        if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
-        else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
-    }
+    // Connection indicator removed - keep sparkline only per user (was bunched)
     // RSSI sparkline 8-step ( -90→-50 ) update history - toggle Fn+B to numeric dBm
     {
         int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
@@ -1404,11 +1410,8 @@ void draw_chat_view() {
     }
     if (WiFi.status() != WL_CONNECTED) {
         M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2); M5Cardputer.Display.print("---");
-    } else if (show_dBm) {
-        M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(rssi_anchor_x, 2);
-        M5Cardputer.Display.printf("%ddBm", WiFi.RSSI());
     } else {
-        // 8 bars anchored at rssi_anchor_x, 1px wide 2px gap, height 1-6
+        // 8 bars sparkline only (dBm removed per user)
         for(int i=0;i<8;i++){
             int idx = (rssi_history_idx + i) %8;
             int8_t v = rssi_history[idx];
@@ -1428,12 +1431,7 @@ void draw_chat_view() {
             }
         }
     }
-    // Vertical also needs W/D indicator near RSSI if not drawn above (more spacing)
-    if (is_vertical) {
-        M5Cardputer.Display.setCursor(95, 2);
-        if (WiFi.status() != WL_CONNECTED) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("D"); }
-        else { M5Cardputer.Display.setTextColor(0x07E0, 0x0841); M5Cardputer.Display.print("W"); }
-    }
+    // Vertical W/D removed - sparkline only
     // Rotation lock indicator l/u (more spacing)
     M5Cardputer.Display.setCursor(battery_anchor_x - 12, 2);
     if (rotation_locked) { M5Cardputer.Display.setTextColor(0xF800, 0x0841); M5Cardputer.Display.print("L"); }
@@ -1473,18 +1471,20 @@ void draw_chat_view() {
         else if (has_unread_msg) M5Cardputer.Display.fillRect(dot_x, 10, 3, 2, 0x07FF);
     }
 
-    // LOWER INPUT BOX - fluid to display_width/display_height, textbox integrity 225-240 vertical
+    // LOWER INPUT BOX - fluid + text_scale 2 (input 1->2 needs y 118)
+    M5Cardputer.Display.setTextSize(text_scale);
     M5Cardputer.Display.fillRect(0, input_box_y, display_width, textbox_height, 0x0000);
     M5Cardputer.Display.drawFastHLine(0, wire_y, display_width, 0x7BEF);
     M5Cardputer.Display.setTextColor(0xFD20, 0x0000);
-    int input_cursor_y = is_vertical ? 227 : 124;
+    int input_cursor_y = is_vertical ? (text_scale==2? 223 : 227) : (text_scale==2? 118 : 124);
     M5Cardputer.Display.setCursor(4, input_cursor_y);
     M5Cardputer.Display.print("> ");
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
     // For vertical 135px width, wrap input display if needed but keep single line preview truncated
-    String disp_input = input_buffer;
+    String disp_input = input_buffer; if(disp_input.length()>31) disp_input = disp_input.substring(disp_input.length()-31);
     if (is_vertical && disp_input.length() > 18) disp_input = disp_input.substring(disp_input.length() - 18);
     M5Cardputer.Display.print(disp_input.c_str());
+    M5Cardputer.Display.setTextSize(1);
     // Textbox counter at far-right, red at >390
     {
         int rem = 200 - (int)input_buffer.length();
@@ -1508,28 +1508,55 @@ void handle_keyboard_inputs() {
         }
     }
     if (!M5Cardputer.Keyboard.isPressed()) return;
-    
     // Explicit 150ms hardware bounce filter guard to stop character double-chatter
     if (millis() - last_keypress_debounce < 150) return;
     last_keypress_debounce = millis();
     last_input_time = millis(); // Fresh backlight dim timer
+    // Fn mode debounce 300ms to stop holding Fn glitch
+    static unsigned long last_fn_debounce=0;
+    bool is_fn_now = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
+    if (is_fn_now && millis() - last_fn_debounce < 300) {
+        // allow only scrollback/history which need repeat, but not mode switches
+        bool isModeKey = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('r');
+        if (isModeKey) return;
+    }
+    if (is_fn_now) last_fn_debounce = millis();
     
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
+    // Hold repeat guard: if same word held, slow to 400ms
+    {
+        static String last_hold_word="";
+        static unsigned long last_hold_ms=0;
+        String cur_word;
+        for(auto c: status.word) cur_word += c;
+        if (cur_word.length()>0 && cur_word == last_hold_word && millis() - last_hold_ms < 400) {
+            return;
+        }
+        if (cur_word.length()>0) { last_hold_word = cur_word; last_hold_ms = millis(); }
+        if (cur_word.length() > 1) cur_word = cur_word.substring(0,1);
+    }
     // Fn hold ghost guard: if only Fn held with no other key word/enter/del, avoid ghost matrix scan
     if (is_fn && status.word.empty() && !status.enter && !status.del) {
         bool anyFnCombo = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('s') || M5Cardputer.Keyboard.isKeyPressed('c') || M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('.') || M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(' ') || M5Cardputer.Keyboard.isKeyPressed('f');
         if (!anyFnCombo) return;
     }
     
-    // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P)
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('p')) {
-        current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
-        menu_selection_idx = 0; nav_server_select_idx = 0; nav_channel_select_idx = 0;
-        ui_needs_redraw = true;
-        set_led_mode(18);
-        return;
+    // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P) - edge
+    {
+        static bool was_p_prev=false;
+        bool cur_p = is_fn && M5Cardputer.Keyboard.isKeyPressed('p');
+        if(cur_p && !was_p_prev){
+            current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
+            menu_selection_idx = 0; nav_server_select_idx = 0; nav_channel_select_idx = 0;
+            ui_needs_redraw = true;
+            set_led_mode(18);
+            was_p_prev=true;
+            return;
+        }
+        if(!cur_p) was_p_prev=false;
+        if(cur_p) return; // hold, don't fall through to other handlers
     }
 
     // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O) + Theme
@@ -1567,11 +1594,7 @@ void handle_keyboard_inputs() {
         }
         return;
     }
-    if (is_fn && M5Cardputer.Keyboard.isKeyPressed('b')) {
-        show_dBm = !show_dBm;
-        ui_needs_redraw=true;
-        return;
-    }
+    // Fn+B dBm toggle removed - keep sparkline only per user
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('q')) {
         show_mentions_peek = !show_mentions_peek;
         ui_needs_redraw=true;
@@ -1626,13 +1649,21 @@ void handle_keyboard_inputs() {
         set_led_mode(18);
         return;
     }
-    // Global Scrollback Panic Reset (Esc or `) - restores real-time view from any mode
-    if (M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed(0x1B)) {
-        scrollback_offset = 0;
-        scrollback_offset_idx = 0;
-        is_scrollback_active = false;
-        scrollback_mode_active = false;
-        ui_needs_redraw = true;
+    // Global Scrollback Panic Reset (Esc or `) - edge triggered 500ms
+    {
+        static unsigned long last_esc_ms=0;
+        static bool was_esc=false;
+        bool cur_esc = M5Cardputer.Keyboard.isKeyPressed('`') || M5Cardputer.Keyboard.isKeyPressed(0x1B);
+        if (cur_esc && !was_esc) {
+            if (millis() - last_esc_ms < 500) { was_esc=cur_esc; return; }
+            last_esc_ms = millis();
+            scrollback_offset = 0;
+            scrollback_offset_idx = 0;
+            is_scrollback_active = false;
+            scrollback_mode_active = false;
+            ui_needs_redraw = true;
+        }
+        was_esc = cur_esc;
     }
 
     // Layer C: Critical Hardware Intercept for Fn+Arrow Punctuation Codes
@@ -2197,6 +2228,15 @@ void handle_keyboard_inputs() {
             }
         }
         
+        // Hold glitch guard: limit burst to 1 char when holding
+        if (status.word.length() > 1) status.word = status.word.substring(0,1);
+        static String last_hold_word=""; static unsigned long last_hold_ms=0;
+        if (status.word.length()>0 && status.word == last_hold_word && millis() - last_hold_ms < 400) {
+            // same char held, slow repeat to 400ms
+            ui_needs_redraw=false;
+            return;
+        }
+        if (status.word.length()>0) { last_hold_word=status.word; last_hold_ms=millis(); }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
@@ -2480,6 +2520,21 @@ void irc_network_task(void* pvParameters) {
                     Serial.printf("[NET] Dynamic discovery complete. Isolated %d networks from bouncer.\n", discovered_network_count);
                 }
             }
+            // Timeout fallback if bouncer never sends Available: (no channels populating)
+            {
+                static unsigned long scan_start_ms = 0;
+                if (scan_start_ms==0) scan_start_ms=millis();
+                if (!master_scan_complete_global && discovered_network_count==0 && millis()-scan_start_ms>10000) {
+                    strncpy(discovered_networks[0], bnc_host, 31);
+                    if (strlen(bnc_host)==0) strncpy(discovered_networks[0], "BNC", 31);
+                    discovered_network_count=1;
+                    master_scan_complete_global=true;
+                    master_client.stop();
+                    Serial.println("[NET] Available timeout fallback to bnc_host (10s)");
+                    log_system("NET fallback bnc_host");
+                }
+                if (master_scan_complete_global) scan_start_ms=0;
+            }
             continue;
         }
 
@@ -2505,13 +2560,12 @@ void irc_network_task(void* pvParameters) {
                     for (int t_idx = 0; t_idx < gTabCount; t_idx++) {
                         if (gTabs[t_idx].line_count > 15) {
                             int keep = 15;
-                            for (int m = 0; m < keep; m++) {
-                                gTabs[t_idx].lines[m] = gTabs[t_idx].lines[gTabs[t_idx].line_count - keep + m];
-                            }
-                            for (int m = keep; m < gTabs[t_idx].line_count; m++) {
-                                memset(&gTabs[t_idx].lines[m], 0, sizeof(ChatLine));
-                            }
-                            gTabs[t_idx].line_count = keep;
+                            ChatLine tmp[15];
+                            for(int k=0;k<keep;k++) tmp[k]=gTabs[t_idx].lines[(gTabs[t_idx].head + gTabs[t_idx].line_count - keep + k) % MSG_BUFFER_SIZE];
+                            for(int k=0;k<keep;k++) gTabs[t_idx].lines[k]=tmp[k];
+                            for(int k=keep;k<MSG_BUFFER_SIZE;k++) memset(&gTabs[t_idx].lines[k],0,sizeof(ChatLine));
+                            gTabs[t_idx].head=0;
+                            gTabs[t_idx].line_count=keep;
                         }
                     }
                     heap_caps_check_integrity_all(true);
@@ -2782,9 +2836,16 @@ void irc_network_task(void* pvParameters) {
                     Serial.printf("[NET-SYNC] Handshake finalized for network: %s. Releasing channels.\n", discovered_networks[i]);
                     continue;
                 }
-                // SASL 900/901 + WHO 352 cache (no flood)
-                if (line.indexOf(" 900 ") != -1) { network_handshake_complete[i]=true; Serial.printf("[SASL] 900 success %s\n", discovered_networks[i]); continue; }
-                if (line.indexOf(" 901 ") != -1) { Serial.printf("[SASL] 901 fail %s\n", discovered_networks[i]); set_led_mode(37); continue; }
+                // SASL 900/901/903/904 + WHO 352 cache (no flood)
+                if (line.indexOf(" 900 ") != -1) { network_handshake_complete[i]=true; log_system("SASL 900 %s", discovered_networks[i]); Serial.printf("[SASL] 900 success %s\n", discovered_networks[i]); continue; }
+                if (line.indexOf(" 901 ") != -1 || line.indexOf(" 903 ") != -1 || line.indexOf(" 904 ") != -1) { 
+                    Serial.printf("[SASL] fail %s %s\n", discovered_networks[i], line.c_str()); 
+                    log_system("SASL fail %s", discovered_networks[i]);
+                    set_led_mode(37); 
+                    network_reconnect_cooldown[i]=millis()+10000; // backoff 10s
+                    net_client.stop();
+                    continue; 
+                }
                 if (line.indexOf(" 352 ") != -1) {
                     // :server 352 mynick #chan user host server nick H :0 real
                     int p352=line.indexOf(" 352 "); int s1=line.indexOf(' ', p352+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); int s5=line.indexOf(' ', s4+1); int s6=line.indexOf(' ', s5+1); String nick=line.substring(s6+1, line.indexOf(' ', s6+1)); nick.trim(); int colon=line.indexOf(" :", s6); String chan=line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){ for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chan.c_str())==0 && strcasecmp(gTabs[t].server, isolated_packet_server.c_str())==0){ bool exists=false; for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], nick.c_str())==0) exists=true; if(!exists && gTabs[t].nick_count<12){ strncpy(gTabs[t].nicks[gTabs[t].nick_count], nick.c_str(),15); gTabs[t].nicks_away[gTabs[t].nick_count]=false; gTabs[t].nick_count++; } break; } xSemaphoreGive(irc_mutex); } } }}
@@ -2948,12 +3009,14 @@ void irc_network_task(void* pvParameters) {
                         if (target_tab_slot != -1 && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
                             Tab &t = gTabs[target_tab_slot];
                             
-                            if (t.line_count >= MSG_BUFFER_SIZE) {
-                                memmove(&t.lines[0], &t.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
-                                t.line_count = MSG_BUFFER_SIZE - 1;
+                            ChatLine *clp2;
+                            if (t.line_count < MSG_BUFFER_SIZE) {
+                                clp2 = &t.lines[(t.head + t.line_count) % MSG_BUFFER_SIZE];
+                            } else {
+                                t.head = (t.head + 1) % MSG_BUFFER_SIZE;
+                                clp2 = &t.lines[(t.head + MSG_BUFFER_SIZE -1) % MSG_BUFFER_SIZE];
                             }
-                            
-                            ChatLine &cl = t.lines[t.line_count];
+                            ChatLine &cl = *clp2;
                             strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
                             strncpy(cl.nick, sender_nick.c_str(), sizeof(cl.nick)-1);
                             if (is_ignored(sender_nick.c_str())) { xSemaphoreGive(irc_mutex); ui_needs_redraw=true; continue; }
@@ -3278,6 +3341,11 @@ void setup() {
         Serial.printf("[VAULT] Boot auth attempt slot0: %s\n", wifi_vault_ssid[0]);
         // Keep Y=120 empty - no canvas draw here
     }
+    // Ensure system log dir exists on SD (visible even before first log)
+    if (SD.cardType() != CARD_NONE) {
+        SD.mkdir("/irc");
+        SD.mkdir("/irc/system");
+    }
     // TWDT 4s init (panic true) - tasks registered after creation
     esp_task_wdt_init(8, true);
     esp_register_shutdown_handler(wdt_emergency_flush);
@@ -3310,6 +3378,7 @@ void setup() {
     sd_mutex = xSemaphoreCreateMutex();
     gLogQueue = xQueueCreate(20, sizeof(char) * 128);
     input_buffer.reserve(201);
+    // Ensure system log dir after mutex will be created in log_system itself
     gTabCount = 1; current_tab_index = 0; memset(&gTabs, 0, sizeof(gTabs));
     strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name)-1);
     strncpy(gTabs[0].server, "CC", sizeof(gTabs[0].server)-1); // Clean local system node identifier
@@ -3321,6 +3390,9 @@ void setup() {
     load_wifi_vault_from_sd();
     load_input_history();
     load_ignore_list();
+    load_highlight_list();
+    // System log boot entry (now mutex ready, ensures /irc/system visible)
+    log_system("System boot ok heap %d", heap_caps_get_free_size(MALLOC_CAP_8BIT));
     load_alias_list();
     load_highlight_list();
 
