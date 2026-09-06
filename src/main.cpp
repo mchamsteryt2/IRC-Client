@@ -1158,7 +1158,12 @@ void draw_chat_view() {
     // STATE 3: LIVE TERMINAL CHAT VIEWPORT
     // ==========================================
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-        canvas.fillSprite(0x0000);
+        if(canvas.width()==0 || canvas.height()==0){
+            Serial.println("[GFX] canvas 0 in draw, recreating 240x135");
+            canvas.deleteSprite();
+            canvas.createSprite(240,135);
+        }
+        canvas.fillSprite(use_light_theme ? 0xFFFF : 0x0000);
         Tab &t = gTabs[current_tab_index];
         int current_y = baseline_y; 
         int starting_index = (t.line_count - 1) - scrollback_offset;
@@ -3199,10 +3204,25 @@ void setup() {
     auto cfg = m5::M5Unified::config();
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
-    // Create canvas sprite for middle viewport (240x109) - must be done after Display init
-    // Without this, pushSprite operates on 0x0 buffer -> middle stays on splash / appears frozen
-    canvas.createSprite(240, 135); 
+    // Create canvas sprite for middle viewport - must be done after Display init
+    // Check heap and fallback if 240x135 fails (black screen)
+    Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    if(!canvas.createSprite(240, 135)){
+        Serial.println("[GFX] 240x135 sprite fail, trying 135x240 fallback");
+        canvas.createSprite(135, 240);
+    }
+    if(canvas.width()==0 || canvas.height()==0){
+        Serial.println("[GFX] sprite still 0, retry 240x135 after heap trim");
+        // trim gTabs to free heap then retry
+        for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
+        canvas.deleteSprite();
+        canvas.createSprite(240,135);
+    }
+    Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
     canvas.fillSprite(0x0000);
+    // Force visible brightness at boot (ignore SD 15)
+    M5Cardputer.Display.setBrightness(80);
+    g_backlight_level=80;
     
     // BMI270 Wire1 tilt sensor init (SDA 2 / SCL 1 on StampS3 is handled by M5Unified, fallback Wire1 direct)
     Wire1.begin(2, 1);
@@ -3259,7 +3279,7 @@ void setup() {
     }
     
     load_settings_from_sd();
-    if (screen_brightness < 40) { screen_brightness = 80; sync_new_nick_to_sd(irc_nick); }
+    if (screen_brightness < 40) { Serial.printf("[BRIGHT] bump %d->80\n", screen_brightness); screen_brightness = 80; g_backlight_level=80; sync_new_nick_to_sd(irc_nick); }
     if (!safe_mode_active) purge_old_logs();
 
     irc_mutex = xSemaphoreCreateMutex();
