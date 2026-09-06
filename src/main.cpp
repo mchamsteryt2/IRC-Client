@@ -276,6 +276,7 @@ void set_led_mode(uint8_t mode) {
 // ==========================================
 void update_config_string(char* destination, const char* source, size_t max_len);
 bool is_mention(const char* msg, const char* nick);
+void log_system(const char* fmt, ...);
 void sync_ntp_timezone();
 // SD Wi-Fi Vault helpers
 void load_wifi_vault_from_sd();
@@ -401,21 +402,9 @@ void purge_old_logs() {
 }
 
 void append_line_to_sd_log(const char* tab_name, const char* nick, const char* message) {
-    if (safe_mode_active || channel_log_enabled != 1) return;
-    
-    // Create direct structural folder path variables safely
-    char file_path[64] = {0};
-    // Strip channel prefix hash markers to keep file naming conventions completely FAT32 safe
-    const char* clean_name = (tab_name[0] == '#') ? (tab_name + 1) : tab_name;
-    snprintf(file_path, sizeof(file_path), "/irc/logs/%s.log", clean_name);
-    
-    // Open in append-mode to write text chunks without wiping historical rows
-    File log_file = SD.open(file_path, FILE_APPEND);
-    if (!log_file) return;
-    
-    // Export raw text payload strings cleanly inside a non-blocking snapshot lock pass
-    log_file.printf("[00:00] <%s> %s\n", nick, message);
-    log_file.close();
+    // Unified to 512B cache path /irc/logs/<server>/<room>_YYYY_MM_DD.log - keep as no-op to avoid duplicate collision
+    (void)tab_name; (void)nick; (void)message;
+    return;
 }
 
 
@@ -450,7 +439,30 @@ void flush_log_cache() {
 // Emergency TWDT flush - called from watchdog ISR before hardware restart
 void wdt_emergency_flush() {
     // Short non-blocking window, flush RAM cache to /irc/logs/ before S3 restart
+    log_system("WDT panic flush");
     flush_log_cache();
+}
+void log_system(const char* fmt, ...) {
+    if (safe_mode_active) return;
+    char buf[160];
+    va_list args; va_start(args, fmt); vsnprintf(buf, sizeof(buf), fmt, args); va_end(args);
+    unsigned long sec = millis()/1000 + adj_time;
+    char path[64];
+    struct tm ti;
+    if (getLocalTime(&ti, 30)) {
+        snprintf(path, sizeof(path), "/irc/system/system_%04d_%02d_%02d.log", ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday);
+    } else {
+        uint32_t yr=2026, mon=((sec/2629743)%12)+1, day=((sec/86400)%31)+1;
+        snprintf(path, sizeof(path), "/irc/system/system_%04d_%02d_%02d.log", yr, mon, day);
+    }
+    bool sd_locked=false;
+    if (sd_mutex) sd_locked=(xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50))==pdTRUE); else sd_locked=true;
+    if (!sd_locked) return;
+    SD.mkdir("/irc");
+    SD.mkdir("/irc/system");
+    File f=SD.open(path, FILE_APPEND);
+    if(f){ f.printf("[%02d:%02d] %s\n", (int)(sec/3600)%24, (int)(sec%3600)/60, buf); f.close(); }
+    if(sd_mutex) xSemaphoreGive(sd_mutex);
 }
 
 // ==========================================
@@ -773,7 +785,9 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         }
         // Heap guard: log largest free block <20KB
         if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 20000) {
-            Serial.printf("[HEAP] largest free %d <20KB\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+            int largest=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+            Serial.printf("[HEAP] largest free %d <20KB\n", largest);
+            log_system("HEAP largest %d <20KB", largest);
             set_led_mode(34);
         }
         
@@ -797,9 +811,9 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         uint32_t active_day = ((current_sync_sec / 86400) % 31) + 1;   
 
         String safe_server = String(t.server);
-        safe_server.replace("/", "_"); safe_server.replace("\\", "_"); safe_server.trim();
+        safe_server.replace("/", "_"); safe_server.replace("\\", "_"); safe_server.replace("#", "_"); safe_server.replace("&", "_"); safe_server.replace("~", "_"); safe_server.trim();
         String safe_room = String(t.name);
-        safe_room.replace("/", "_"); safe_room.replace("\\", "_"); safe_room.trim();
+        safe_room.replace("/", "_"); safe_room.replace("\\", "_"); safe_room.replace("#", "_"); safe_room.replace("&", "_"); safe_room.replace("~", "_"); safe_room.trim();
 
         char dir_path_buffer[64] = {0};
         snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server.c_str());
@@ -892,6 +906,7 @@ uint16_t get_nick_palette_color(const char* nick) {
     const uint16_t palette[] = {0x07FF, 0xFDA0, 0xF81F, 0x07E0, 0xAFE5, 0xFED0, 0x867F}; 
     return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
 }
+bool is_nick_char(char c){ return isalnum((unsigned char)c) || c=='_' || c=='-' || c=='[' || c==']' || c=='{' || c=='}' || c=='^' || c=='|' || c=='\\' || c=='`'; }
 bool is_mention(const char* msg, const char* nick) {
     if (is_highlight_word(msg)) return true;
     if (!msg || !nick || !*nick) return false;
@@ -899,8 +914,8 @@ bool is_mention(const char* msg, const char* nick) {
     if (nlen==0) return false;
     for (const char* p = msg; *p; p++) {
         if (strncasecmp(p, nick, nlen)==0) {
-            bool preOk = (p==msg) || !isalnum((unsigned char)p[-1]);
-            bool postOk = p[nlen]=='\0' || !isalnum((unsigned char)p[nlen]);
+            bool preOk = (p==msg) || !is_nick_char(p[-1]);
+            bool postOk = p[nlen]=='\0' || !is_nick_char(p[nlen]);
             if (preOk && postOk) return true;
         }
     }
@@ -1431,7 +1446,10 @@ void draw_chat_view() {
         struct tm timeinfo;
         int hh, mm;
         if (getLocalTime(&timeinfo, 30)) { hh=timeinfo.tm_hour; mm=timeinfo.tm_min; }
-        else { unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60; }
+        else { 
+            static bool ntpWarn=false;
+            if(!ntpWarn){ Serial.println("[NTP] pool blocked, fallback millis+adj_time drift"); ntpWarn=true; }
+            unsigned long sec = (millis()/1000 + adj_time) % 86400; hh=sec/3600; mm=(sec%3600)/60; }
         if (use_12_hour_format) { int h12 = hh%12; if(h12==0) h12=12; hh=h12; }
         M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(150, 2);
         M5Cardputer.Display.printf("%02d:%02d", hh, mm);
@@ -1469,7 +1487,7 @@ void draw_chat_view() {
     M5Cardputer.Display.print(disp_input.c_str());
     // Textbox counter at far-right, red at >390
     {
-        int rem = 400 - (int)input_buffer.length();
+        int rem = 200 - (int)input_buffer.length();
         int cnt_x = display_width - 26;
         M5Cardputer.Display.setCursor(cnt_x, input_cursor_y);
         if ((int)input_buffer.length() >= 390) M5Cardputer.Display.setTextColor(0xF800, 0x0000);
@@ -2182,7 +2200,7 @@ void handle_keyboard_inputs() {
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
-            if (input_buffer.length() < 400) { 
+            if (input_buffer.length() < 200) { 
                 input_buffer += c; 
                 input_history_pos=-1;
                 ui_needs_redraw = true; 
@@ -2451,6 +2469,12 @@ void irc_network_task(void* pvParameters) {
                         if (comma_idx == -1) break; 
                         start_pos = comma_idx + 1;
                     }
+                    if(discovered_network_count==0){
+                        // Fallback: bouncer didn't send Available:, use bnc_host as single network
+                        strncpy(discovered_networks[0], bnc_host, 31);
+                        discovered_network_count=1;
+                        Serial.println("[NET] No Available: line, fallback to bnc_host");
+                    }
                     master_client.stop(); // Close the discovery probe safely
                     master_scan_complete_global = true;
                     Serial.printf("[NET] Dynamic discovery complete. Isolated %d networks from bouncer.\n", discovered_network_count);
@@ -2479,8 +2503,8 @@ void irc_network_task(void* pvParameters) {
                 if (ESP.getMinFreeHeap() < 45 * 1024) {
                     Serial.println("[HEAP] Low heap detected (<45KB), recycling old channel history buffers");
                     for (int t_idx = 0; t_idx < gTabCount; t_idx++) {
-                        if (gTabs[t_idx].line_count > 10) {
-                            int keep = 10;
+                        if (gTabs[t_idx].line_count > 15) {
+                            int keep = 15;
                             for (int m = 0; m < keep; m++) {
                                 gTabs[t_idx].lines[m] = gTabs[t_idx].lines[gTabs[t_idx].line_count - keep + m];
                             }
@@ -3071,6 +3095,14 @@ void custom_ui_loop_task(void* pvParameters) {
         }
         g_backlight_level = target_backlight_level;
         M5Cardputer.Display.setBrightness(target_backlight_level);
+        // Periodic log flush every 1s to make channel logs visible (was only on 512B full)
+        {
+            static unsigned long last_log_flush=0;
+            if(channel_log_enabled==1 && millis()-last_log_flush>1000 && log_sector_cache_len>0){
+                last_log_flush=millis();
+                flush_log_cache();
+            }
+        }
         // Auto-away 5m idle -> AWAY :auto, Mode 10; key restores
         if (current_app_mode==MODE_CHAT && !is_away && millis() - last_user_keyboard_input_tick > 300000) {
             for(int i=0;i<discovered_network_count;i++) if(clients[i].connected()){ clients[i].printf("AWAY :auto\r\n"); clients[i].flush(); }
@@ -3113,7 +3145,7 @@ void custom_ui_loop_task(void* pvParameters) {
                 target_led_mode = 28; // Filter active steady gold
             } else if (show_nicklist) {
                 target_led_mode = 29; // Nicklist drawer teal
-            } else if (input_buffer.length() >= 390) {
+            } else if (input_buffer.length() >= 190) {
                 target_led_mode = 6;  // Buffer Shield: Flash Indigo near character cap
             }
         }
@@ -3196,8 +3228,13 @@ void setup() {
     // Check heap and fallback if 240x135 fails (black screen)
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
     if(!canvas.createSprite(240, 135)){
-        Serial.println("[GFX] 240x135 sprite fail, trying 135x240 fallback");
-        canvas.createSprite(135, 240);
+        Serial.println("[GFX] 240x135 sprite fail, trying 240x100 fallback");
+        // free some heap aggressively
+        for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
+        if(!canvas.createSprite(240, 100)){
+            Serial.println("[GFX] 240x100 fail, trying 135x100");
+            canvas.createSprite(135, 100);
+        }
     }
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] sprite still 0, retry 240x135 after heap trim");
@@ -3212,9 +3249,8 @@ void setup() {
     M5Cardputer.Display.setBrightness(80);
     g_backlight_level=80;
     
-    // BMI270 Wire1 tilt sensor init (SDA 2 / SCL 1 on StampS3 is handled by M5Unified, fallback Wire1 direct)
+    // BMI270 Wire1 tilt sensor init - cfg.internal_imu already inits via M5Cardputer.begin, just ensure Wire1
     Wire1.begin(2, 1);
-    M5.Imu.init();
     // Interrupt-driven idle dimmer wait gate: hardware FALLING edge on keyboard matrix rows wakes display
     // Cardputer matrix rows map to GPIOs 8,9,10,46 via internal shift register; we attach to exposed row pins
     pinMode(8, INPUT_PULLUP);
@@ -3233,7 +3269,7 @@ void setup() {
     SPI.begin(40, 39, 14, 12);
     bool sd_ok=false;
     for(int i=0;i<3;i++){ if(SD.begin(12, SPI, 10000000)){ sd_ok=true; break; } vTaskDelay(pdMS_TO_TICKS(200)); }
-    if(!sd_ok){ safe_mode_active=true; set_led_mode(11); Serial.println("[STORAGE] SD self-heal failed 3x, safe_mode"); }
+    if(!sd_ok){ safe_mode_active=true; set_led_mode(11); Serial.println("[STORAGE] SD self-heal failed 3x, safe_mode"); log_system("STORAGE SD self-heal fail 3x"); }
     // SD Wi-Fi Vault boot ingestion: parse /irc/wifi_cache.txt into transient vault array
     load_wifi_vault_from_sd();
     if (wifi_vault_count > 0) {
@@ -3273,6 +3309,7 @@ void setup() {
     irc_mutex = xSemaphoreCreateMutex();
     sd_mutex = xSemaphoreCreateMutex();
     gLogQueue = xQueueCreate(20, sizeof(char) * 128);
+    input_buffer.reserve(201);
     gTabCount = 1; current_tab_index = 0; memset(&gTabs, 0, sizeof(gTabs));
     strncpy(gTabs[0].name, "~mentions", sizeof(gTabs[0].name)-1);
     strncpy(gTabs[0].server, "CC", sizeof(gTabs[0].server)-1); // Clean local system node identifier
