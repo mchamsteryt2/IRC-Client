@@ -563,8 +563,8 @@ void handle_vault_scan_complete() {
     // Compare discovered SSIDs against vault history
     for(int i=0;i<wifi_vault_count;i++){
         for(int s=0;s<n;s++){
-            String seen = WiFi.SSID(s);
-            if(seen == wifi_vault_ssid[i]){
+            String tmpSeen = WiFi.SSID(s);
+            if(tmpSeen == wifi_vault_ssid[i]){
                 Serial.printf("[VAULT-ROAM] Matched historical SSID: %s\n", wifi_vault_ssid[i]);
                 WiFi.scanDelete();
                 queueLed(41, 800);
@@ -1081,10 +1081,11 @@ void draw_chat_view() {
                     // per-room metadata: nick count + pinned marker
                     if (gTabs[i].pinned) { canvas.setTextColor(0xFFE0); canvas.print(" P"); }
                     if (gTabs[i].nick_count>0) { canvas.setTextColor(0x7BEF); canvas.printf(" %d", gTabs[i].nick_count); }
-                    // last-message preview dim below (6px offset, 12-char)
+                    // last-message preview dim below (6px offset, 12-char) - char no String
                     if (gTabs[i].line_count>0 && !is_vertical) {
-                        String last = String(gTabs[i].lines[gTabs[i].line_count-1].message);
-                        if (last.length()>12) last = last.substring(0,12);
+                        char last[13]={0};
+                        strncpy(last, gTabs[i].lines[gTabs[i].line_count-1].message, 12);
+                        last[12]='\0';
                         canvas.setCursor(right_x+8, draw_y_row_coordinate+7);
                         canvas.setTextColor(0x4208);
                         canvas.print(last);
@@ -1176,9 +1177,13 @@ void draw_chat_view() {
                     bool sel = (menu_selection_idx == 5 + i);
                     canvas.setTextColor(sel ? 0xFFFF : 0x7BEF);
                     canvas.setCursor(10, y);
-                    String ss = WiFi.SSID(i);
-                    if (ss.length()>14) ss = ss.substring(0,12)+"..";
-                    canvas.printf("%s %s %ddBm", sel?">":" ", ss.c_str(), WiFi.RSSI(i));
+                    char ss[32]={0};
+                    {
+                        String tmp = WiFi.SSID(i);
+                        strncpy(ss, tmp.c_str(), sizeof(ss)-1);
+                        if (strlen(ss)>14) { ss[12]='\0'; strcat(ss, ".."); }
+                    }
+                    canvas.printf("%s %s %ddBm", sel?">":" ", ss, WiFi.RSSI(i));
                 }
                 if (menu_selection_idx >=5) {
                     canvas.setTextColor(0x07E0); canvas.setCursor(10, 180); canvas.print("Enter:Connect vault");
@@ -1199,22 +1204,19 @@ void draw_chat_view() {
     // ==========================================
     // STATE 3: LIVE TERMINAL CHAT VIEWPORT
     // ==========================================
-    // Ensure canvas valid - no PSRAM: keep whatever size succeeded at boot (240x109) to avoid 64KB alloc failure on 320KB heap
-    // PSRAM boards get 240x135 atomic full-screen; no-PSRAM keeps 240x109 middle viewport + separate navbar/input to save RAM
+    // No PSRAM on Cardputer Adv target - always use 240x109 middle viewport to avoid 65KB alloc failure on 320KB heap
     if(canvas.width()==0 || canvas.height()==0){
         Serial.println("[GFX] canvas 0 in draw, recreating viewport");
         canvas.deleteSprite();
-        bool psram = psramFound() && ESP.getPsramSize() > 0;
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        // Need ~65KB for 240x135*2 + overhead; require 70KB contiguous
-        if(psram || largest >= 70000){
-            if(!canvas.createSprite(240,135)) canvas.createSprite(240,109);
-        } else {
-            if(!canvas.createSprite(240,109)) canvas.createSprite(135,214);
+        if(!canvas.createSprite(240,109)){
+            if(!canvas.createSprite(135,214)){
+                // last resort 240x135 will likely fail without PSRAM but try
+                canvas.createSprite(240,135);
+            }
         }
         canvas.setTextSize(text_scale);
     }
-    bool is_fullscreen = (canvas.width()==240 && canvas.height()==135);
+    bool is_fullscreen = false; // no PSRAM - never fullscreen, keep bloat-free
     // Snapshot chat state under mutex (short critical section) to avoid holding mutex during heavy rendering
     Tab snapTab;
     uint8_t snap_gTabCount = 0;
@@ -1449,12 +1451,7 @@ void draw_chat_view() {
         }
         if(is_fullscreen){
             // --- Fullscreen atomic path (PSRAM): navbar+input into canvas, single push at 0,0 eliminates flicker ---
-            // RSSI history update (throttled 500ms, no draw yet)
-            {
-                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
-                static unsigned long last_hist = 0;
-                if (millis() - last_hist > 500) { last_hist = millis(); rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8; }
-            }
+            // (rssi_history updated in custom_ui_loop_task every 500ms, not here to avoid double)
             // Navbar (0,0,240,12) - drawn into canvas
             canvas.fillRect(0, 0, display_width, 12, 0x0841);
             {
@@ -1565,13 +1562,7 @@ void draw_chat_view() {
                 canvas.setTextSize(text_scale);
             }
         } else {
-            // --- No-PSRAM fallback: middle viewport only, navbar/input via Display but with waitDisplay batching to reduce flicker ---
-            // RSSI update
-            {
-                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
-                static unsigned long last_hist = 0;
-                if (millis() - last_hist > 500) { last_hist = millis(); rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8; }
-            }
+            // --- No-PSRAM fallback: middle viewport only (rssi updated in loop) ---
         }
     } // end snapshot block
     if(is_fullscreen){
@@ -2879,26 +2870,31 @@ void irc_network_task(void* pvParameters) {
                 if (bytes_read <= 0) continue;
                 packet_chunk[bytes_read] = '\0';
                 
-                String line = String(packet_chunk);
-                line.trim(); line.replace("\r", "");
-                if (line.length() == 0) continue;
+                // Use packet_chunk directly as line buffer (no String heap) for hot PRIVMSG path
+                char *cLine = packet_chunk;
+                // trim leading
+                while(*cLine==' '||*cLine=='\t'||*cLine=='\r'||*cLine=='\n') cLine++;
+                // trim trailing \r\n space
+                {
+                    size_t ll = strlen(cLine);
+                    while(ll>0 && (cLine[ll-1]=='\r' || cLine[ll-1]=='\n' || cLine[ll-1]==' ' || cLine[ll-1]=='\t')) { cLine[ll-1]='\0'; ll--; }
+                }
+                if (*cLine=='\0') continue;
 
                 // SASL Authentication Handler: Intercept CAP negotiation
-                if (line.indexOf("CAP LS 302") != -1) {
+                if (strstr(cLine, "CAP LS 302") != nullptr) {
                     net_client.printf("CAP REQ :sasl\r\n");
                     net_client.flush();
                     continue;
                 }
-                if (line.indexOf("CAP ACK :sasl") != -1) {
-                    String user = String(bnc_user);
-                    String pass = String(bnc_pass);
-                    int plain_len = 1 + user.length() + 1 + pass.length();
+                if (strstr(cLine, "CAP ACK :sasl") != nullptr) {
+                    int plain_len = 1 + strlen(bnc_user) + 1 + strlen(bnc_pass);
                     char plain[128] = {0};
                     int pos = 0;
                     plain[pos++] = '\0';
-                    memcpy(plain+pos, user.c_str(), user.length()); pos += user.length();
+                    memcpy(plain+pos, bnc_user, strlen(bnc_user)); pos += strlen(bnc_user);
                     plain[pos++] = '\0';
-                    memcpy(plain+pos, pass.c_str(), pass.length()); pos += pass.length();
+                    memcpy(plain+pos, bnc_pass, strlen(bnc_pass)); pos += strlen(bnc_pass);
                     char b64[256] = {0};
                     size_t olen = 0;
                     mbedtls_base64_encode((unsigned char*)b64, sizeof(b64), &olen, (unsigned char*)plain, plain_len);
@@ -2906,69 +2902,117 @@ void irc_network_task(void* pvParameters) {
                     net_client.flush();
                     memset(plain, 0, sizeof(plain));
                     memset(b64, 0, sizeof(b64));
-                    user = ""; pass = "";
                     continue;
                 }
 
                 // --- ATOMIC DISCOVERY PROTOCOL TOKENIZER ---
-                String discovered_room = "";
-                String isolated_packet_server = String(discovered_networks[i]); // Secure default baseline
+                char discovered_room[64] = {0};
+                char isolated_packet_server[32] = {0};
+                strncpy(isolated_packet_server, discovered_networks[i], sizeof(isolated_packet_server)-1);
 
-                if (line.indexOf(" PRIVMSG ") != -1) {
-                    int priv_idx = line.indexOf(" PRIVMSG ");
-                    int colon_idx = line.indexOf(" :", priv_idx);
-                    if (priv_idx != -1 && colon_idx != -1) {
-                        String target_recipient = line.substring(priv_idx + 9, colon_idx);
-                        target_recipient.trim();
-                        
-                        int slash_idx = target_recipient.indexOf('/');
-                        int hash_pos = target_recipient.indexOf('#');
-                        int amp_pos = target_recipient.indexOf('&');
-                        int symbol_pos = (hash_pos != -1) ? hash_pos : amp_pos;
+                {
+                    char *priv = strstr(cLine, " PRIVMSG ");
+                    if (priv) {
+                        int priv_idx = priv - cLine;
+                        char *colon = strstr(priv, " :");
+                        int colon_idx = colon ? (colon - cLine) : -1;
+                        if (priv_idx != -1 && colon_idx != -1) {
+                            char target_recipient[128] = {0};
+                            int tr_len = colon_idx - (priv_idx + 9);
+                            if (tr_len >= (int)sizeof(target_recipient)) tr_len = sizeof(target_recipient)-1;
+                            memcpy(target_recipient, cLine + priv_idx + 9, tr_len);
+                            target_recipient[tr_len]='\0';
+                            // trim
+                            {
+                                char *ts = target_recipient;
+                                while(*ts==' '||*ts=='\t') ts++;
+                                if(ts!=target_recipient) memmove(target_recipient, ts, strlen(ts)+1);
+                                char *te = target_recipient + strlen(target_recipient)-1;
+                                while(te>=target_recipient && (*te==' '||*te=='\t')) {*te='\0'; te--;}
+                            }
+                            char *slash = strchr(target_recipient, '/');
+                            char *hash = strchr(target_recipient, '#');
+                            char *amp = strchr(target_recipient, '&');
+                            char *symbol = hash ? hash : amp;
 
                         // RIGID PROTECTION: Only strip a server prefix if it sits directly in front of a true channel hash symbol
-                        if (slash_idx != -1 && symbol_pos != -1 && slash_idx < symbol_pos) {
-                            isolated_packet_server = target_recipient.substring(0, slash_idx);
-                            discovered_room = target_recipient.substring(symbol_pos);
-                        } else if (symbol_pos != -1) {
-                            discovered_room = target_recipient.substring(symbol_pos);
+                        bool hasSlash = (slash != nullptr);
+                        bool hasSymbol = (symbol != nullptr);
+                        int slashPos = hasSlash ? (slash - target_recipient) : -1;
+                        int symPos = hasSymbol ? (symbol - target_recipient) : -1;
+                        if (hasSlash && hasSymbol && slashPos < symPos) {
+                            target_recipient[slashPos]='\0';
+                            strncpy(isolated_packet_server, target_recipient, sizeof(isolated_packet_server)-1);
+                            strncpy(discovered_room, symbol, sizeof(discovered_room)-1);
+                        } else if (hasSymbol) {
+                            strncpy(discovered_room, symbol, sizeof(discovered_room)-1);
+                            // isolated stays default
                         } else {
-                            // This is a clean Private Query PM!
-                            discovered_room = target_recipient;
+                            strncpy(discovered_room, target_recipient, sizeof(discovered_room)-1);
                         }
                     }
                 }
-                isolated_packet_server.trim();
-                discovered_room.trim();
+                // trim isolated/discovered
+                {
+                    // trim isolated
+                    char *is = isolated_packet_server;
+                    while(*is==' '||*is=='\t') is++;
+                    if(is!=isolated_packet_server) memmove(isolated_packet_server,is,strlen(is)+1);
+                    char *ie = isolated_packet_server + strlen(isolated_packet_server)-1;
+                    while(ie>=isolated_packet_server && (*ie==' '||*ie=='\t')) {*ie='\0'; ie--;}
+                    // trim discovered
+                    char *ds = discovered_room;
+                    while(*ds==' '||*ds=='\t') ds++;
+                    if(ds!=discovered_room) memmove(discovered_room,ds,strlen(ds)+1);
+                    char *de = discovered_room + strlen(discovered_room)-1;
+                    while(de>=discovered_room && (*de==' '||*de=='\t')) {*de='\0'; de--;}
+                }
 
                 // Preserve JOIN and 353 handling for backward compatibility (also protected by slash blocker)
-                if (discovered_room.length() == 0) {
-                    if (line.indexOf(" JOIN ") != -1) {
-                        int join_idx = line.indexOf(" JOIN ");
-                        discovered_room = line.substring(join_idx + 6);
-                    } else if (line.indexOf(" 353 ") != -1) {
-                        int equal_idx = line.indexOf(" = ");
-                        if (equal_idx != -1) {
-                            int colon_idx = line.indexOf(" :", equal_idx);
-                            if (colon_idx != -1) discovered_room = line.substring(equal_idx + 3, colon_idx);
+                if (discovered_room[0]=='\0') {
+                    char *joinPos = strstr(cLine, " JOIN ");
+                    if (joinPos) {
+                        char *dr = joinPos + 6;
+                        while(*dr==' '||*dr=='\t') dr++;
+                        strncpy(discovered_room, dr, sizeof(discovered_room)-1);
+                    } else {
+                        char *p353 = strstr(cLine, " 353 ");
+                        if (p353) {
+                            char *eq = strstr(p353, " = ");
+                            if (eq) {
+                                char *cc = strstr(eq, " :");
+                                if (cc) {
+                                    int len = cc - (eq+3);
+                                    if(len>= (int)sizeof(discovered_room)) len = sizeof(discovered_room)-1;
+                                    memcpy(discovered_room, eq+3, len);
+                                    discovered_room[len]='\0';
+                                }
+                            }
                         }
                     }
-                    discovered_room.trim();
-                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
+                    // trim
+                    {
+                        char *ds = discovered_room;
+                        while(*ds==' '||*ds=='\t') ds++;
+                        if(ds!=discovered_room) memmove(discovered_room,ds,strlen(ds)+1);
+                        char *de = discovered_room + strlen(discovered_room)-1;
+                        while(de>=discovered_room && (*de==' '||*de=='\t')) {*de='\0'; de--;}
+                    }
+                    if (discovered_room[0]==':') memmove(discovered_room, discovered_room+1, strlen(discovered_room));
                 }
 
                 // If a channel name was isolated, dynamically allocate its space in RAM
-                if (discovered_room.length() > 0) {
-                    if (discovered_room.startsWith(":")) discovered_room = discovered_room.substring(1);
-                    if (discovered_room.startsWith("#") || discovered_room.startsWith("&")) {
+                if (discovered_room[0]!='\0') {
+                    if (discovered_room[0]==':') memmove(discovered_room, discovered_room+1, strlen(discovered_room)+1);
+                    if (discovered_room[0]=='#' || discovered_room[0]=='&') {
                         if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
                             bool tab_exists = false;
                             for (int t = 0; t < gTabCount; t++) {
-                                if (strcmp(gTabs[t].name, discovered_room.c_str()) == 0 && strcmp(gTabs[t].server, isolated_packet_server.c_str()) == 0) { tab_exists = true; break; }
+                                if (strcmp(gTabs[t].name, discovered_room) == 0 && strcmp(gTabs[t].server, isolated_packet_server) == 0) { tab_exists = true; break; }
                             }
                             if (!tab_exists && gTabCount < MAX_TABS) {
-                                strncpy(gTabs[gTabCount].name, discovered_room.c_str(), sizeof(gTabs[gTabCount].name)-1);
-                                strncpy(gTabs[gTabCount].server, isolated_packet_server.c_str(), sizeof(gTabs[gTabCount].server)-1);
+                                strncpy(gTabs[gTabCount].name, discovered_room, sizeof(gTabs[gTabCount].name)-1);
+                                strncpy(gTabs[gTabCount].server, isolated_packet_server, sizeof(gTabs[gTabCount].server)-1);
                                 gTabs[gTabCount].line_count = 0;
                                 gTabCount++;
                             }
@@ -2977,6 +3021,8 @@ void irc_network_task(void* pvParameters) {
                     }
                 }
 
+                // For remaining numeric replies, create String wrapper (one heap alloc per non-PRIVMSG packet, acceptable; hot PRIVMSG already handled via cLine)
+                String line = String(cLine);
                 // WHOIS numeric cache (311/312/317/318/319/330/671)
                 if (line.indexOf(" 311 ") != -1) {
                     int p311 = line.indexOf(" 311 ");
@@ -2990,15 +3036,20 @@ void irc_network_task(void* pvParameters) {
                         strncpy(whois_cache.real, real.c_str(), sizeof(whois_cache.real)-1);
                         whois_pending=true;
                     }}
+                    continue;
                 } else if (line.indexOf(" 312 ") != -1) {
                     int p312=line.indexOf(" 312 "); int s1=line.indexOf(' ', p312+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(" :", s3); String srv=(s4==-1)?line.substring(s3+1):line.substring(s3+1,s4); srv.trim(); strncpy(whois_cache.server, srv.c_str(), sizeof(whois_cache.server)-1); }}
+                    continue;
                 } else if (line.indexOf(" 317 ") != -1) {
                     int p317=line.indexOf(" 317 "); int s1=line.indexOf(' ', p317+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); String idle=line.substring(s3+1, line.indexOf(' ', s3+1)); idle.trim(); whois_cache.idle=idle.toInt(); }}
+                    continue;
                 } else if (line.indexOf(" 330 ") != -1) {
                     int p330=line.indexOf(" 330 "); int s1=line.indexOf(' ', p330+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(" :", s2+1); String acc=(s3==-1)?line.substring(s2+1):line.substring(s2+1,s3); acc.trim(); int sp=acc.lastIndexOf(' '); if(sp!=-1) acc=acc.substring(sp+1); strncpy(whois_cache.account, acc.c_str(), sizeof(whois_cache.account)-1); }}
-                } else if (line.indexOf(" 671 ") != -1) { whois_cache.secure=true; }
+                    continue;
+                } else if (line.indexOf(" 671 ") != -1) { whois_cache.secure=true; continue; }
                 else if (line.indexOf(" 319 ") != -1) {
                     int p319=line.indexOf(" 319 "); int colon=line.indexOf(" :", p319); if(colon!=-1){ String chans=line.substring(colon+2); chans.trim(); strncpy(whois_cache.channels, chans.c_str(), sizeof(whois_cache.channels)-1); }
+                    continue;
                 } else if (line.indexOf(" 318 ") != -1) {
                     if(whois_pending){ whois_pending=false; current_app_mode=MODE_WHOIS; ui_needs_redraw=true; if(speaker_enabled && sound_profile>=1) M5.Speaker.tone(600,100); queueLed(18,500); }
                     continue;
@@ -3009,9 +3060,11 @@ void irc_network_task(void* pvParameters) {
                             xSemaphoreGive(irc_mutex); ui_needs_redraw=true;
                         }
                     }}
+                    continue;
                 } else if (line.indexOf(" 322 ") != -1) {
-                    // Minimal chan list cache (10 max, light)
-                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<10){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } add_message_to_buffer(chan.c_str(), line.substring(line.indexOf(" :", s4)+2).c_str(), 0x7BEF); }}
+                    // Minimal chan list cache (10 max, light) - do not log to chat to avoid leaking into wrong channel log
+                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<10){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } } }}
+                    continue;
                 } else if (line.indexOf(" 323 ") != -1) {
                     if(chan_list_count>0){
                         String sum="Channels: ";
@@ -3020,7 +3073,7 @@ void irc_network_task(void* pvParameters) {
                         // also push to log browser cache is already via SD, no extra
                     }
                     chan_list_count=0;
-                }
+                    continue;
                 }
                 // ==========================================
                 // 🛑 PROTOCOL DROP SHIELD MASK + NICKLIST/TOPIC CAPTURE
@@ -3029,11 +3082,11 @@ void irc_network_task(void* pvParameters) {
                 // Capture topic (332 / TOPIC) into per-tab storage without navbar clutter
                 if (line.indexOf(" 332 ") != -1 || line.indexOf(" TOPIC ") != -1) {
                     int colon = line.indexOf(" :");
-                    if (colon != -1 && discovered_room.length()>0) {
+                    if (colon != -1 && discovered_room[0]!='\0') {
                         String topic = line.substring(colon+2);
                         topic.trim();
                         if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, discovered_room.c_str())==0 && strcmp(gTabs[t].server, isolated_packet_server.c_str())==0){
+                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, discovered_room)==0 && strcmp(gTabs[t].server, isolated_packet_server)==0){
                                 strncpy(gTabs[t].topic, topic.c_str(), sizeof(gTabs[t].topic)-1);
                                 queueLed(24, 400);
                                 break;
@@ -3043,28 +3096,50 @@ void irc_network_task(void* pvParameters) {
                     }
                     if (line.indexOf(" 332 ") != -1) continue; // don't flood chat with RPL_TOPIC
                 }
-                // Capture nicklist from 353 before dropping to feed drawer
+                // Capture nicklist from 353 before dropping to feed drawer - char-based to avoid String heap fragmentation (no-PSRAM leak-like fragmentation)
                 if (line.indexOf(" 353 ") != -1) {
                     int colon = line.lastIndexOf(" :");
-                    if (colon != -1 && discovered_room.length()>0) {
-                        String nickStr = line.substring(colon+2);
-                        nickStr.trim();
-                        if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, discovered_room.c_str())==0 && strcmp(gTabs[t].server, isolated_packet_server.c_str())==0){
+                    if (colon != -1 && discovered_room[0]!='\0') {
+                        // stack buffer, no String allocation
+                        char nickBuf[512];
+                        const char* lineC = line.c_str();
+                        int off = colon + 2;
+                        int lineLen = line.length();
+                        int copyLen = lineLen - off;
+                        if (copyLen < 0) copyLen = 0;
+                        if (copyLen >= (int)sizeof(nickBuf)) copyLen = sizeof(nickBuf)-1;
+                        memcpy(nickBuf, lineC + off, copyLen);
+                        nickBuf[copyLen] = '\0';
+                        // trim leading
+                        char *p = nickBuf;
+                        while(*p==' '||*p=='\t'||*p=='\r'||*p=='\n') p++;
+                        // trim trailing
+                        size_t plen = strlen(p);
+                        if (plen > 0) {
+                            char *pe = p + plen - 1;
+                            while(pe >= p && (*pe==' '||*pe=='\t'||*pe=='\r'||*pe=='\n')) { *pe='\0'; pe--; }
+                        }
+                        if (*p && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, discovered_room)==0 && strcmp(gTabs[t].server, isolated_packet_server)==0){
                                 gTabs[t].nick_count=0;
-                                int start=0;
-                                while(start < (int)nickStr.length() && gTabs[t].nick_count < 12){
-                                    int sp = nickStr.indexOf(' ', start);
-                                    String tok = (sp==-1)? nickStr.substring(start) : nickStr.substring(start, sp);
-                                    tok.trim();
-                                    if(tok.length()>0){
-                                        // strip @ + % modes
-                                        if(tok[0]=='@' || tok[0]=='+' || tok[0]=='%' || tok[0]=='~' || tok[0]=='&') tok = tok.substring(1);
-                                        strncpy(gTabs[t].nicks[gTabs[t].nick_count], tok.c_str(), 15);
+                                char *save = p;
+                                while(*save && gTabs[t].nick_count < 12){
+                                    while(*save==' '||*save=='\t') save++;
+                                    if(!*save) break;
+                                    char *tokStart = save;
+                                    while(*save && *save!=' ' && *save!='\t') save++;
+                                    char saved = *save;
+                                    *save = '\0';
+                                    char *tok = tokStart;
+                                    while(*tok=='@'||*tok=='+'||*tok=='%'||*tok=='~'||*tok=='&') tok++;
+                                    if(*tok){
+                                        strncpy(gTabs[t].nicks[gTabs[t].nick_count], tok, 15);
+                                        gTabs[t].nicks[gTabs[t].nick_count][15]='\0';
+                                        gTabs[t].nicks_away[gTabs[t].nick_count]=false;
                                         gTabs[t].nick_count++;
                                     }
-                                    if(sp==-1) break;
-                                    start = sp+1;
+                                    if(saved=='\0') break;
+                                    save++;
                                 }
                                 break;
                             }
@@ -3122,8 +3197,63 @@ void irc_network_task(void* pvParameters) {
                     continue; 
                 }
                 if (line.indexOf(" 352 ") != -1) {
-                    // :server 352 mynick #chan user host server nick H :0 real
-                    int p352=line.indexOf(" 352 "); int s1=line.indexOf(' ', p352+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); int s5=line.indexOf(' ', s4+1); int s6=line.indexOf(' ', s5+1); String nick=line.substring(s6+1, line.indexOf(' ', s6+1)); nick.trim(); int colon=line.indexOf(" :", s6); String chan=line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){ for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chan.c_str())==0 && strcasecmp(gTabs[t].server, isolated_packet_server.c_str())==0){ bool exists=false; for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], nick.c_str())==0) exists=true; if(!exists && gTabs[t].nick_count<12){ strncpy(gTabs[t].nicks[gTabs[t].nick_count], nick.c_str(),15); gTabs[t].nicks_away[gTabs[t].nick_count]=false; gTabs[t].nick_count++; } break; } xSemaphoreGive(irc_mutex); } } }}
+                    // char-based WHO 352 parsing - no String heap (fixes fragmentation leak-like on no-PSRAM)
+                    // :server 352 mynick #chan ident host server nick H :0 real
+                    char wbuf[512];
+                    size_t wl = line.length();
+                    if (wl >= sizeof(wbuf)) wl = sizeof(wbuf)-1;
+                    memcpy(wbuf, line.c_str(), wl);
+                    wbuf[wl]='\0';
+                    char *p352 = strstr(wbuf, " 352 ");
+                    if(p352){
+                        p352 += 5; // after " 352 "
+                        // skip spaces + mynick
+                        while(*p352==' ') p352++;
+                        while(*p352 && *p352!=' ') p352++; // skip mynick
+                        while(*p352==' ') p352++;
+                        // p352 at #chan
+                        char *chanStart = p352;
+                        while(*p352 && *p352!=' ') p352++;
+                        char saveChanEnd = *p352;
+                        *p352='\0';
+                        char chanTmp[32]; strncpy(chanTmp, chanStart, sizeof(chanTmp)-1); chanTmp[sizeof(chanTmp)-1]='\0';
+                        if(saveChanEnd) p352++;
+                        // skip ident
+                        while(*p352==' ') p352++;
+                        while(*p352 && *p352!=' ') p352++;
+                        while(*p352==' ') p352++;
+                        // skip host
+                        while(*p352 && *p352!=' ') p352++;
+                        while(*p352==' ') p352++;
+                        // skip server
+                        while(*p352 && *p352!=' ') p352++;
+                        while(*p352==' ') p352++;
+                        // nick
+                        char *nickStart = p352;
+                        while(*p352 && *p352!=' ') p352++;
+                        char saveNickEnd = *p352;
+                        *p352='\0';
+                        char nickTmp[32]; strncpy(nickTmp, nickStart, sizeof(nickTmp)-1); nickTmp[sizeof(nickTmp)-1]='\0';
+                        // restore for completeness (not needed)
+                        // validate chan
+                        if((chanTmp[0]=='#'||chanTmp[0]=='&') && nickTmp[0]){
+                            if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
+                                for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chanTmp)==0 && strcasecmp(gTabs[t].server, isolated_packet_server)==0){
+                                    bool exists=false;
+                                    for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], nickTmp)==0) exists=true;
+                                    if(!exists && gTabs[t].nick_count<12){
+                                        strncpy(gTabs[t].nicks[gTabs[t].nick_count], nickTmp,15);
+                                        gTabs[t].nicks[gTabs[t].nick_count][15]='\0';
+                                        gTabs[t].nicks_away[gTabs[t].nick_count]=false;
+                                        gTabs[t].nick_count++;
+                                    }
+                                    break;
+                                }
+                                xSemaphoreGive(irc_mutex);
+                            }
+                        }
+                    }
+                    continue;
                 }
 
                 // LAYER B: DYNAMIC CHANNEL SYNC - PART EVENT EXTRACTION (STATE MACHINE DELETION ENGINE)
@@ -3177,7 +3307,7 @@ void irc_network_task(void* pvParameters) {
                     }
                     if((chan.startsWith("#")||chan.startsWith("&")) && modeStr.length()>0){
                         if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE){
-                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chan.c_str())==0 && strcasecmp(gTabs[t].server, isolated_packet_server.c_str())==0){
+                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name, chan.c_str())==0 && strcasecmp(gTabs[t].server, isolated_packet_server)==0){
                                 strncpy(gTabs[t].modes, modeStr.c_str(), sizeof(gTabs[t].modes)-1);
                                 break;
                             }
@@ -3194,6 +3324,8 @@ void irc_network_task(void* pvParameters) {
                         xSemaphoreGive(irc_mutex);
                         ui_needs_redraw = true;
                     }
+                    // Do not show JOIN in main screen / current tab chat - already handled via tab creation
+                    if (line.indexOf(" JOIN ") != -1) continue;
                 }
                 String network_context = String(discovered_networks[i]);
                 if (network_context.length() == 0) network_context = "BNC";
@@ -3345,6 +3477,7 @@ void irc_network_task(void* pvParameters) {
         }
         esp_task_wdt_reset(); // idle heartbeat ensures 4s TWDT never fires spuriously
     }
+    }
 }
 
 void custom_ui_loop_task(void* pvParameters) {
@@ -3464,6 +3597,21 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
+        // Periodic UI refresh for sparkline/battery/time - ensures auto-update even when idle (was blocked by ui_needs_redraw gate)
+        {
+            static unsigned long last_rssi_tick = 0;
+            if (millis() - last_rssi_tick >= 500) {
+                last_rssi_tick = millis();
+                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
+                rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
+                if (current_app_mode == MODE_CHAT) ui_needs_redraw = true;
+            }
+            static unsigned long last_time_tick = 0;
+            if (millis() - last_time_tick >= 1000) {
+                last_time_tick = millis();
+                if (current_app_mode == MODE_CHAT) ui_needs_redraw = true;
+            }
+        }
         // Hardware Frame-Rate Governor Shield - 30 FPS (33ms) reduces SPI load and flood flicker, atomic push eliminates tearing
         static unsigned long last_hardware_frame_tick = 0;
         // Coalesce flood: if many messages arrived, limit to 30fps; interpolation disabled (no bounce) to avoid extra frames
@@ -3532,21 +3680,21 @@ void setup() {
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
     use_light_theme=false; text_scale=1;
-    // Create full-screen canvas (240x135) for atomic push - eliminates navbar/input flicker
+    // No PSRAM - use 240x109 middle viewport (52KB) bloat-free, never 240x135
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
-    if(!canvas.createSprite(240, 135)){
-        Serial.println("[GFX] 240x135 sprite fail, trying 240x109 fallback");
+    if(!canvas.createSprite(240, 109)){
+        Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
-        if(!canvas.createSprite(240, 109)){
-            Serial.println("[GFX] 240x109 fail, trying 135x214");
-            canvas.createSprite(135, 214);
+        if(!canvas.createSprite(135, 214)){
+            Serial.println("[GFX] 135x214 fail, trying 240x135 last resort");
+            canvas.createSprite(240, 135);
         }
     }
     if(canvas.width()==0 || canvas.height()==0){
-        Serial.println("[GFX] sprite still 0, retry 240x135 after heap trim");
+        Serial.println("[GFX] sprite still 0, retry 240x109 after heap trim");
         for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
         canvas.deleteSprite();
-        canvas.createSprite(240,135);
+        canvas.createSprite(240,109);
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
     canvas.fillSprite(0x0000);
