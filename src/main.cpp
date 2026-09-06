@@ -1178,7 +1178,7 @@ void draw_chat_view() {
     // ==========================================
     if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5)) == pdTRUE) {
         if(canvas.width()==0 || canvas.height()==0){
-            Serial.println("[GFX] canvas 0 in draw, recreating 240x135");
+            Serial.println("[GFX] canvas 0 in draw, recreating viewport");
             canvas.deleteSprite();
             canvas.createSprite(240,135);
         }
@@ -1374,7 +1374,7 @@ void draw_chat_view() {
         }
         xSemaphoreGive(irc_mutex);
     }
-    canvas.pushSprite(0, 0);
+    canvas.pushSprite(0, 12);
 
     // NAVBAR RENDERING SYSTEM - fluid to display_width
     M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
@@ -2229,14 +2229,16 @@ void handle_keyboard_inputs() {
         }
         
         // Hold glitch guard: limit burst to 1 char when holding
-        if (status.word.length() > 1) status.word = status.word.substring(0,1);
+        if (status.word.size() > 1) status.word.resize(1);
         static String last_hold_word=""; static unsigned long last_hold_ms=0;
-        if (status.word.length()>0 && status.word == last_hold_word && millis() - last_hold_ms < 400) {
+        String _hold_cur;
+        for(auto c: status.word) _hold_cur += c;
+        if (_hold_cur.length()>0 && _hold_cur == last_hold_word && millis() - last_hold_ms < 400) {
             // same char held, slow repeat to 400ms
             ui_needs_redraw=false;
             return;
         }
-        if (status.word.length()>0) { last_hold_word=status.word; last_hold_ms=millis(); }
+        if (_hold_cur.length()>0) { last_hold_word=_hold_cur; last_hold_ms=millis(); }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
@@ -3101,7 +3103,7 @@ void custom_ui_loop_task(void* pvParameters) {
                                     canvas.deleteSprite();
                                     if(!canvas.createSprite(dw, dh)){
                                         Serial.println("[GFX] sprite fail, fallback 240x135");
-                                        canvas.createSprite(240,135);
+                                        canvas.createSprite(240, 109);
                                     }
                                     canvas.fillSprite(0x0000);
                                     xSemaphoreGive(irc_mutex);
@@ -3287,16 +3289,16 @@ void setup() {
     cfg.internal_imu = true;
     M5Cardputer.begin(cfg, true); // Initialize display and keyboard matrix cleanly
     M5Cardputer.Display.setRotation(1);
+    use_light_theme=false; text_scale=1;
     // Create canvas sprite for middle viewport - must be done after Display init
     // Check heap and fallback if 240x135 fails (black screen)
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
     if(!canvas.createSprite(240, 135)){
-        Serial.println("[GFX] 240x135 sprite fail, trying 240x100 fallback");
-        // free some heap aggressively
+        Serial.println("[GFX] 240x135 sprite fail, trying 135x240 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
-        if(!canvas.createSprite(240, 100)){
-            Serial.println("[GFX] 240x100 fail, trying 135x100");
-            canvas.createSprite(135, 100);
+        if(!canvas.createSprite(135, 240)){
+            Serial.println("[GFX] 135x240 fail, trying 240x100");
+            canvas.createSprite(240, 100);
         }
     }
     if(canvas.width()==0 || canvas.height()==0){
@@ -3396,6 +3398,14 @@ void setup() {
     load_alias_list();
     load_highlight_list();
 
+    // Force visible brightness at boot (80) after all init, before draw
+    M5Cardputer.Display.setBrightness(80);
+    g_backlight_level=80;
+    // Ensure canvas is valid before boot
+    if(canvas.width()==0 || canvas.height()==0){
+        canvas.deleteSprite();
+        canvas.createSprite(240,135);
+    }
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
     
