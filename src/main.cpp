@@ -822,16 +822,21 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         uint32_t active_mon = ((current_sync_sec / 2629743) % 12) + 1; 
         uint32_t active_day = ((current_sync_sec / 86400) % 31) + 1;   
 
-        String safe_server = String(t.server);
-        safe_server.replace("/", "_"); safe_server.replace("\\", "_"); safe_server.replace("#", "_"); safe_server.replace("&", "_"); safe_server.replace("~", "_"); safe_server.trim();
-        String safe_room = String(t.name);
-        safe_room.replace("/", "_"); safe_room.replace("\\", "_"); safe_room.replace("#", "_"); safe_room.replace("&", "_"); safe_room.replace("~", "_"); safe_room.trim();
+        char safe_server[32]={0}, safe_room[32]={0};
+        strncpy(safe_server, t.server, 31); strncpy(safe_room, t.name, 31);
+        for(char *p=safe_server;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
+        for(char *p=safe_room;*p;p++) if(*p=='/'||*p=='\\'||*p=='#'||*p=='&'||*p=='~') *p='_';
+        // trim
+        { char *s=safe_server; while(*s==' '||*s=='\t') s++; if(s!=safe_server) memmove(safe_server,s,strlen(s)+1);
+          for(int i=strlen(safe_server)-1;i>=0 && (safe_server[i]==' '||safe_server[i]=='\t');i--) safe_server[i]='\0'; }
+        { char *s=safe_room; while(*s==' '||*s=='\t') s++; if(s!=safe_room) memmove(safe_room,s,strlen(s)+1);
+          for(int i=strlen(safe_room)-1;i>=0 && (safe_room[i]==' '||safe_room[i]=='\t');i--) safe_room[i]='\0'; }
 
         char dir_path_buffer[64] = {0};
-        snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server.c_str());
+        snprintf(dir_path_buffer, sizeof(dir_path_buffer), "/irc/logs/%s", safe_server);
         if (!SD.exists(dir_path_buffer)) SD.mkdir(dir_path_buffer);
         char file_path_buffer[128] = {0};
-        snprintf(file_path_buffer, sizeof(file_path_buffer), "/irc/logs/%s/%s_%04d_%02d_%02d.log", safe_server.c_str(), safe_room.c_str(), active_yr, active_mon, active_day);
+        snprintf(file_path_buffer, sizeof(file_path_buffer), "/irc/logs/%s/%s_%04d_%02d_%02d.log", safe_server, safe_room, active_yr, active_mon, active_day);
 
         // If path changed, flush previous cache first
         if (strcmp(log_sector_current_path, file_path_buffer) != 0) {
@@ -1378,27 +1383,27 @@ void draw_chat_view() {
 
     // NAVBAR RENDERING SYSTEM - fluid to display_width
     M5Cardputer.Display.fillRect(0, 0, display_width, 12, 0x0841);
-    String nav_server_str = String(gTabs[current_tab_index].server);
-    String nav_chan_str = String(gTabs[current_tab_index].name);
-    String full_nav_str = "[" + nav_server_str + "] " + nav_chan_str;
-    int nav_text_width = canvas.textWidth(full_nav_str.c_str());
-    String display_server = nav_server_str;
+    char nav_server_str[32]={0}, nav_chan_str[32]={0};
+    strncpy(nav_server_str, gTabs[current_tab_index].server,31); strncpy(nav_chan_str, gTabs[current_tab_index].name,31);
+    char full_nav_str[70]={0}; snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",nav_server_str,nav_chan_str);
+    int nav_text_width = canvas.textWidth(full_nav_str);
+    char display_server[32]={0}; strncpy(display_server, nav_server_str,31);
     if (nav_text_width > navbar_clamp_x) {
-        int server_len = nav_server_str.length();
-        if (server_len > 6) display_server = nav_server_str.substring(0, 4) + "..." + nav_server_str.substring(server_len - 2);
-        else if (server_len > 4) display_server = nav_server_str.substring(0, 2) + "..." + nav_server_str.substring(server_len - 2);
-        full_nav_str = "[" + display_server + "] " + nav_chan_str;
-        nav_text_width = canvas.textWidth(full_nav_str.c_str());
+        int server_len = strlen(nav_server_str);
+        if (server_len > 6) { strncpy(display_server, nav_server_str,4); display_server[4]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+        else if (server_len > 4) { strncpy(display_server, nav_server_str,2); display_server[2]='\0'; strcat(display_server,"..."); strncat(display_server, nav_server_str+server_len-2,2); }
+        snprintf(full_nav_str,sizeof(full_nav_str),"[%s] %s",display_server,nav_chan_str);
+        nav_text_width = canvas.textWidth(full_nav_str);
         if (nav_text_width > navbar_clamp_x) {
             int max_chan = is_vertical ? 6 : 10;
-            if ((int)nav_chan_str.length() > max_chan) nav_chan_str = nav_chan_str.substring(0, max_chan - 3) + "...";
+            if ((int)strlen(nav_chan_str) > max_chan) { nav_chan_str[max_chan-3]='\0'; strcat(nav_chan_str,"..."); }
         }
     }
     M5Cardputer.Display.setTextColor(0x7BEF, 0x0841); M5Cardputer.Display.setCursor(2, 2);
-    M5Cardputer.Display.printf("[%s]", display_server.c_str());
+    M5Cardputer.Display.printf("[%s]", display_server);
     int chan_x = is_vertical ? 45 : 54;
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0841); M5Cardputer.Display.setCursor(chan_x, 2);
-    char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str.c_str(), is_vertical ? 6 : 8);
+    char truncated_name[12] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 8);
     M5Cardputer.Display.print(truncated_name);
 
     // Connection indicator removed - keep sparkline only per user (was bunched)
@@ -1480,10 +1485,12 @@ void draw_chat_view() {
     M5Cardputer.Display.setCursor(4, input_cursor_y);
     M5Cardputer.Display.print("> ");
     M5Cardputer.Display.setTextColor(0xFFFF, 0x0000);
-    // For vertical 135px width, wrap input display if needed but keep single line preview truncated
-    String disp_input = input_buffer; if(disp_input.length()>31) disp_input = disp_input.substring(disp_input.length()-31);
-    if (is_vertical && disp_input.length() > 18) disp_input = disp_input.substring(disp_input.length() - 18);
-    M5Cardputer.Display.print(disp_input.c_str());
+    // For vertical 135px width, truncated preview without String heap (hold-safe)
+    { int l=input_buffer.length(); const char* s=input_buffer.c_str();
+      int off=0; if(l>31) off=l-31;
+      int dlen=l-off; if(is_vertical && dlen>18) off=l-18;
+      M5Cardputer.Display.print(s+off);
+    }
     M5Cardputer.Display.setTextSize(1);
     // Textbox counter at far-right, red at >390
     {
@@ -1500,16 +1507,16 @@ void draw_chat_view() {
 void handle_keyboard_inputs() {
     if (M5Cardputer.Keyboard.isPressed()) {
         last_user_keyboard_input_tick = millis(); // Refresh activity timer anchor
-        // Instant restore from 35% partial dimmer: full operational brightness 100% duty, pin HIGH, refresh canvas
+        // Instant restore from 35% partial dimmer: request full brightness, let ui loop throttle actual setBrightness
         if (current_app_mode == MODE_CHAT) {
-            g_backlight_level = 255; M5Cardputer.Display.setBrightness(255);
-            // pin 38 tied to backlight via scaling (no forced HIGH)
+            g_backlight_level = 255;
+            // throttle avoids LE/Speaker clash, actual Display.setBrightness in ui loop
             ui_needs_redraw = true;
         }
     }
     if (!M5Cardputer.Keyboard.isPressed()) return;
-    // Explicit 150ms hardware bounce filter guard to stop character double-chatter
-    if (millis() - last_keypress_debounce < 150) return;
+    // Explicit 180ms hardware bounce filter + WDT feed to stop flicker double-chatter
+    if (millis() - last_keypress_debounce < 180) { esp_task_wdt_reset(); return; }
     last_keypress_debounce = millis();
     last_input_time = millis(); // Fresh backlight dim timer
     // Fn mode debounce 300ms to stop holding Fn glitch
@@ -1518,7 +1525,7 @@ void handle_keyboard_inputs() {
     if (is_fn_now && millis() - last_fn_debounce < 300) {
         // allow only scrollback/history which need repeat, but not mode switches
         bool isModeKey = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('r');
-        if (isModeKey) return;
+        if (isModeKey) { esp_task_wdt_reset(); return; }
     }
     if (is_fn_now) last_fn_debounce = millis();
     
@@ -1532,7 +1539,7 @@ void handle_keyboard_inputs() {
         String cur_word;
         for(auto c: status.word) cur_word += c;
         if (cur_word.length()>0 && cur_word == last_hold_word && millis() - last_hold_ms < 400) {
-            return;
+            esp_task_wdt_reset(); return;
         }
         if (cur_word.length()>0) { last_hold_word = cur_word; last_hold_ms = millis(); }
         if (cur_word.length() > 1) cur_word = cur_word.substring(0,1);
@@ -1540,7 +1547,7 @@ void handle_keyboard_inputs() {
     // Fn hold ghost guard: if only Fn held with no other key word/enter/del, avoid ghost matrix scan
     if (is_fn && status.word.empty() && !status.enter && !status.del) {
         bool anyFnCombo = M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q') || M5Cardputer.Keyboard.isKeyPressed('s') || M5Cardputer.Keyboard.isKeyPressed('c') || M5Cardputer.Keyboard.isKeyPressed('r') || M5Cardputer.Keyboard.isKeyPressed('b') || M5Cardputer.Keyboard.isKeyPressed('m') || M5Cardputer.Keyboard.isKeyPressed(';') || M5Cardputer.Keyboard.isKeyPressed('.') || M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/') || M5Cardputer.Keyboard.isKeyPressed(' ') || M5Cardputer.Keyboard.isKeyPressed('f');
-        if (!anyFnCombo) return;
+        if (!anyFnCombo) { esp_task_wdt_reset(); return; }
     }
     
     // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P) - edge
@@ -1556,7 +1563,7 @@ void handle_keyboard_inputs() {
             return;
         }
         if(!cur_p) was_p_prev=false;
-        if(cur_p) return; // hold, don't fall through to other handlers
+        if(cur_p) { esp_task_wdt_reset(); return; } // hold, don't fall through to other handlers
     }
 
     // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O) + Theme
@@ -1676,8 +1683,7 @@ void handle_keyboard_inputs() {
             if (rotation_locked) locked_rotation = M5Cardputer.Display.getRotation();
             queueLed(40, 500); // Mode 40 lock blip
             // Visual lock persists in navbar, no canvas resize needed on lock alone
-            g_backlight_level = 255; M5Cardputer.Display.setBrightness(255);
-            // pin 38 tied to backlight via scaling (no forced HIGH)
+            g_backlight_level = 255;
             last_user_keyboard_input_tick = millis();
             last_input_time = millis();
             ui_needs_redraw = true;
@@ -2080,14 +2086,14 @@ void handle_keyboard_inputs() {
                     bool sdL=false; if(sd_mutex) sdL=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sdL=true;
                     File dir = SD.open("/irc/logs");
                     if (dir && dir.isDirectory()) {
-                        // collect up to 10 logs
-                        String logs[10]; int cnt=0;
+                        // collect up to 10 logs - char heap-safe
+                        char logs[10][64]={0}; int cnt=0;
                         File f = dir.openNextFile();
-                        while(f && cnt<10){ if(!f.isDirectory()){ logs[cnt]=String(f.path()); cnt++; } f.close(); f=dir.openNextFile(); }
+                        while(f && cnt<10){ if(!f.isDirectory()){ strncpy(logs[cnt], f.path(),63); cnt++; } f.close(); f=dir.openNextFile(); esp_task_wdt_reset(); }
                         dir.close();
                         if(sdL && sd_mutex) xSemaphoreGive(sd_mutex);
                         if (menu_selection_idx < cnt) {
-                            String p = logs[menu_selection_idx];
+                            char p[64]; strncpy(p, logs[menu_selection_idx],63);
                             bool sdL2=false; if(sd_mutex) sdL2=(xSemaphoreTake(sd_mutex,pdMS_TO_TICKS(50))==pdTRUE); else sdL2=true;
                             File lf = SD.open(p);
                             if (lf) {
@@ -2228,17 +2234,17 @@ void handle_keyboard_inputs() {
             }
         }
         
-        // Hold glitch guard: limit burst to 1 char when holding
+        // Hold glitch guard: limit burst to 1 char when holding + WDT feed
         if (status.word.size() > 1) status.word.resize(1);
-        static String last_hold_word=""; static unsigned long last_hold_ms=0;
+        static String last_hold_word2=""; static unsigned long last_hold_ms2=0;
         String _hold_cur;
         for(auto c: status.word) _hold_cur += c;
-        if (_hold_cur.length()>0 && _hold_cur == last_hold_word && millis() - last_hold_ms < 400) {
-            // same char held, slow repeat to 400ms
-            ui_needs_redraw=false;
+        if (_hold_cur.length()>0 && _hold_cur == last_hold_word2 && millis() - last_hold_ms2 < 400) {
+            // same char held, slow repeat to 400ms, suppress flicker redraw
+            ui_needs_redraw=false; esp_task_wdt_reset();
             return;
         }
-        if (_hold_cur.length()>0) { last_hold_word=_hold_cur; last_hold_ms=millis(); }
+        if (_hold_cur.length()>0) { last_hold_word2=_hold_cur; last_hold_ms2=millis(); }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             if (is_fn && (c == ';' || c == '/' || c == 'p' || c == 's' || c == 'o')) continue;
@@ -3100,9 +3106,10 @@ void custom_ui_loop_task(void* pvParameters) {
                                 if(irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(50))==pdTRUE){
                                     int dw = M5Cardputer.Display.width();
                                     int dh = M5Cardputer.Display.height();
+                                    int vh = dh - 12 - 14; if(vh<100) vh=109; if(vh>214) vh=dh;
                                     canvas.deleteSprite();
-                                    if(!canvas.createSprite(dw, dh)){
-                                        Serial.println("[GFX] sprite fail, fallback 240x135");
+                                    if(!canvas.createSprite(dw, vh)){
+                                        Serial.println("[GFX] sprite fail, fallback 240x109");
                                         canvas.createSprite(240, 109);
                                     }
                                     canvas.fillSprite(0x0000);
@@ -3159,7 +3166,15 @@ void custom_ui_loop_task(void* pvParameters) {
             }
         }
         g_backlight_level = target_backlight_level;
-        M5Cardputer.Display.setBrightness(target_backlight_level);
+        { static int last_bl=-1; static unsigned long last_bl_ms=0;
+          if(target_backlight_level!=last_bl && millis()-last_bl_ms>100){
+              // avoid LE DC clash with Speaker tone (shared timer)
+              if(!M5.Speaker.isPlaying()){
+                  M5Cardputer.Display.setBrightness(target_backlight_level);
+                  last_bl=target_backlight_level; last_bl_ms=millis();
+              }
+          }
+        }
         // Periodic log flush every 1s to make channel logs visible (was only on 512B full)
         {
             static unsigned long last_log_flush=0;
@@ -3293,20 +3308,20 @@ void setup() {
     // Create canvas sprite for middle viewport - must be done after Display init
     // Check heap and fallback if 240x135 fails (black screen)
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
-    if(!canvas.createSprite(240, 135)){
-        Serial.println("[GFX] 240x135 sprite fail, trying 135x240 fallback");
+    if(!canvas.createSprite(240, 109)){
+        Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
-        if(!canvas.createSprite(135, 240)){
-            Serial.println("[GFX] 135x240 fail, trying 240x100");
+        if(!canvas.createSprite(135, 214)){
+            Serial.println("[GFX] 135x214 fail, trying 240x100");
             canvas.createSprite(240, 100);
         }
     }
     if(canvas.width()==0 || canvas.height()==0){
-        Serial.println("[GFX] sprite still 0, retry 240x135 after heap trim");
+        Serial.println("[GFX] sprite still 0, retry 240x109 after heap trim");
         // trim gTabs to free heap then retry
         for(int t=0;t<gTabCount;t++) if(gTabs[t].line_count>5) gTabs[t].line_count=5;
         canvas.deleteSprite();
-        canvas.createSprite(240,135);
+        canvas.createSprite(240,109);
     }
     Serial.printf("[GFX] sprite %dx%d ok\n", canvas.width(), canvas.height());
     canvas.fillSprite(0x0000);
@@ -3401,10 +3416,10 @@ void setup() {
     // Force visible brightness at boot (80) after all init, before draw
     M5Cardputer.Display.setBrightness(80);
     g_backlight_level=80;
-    // Ensure canvas is valid before boot
+    // Ensure canvas is valid before boot (viewport 109)
     if(canvas.width()==0 || canvas.height()==0){
         canvas.deleteSprite();
-        canvas.createSprite(240,135);
+        canvas.createSprite(240,109);
     }
     // Setup complete. Instantly unblock Core 1 graphics engine to draw status lines
     system_booted = true; 
