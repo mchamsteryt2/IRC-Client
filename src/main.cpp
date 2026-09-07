@@ -1225,17 +1225,19 @@ void draw_chat_view() {
                 channel_print_counter++;
             }
         }
-        int ch2 = canvas.height();
-        int bar_y = ch2 - 13;
-        canvas.fillRect(0, bar_y, display_width, 13, 0x0841);
-        canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
-        if (nav_filter_active) {
-            canvas.setCursor(6, bar_y + 2); canvas.setTextColor(0xFFE0); canvas.printf("Find:%s_", nav_filter);
-        } else {
-            canvas.setCursor(6, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print(";/. Scroll | Enter:Open Fn+F Find Fn+S Pin");
-        }
         canvas.pushSprite(0, 0); 
         if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), 0x0000);
+        { // footer glued to screen bottom for full-height menu look
+            int fy = display_height - 13;
+            M5Cardputer.Display.fillRect(0, fy, display_width, 13, 0x0841);
+            M5Cardputer.Display.drawFastHLine(0, fy, display_width, theme_dim_color());
+            M5Cardputer.Display.setTextSize(text_scale);
+            if (nav_filter_active) {
+                M5Cardputer.Display.setTextColor(0xFFE0); M5Cardputer.Display.setCursor(6, fy + 2); M5Cardputer.Display.printf("Find:%s_", nav_filter);
+            } else {
+                M5Cardputer.Display.setTextColor(0xFFFF); M5Cardputer.Display.setCursor(6, fy + 2); M5Cardputer.Display.print(";/. Scroll | Enter:Open Fn+F Find Fn+S Pin");
+            }
+        }
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
@@ -1341,14 +1343,14 @@ void draw_chat_view() {
                 canvas.setTextColor(0xF800); canvas.setCursor(10, 102); canvas.print("No networks");
             }
         }
-        int ch3 = canvas.height();
-        int bar_y = ch3 - 13;
-        canvas.fillRect(0, bar_y, display_width, 13, 0x0841);
-        canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
-        canvas.setCursor(10, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print("Esc: Exit | ,/. Adjust Value");
         canvas.pushSprite(0, 0); 
         { uint16_t menu_bg = (current_app_mode==MODE_THEME && use_light_theme) ? 0xFFFF : 0x0000;
-          if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), menu_bg); }
+          if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), menu_bg);
+          int fy = display_height - 13; // footer glued to screen bottom for full-height menu look
+          M5Cardputer.Display.fillRect(0, fy, display_width, 13, 0x0841);
+          M5Cardputer.Display.drawFastHLine(0, fy, display_width, theme_dim_color());
+          M5Cardputer.Display.setTextSize(text_scale);
+          M5Cardputer.Display.setTextColor(0xFFFF); M5Cardputer.Display.setCursor(10, fy + 2); M5Cardputer.Display.print("Esc: Exit | ,/. Adjust Value"); }
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
@@ -1611,6 +1613,7 @@ void draw_chat_view() {
                     hy+=4;
                 }
                 if(discovered_network_count==0 && hy <= wire_y-8) canvas.fillRect(sb_x+2, hy, 2, 2, 0x4208);
+                if (hy < 58) hy = 58; // pin status rows to fixed heights mirroring left rail (RSSI/backup)
                 // IRC aggregate link y=hy: green any 001/376/900, amber TCP up no handshake, red down, dim no nets
                 if (hy <= wire_y-8) {
                     uint16_t irc_c = 0x4208;
@@ -1664,6 +1667,7 @@ void draw_chat_view() {
                 dot_y+=4;
                 if(dot_y > wire_y-8) break;
             }
+            if (dot_y < 58) dot_y = 58; // pin status rows to fixed heights mirroring right rail (IRC/SD)
             // RSSI quality dot: red down, green >=-60, amber >=-75, red weak (matches -85dBm LED-22 alert)
             if (dot_y <= wire_y-8) {
                 uint16_t rssi_c = 0xF800;
@@ -1889,7 +1893,9 @@ void handle_keyboard_inputs() {
         cur.reserve(status.word.size());
         for(auto c: status.word) cur += c;
         if (cur.length()>0 && cur == last_hold_word && millis() - last_hold_ms < 90) {
-            esp_task_wdt_reset(); return;
+            // Fn combos bypass: never eat the poll carrying a hotkey edge (Fn+P/O/I/Q/L...)
+            bool fnCombo = is_fn && (M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q'));
+            if (!fnCombo) { esp_task_wdt_reset(); return; }
         }
         if (cur.length()>0) { last_hold_word = cur; last_hold_ms = millis(); }
     }
@@ -1902,6 +1908,7 @@ void handle_keyboard_inputs() {
     // Hotkey Intercept A: Toggle Multi-Network Channel Navigator Hub (Fn + P) - edge
     {
         static bool was_p_prev=false;
+        static unsigned long p_hold_since=0;
         bool cur_p = is_fn && M5Cardputer.Keyboard.isKeyPressed('p');
         if(cur_p && !was_p_prev){
             current_app_mode = (current_app_mode == MODE_NAVIGATOR) ? MODE_CHAT : MODE_NAVIGATOR;
@@ -1910,16 +1917,18 @@ void handle_keyboard_inputs() {
             // clear chat scroll when returning to chat from navigator
             if (current_app_mode == MODE_CHAT) { scrollback_offset=0; scrollback_offset_idx=0; is_scrollback_active=false; scrollback_mode_active=false; }
             set_led_mode(18);
-            was_p_prev=true;
+            was_p_prev=true; p_hold_since=millis();
             return;
         }
-        if(!cur_p) was_p_prev=false;
+        if(!cur_p) { was_p_prev=false; p_hold_since=0; }
+        else if (millis()-p_hold_since > 1000) { was_p_prev=false; p_hold_since=millis(); } // stuck-high expiry: missed key-up must not kill hotkey
         if(cur_p) { esp_task_wdt_reset(); return; } // hold, don't fall through to other handlers
     }
 
     // Hotkey Intercept B: Cycle Hardware & Bouncer Configuration Menus (Fn + O) + Theme - edge triggered to prevent hold flicker
     {
         static bool was_o_prev=false;
+        static unsigned long o_hold_since=0;
         bool cur_o = is_fn && M5Cardputer.Keyboard.isKeyPressed('o');
         if(cur_o && !was_o_prev){
             // Fix: from any mode (including NAVIGATOR/LOGS/WHOIS) go to SETTINGS, not just CHAT
@@ -1931,10 +1940,11 @@ void handle_keyboard_inputs() {
             menu_selection_idx = 0;
             ui_needs_redraw = true; chrome_needs_redraw = true; input_needs_redraw = true; sparkline_needs_redraw = true;
             set_led_mode(18);
-            was_o_prev=true;
+            was_o_prev=true; o_hold_since=millis();
             return;
         }
-        if(!cur_o) was_o_prev=false;
+        if(!cur_o) { was_o_prev=false; o_hold_since=0; }
+        else if (millis()-o_hold_since > 1000) { was_o_prev=false; o_hold_since=millis(); } // stuck-high expiry: missed key-up must not kill hotkey
         if(cur_o) { esp_task_wdt_reset(); return; }
     }
     {
