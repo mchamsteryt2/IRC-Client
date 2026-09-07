@@ -160,7 +160,7 @@ inline uint16_t theme_accent_color() {
     if(theme_accent%5==4) return use_light_theme ? 0x0000 : 0xFFFF;
     switch(theme_accent%5){ case 0: return 0xFD20; case 1: return 0xFDA0; case 2: return 0x07FF; case 3: return 0xF81F; default: return 0xFD20; }
 }
-inline uint16_t theme_dim_color() { return use_light_theme ? 0x5AEB : 0x7BEF; }
+inline uint16_t theme_dim_color() { return use_light_theme ? 0x4208 : 0x7BEF; } // dark gray on paper, ice on dark
 char alias_names[3][16] = {{0}};
 char alias_cmds[3][64] = {{0}};
 int alias_count = 0;
@@ -178,6 +178,8 @@ WiFiClientSecure clients[MAX_NETWORKS];
 bool network_authenticated[MAX_NETWORKS] = {false};
 bool network_handshake_complete[MAX_NETWORKS] = {false};
 unsigned long network_reconnect_cooldown[MAX_NETWORKS] = {0};
+unsigned long net_last_inbound[MAX_NETWORKS] = {0}; // stall watchdog: last inbound wire bytes per slot
+bool net_ping_outstanding[MAX_NETWORKS] = {false}; // stall probe in flight per slot
 volatile float ui_scroll_y_interpolation = 0.0f;
 volatile bool kb_interrupt_fired = false;
 void IRAM_ATTR kb_isr() { kb_interrupt_fired = true; }
@@ -900,8 +902,9 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         ChatLine &cl = *clp;
         if (timeStr) strncpy(cl.timeStr, timeStr, sizeof(cl.timeStr)-1);
         else strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
-        strncpy(cl.nick, source, sizeof(cl.nick)-1);
-        strncpy(cl.message, msg, sizeof(cl.message)-1);
+        cl.timeStr[sizeof(cl.timeStr)-1]='\0';
+        strncpy(cl.nick, source, sizeof(cl.nick)-1); cl.nick[sizeof(cl.nick)-1]='\0';
+        strncpy(cl.message, msg, sizeof(cl.message)-1); cl.message[sizeof(cl.message)-1]='\0';
         cl.color = color;
         // Fixed: case-insensitive word-boundary mention, not server noise, muted suppress
         cl.is_highlight = is_mention(msg, irc_nick) && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0 && !is_ignored(source) && !t.muted;
@@ -922,22 +925,22 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         strncpy(snap_nick, cl.nick, sizeof(snap_nick)-1);
         strncpy(snap_msg, cl.message, sizeof(snap_msg)-1);
 
-        // Cross-Network Highlights Duplicator Pass - fixed: only true PRIVMSG mentions, not server/status noise (still under irc_mutex)
-        if (is_mention(msg, irc_nick) && current_tab_index != 0 && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0) {
+        // Cross-Network Highlights Duplicator Pass - user-originated only (nicks have no dots), ring discipline
+        if (is_mention(msg, irc_nick) && current_tab_index != 0 && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0 && strchr(source,'.')==nullptr) {
             Tab &mentions_tab = gTabs[0]; // Isolate Tab 0 explicitly
-            if (mentions_tab.line_count >= MSG_BUFFER_SIZE) {
-                memmove(&mentions_tab.lines[0], &mentions_tab.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
-                mentions_tab.line_count = MSG_BUFFER_SIZE - 1;
-            }
-                            ChatLine &ml = mentions_tab.lines[mentions_tab.line_count];
+            ChatLine *mlp;
+            if (mentions_tab.line_count < MSG_BUFFER_SIZE) mlp = &mentions_tab.lines[(mentions_tab.head + mentions_tab.line_count) % MSG_BUFFER_SIZE];
+            else { mentions_tab.head = (mentions_tab.head + 1) % MSG_BUFFER_SIZE; mlp = &mentions_tab.lines[(mentions_tab.head + MSG_BUFFER_SIZE - 1) % MSG_BUFFER_SIZE]; }
+                            ChatLine &ml = *mlp;
                             if (timeStr) strncpy(ml.timeStr, timeStr, sizeof(ml.timeStr)-1);
                             else strncpy(ml.timeStr, "00:00", sizeof(ml.timeStr)-1);
+                            ml.timeStr[sizeof(ml.timeStr)-1]='\0';
                             // Prefix source context block clearly as: [Network]User - accent synced
                             snprintf(ml.nick, sizeof(ml.nick), "[%s]%s", snap_server, source);
-                            strncpy(ml.message, msg, sizeof(ml.message)-1);
+                            strncpy(ml.message, msg, sizeof(ml.message)-1); ml.message[sizeof(ml.message)-1]='\0';
                             ml.color = theme_accent_color();
                             ml.is_highlight = true;
-                            mentions_tab.line_count++;
+                            if (mentions_tab.line_count < MSG_BUFFER_SIZE) mentions_tab.line_count++;
         }
         append_line_to_sd_log(snap_room, source, msg);
         bool needHeapLog = false; int heapLargest = 0;
@@ -1118,6 +1121,7 @@ void draw_chat_view() {
     if (current_app_mode == MODE_NAVIGATOR) {
         // Clear fluid frame
         canvas.fillSprite(0x0000); 
+        canvas.setTextSize(1); // chrome pinned: 2x is chat-only, menus would clip
         int left_w = is_vertical ? (display_width/2 - 1) : 114;
         int right_x = is_vertical ? (display_width/2 + 1) : 117;
         int right_w = is_vertical ? (display_width - right_x) : 123;
@@ -1165,7 +1169,7 @@ void draw_chat_view() {
         int active_window_scroll_offset = 0;
         if (nav_channel_select_idx >= 7) active_window_scroll_offset = nav_channel_select_idx - 6;
         if (total_visible_rooms > 7) {
-            canvas.setTextColor(0x7BEF);
+            canvas.setTextColor(theme_dim_color());
             if (active_window_scroll_offset>0) { canvas.setCursor(right_x + right_w -10, 18); canvas.print("^"); }
             if (active_window_scroll_offset + 7 < total_visible_rooms) { canvas.setCursor(right_x + right_w -10, display_height-20); canvas.print("v"); }
         }
@@ -1210,28 +1214,19 @@ void draw_chat_view() {
                     }
                     // per-room metadata: nick count + pinned marker
                     if (gTabs[i].pinned) { canvas.setTextColor(0xFFE0); canvas.print(" P"); }
-                    if (gTabs[i].nick_count>0) { canvas.setTextColor(0x7BEF); canvas.printf(" %d", gTabs[i].nick_count); }
-                    // last-message preview dim below (6px offset, 12-char) - char no String
-                    if (gTabs[i].line_count>0 && !is_vertical) {
-                        char last[13]={0};
-                        strncpy(last, gTabs[i].lines[gTabs[i].line_count-1].message, 12);
-                        last[12]='\0';
-                        canvas.setCursor(right_x+8, draw_y_row_coordinate+7);
-                        canvas.setTextColor(0x4208);
-                        canvas.print(last);
-                    }
+                    if (gTabs[i].nick_count>0) { canvas.setTextColor(theme_dim_color()); canvas.printf(" %d", gTabs[i].nick_count); }
                     rendered_rows_count++;
                 }
                 channel_print_counter++;
             }
         }
         canvas.pushSprite(0, 0); 
-        if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), 0x0000);
-        { // footer glued to screen bottom for full-height menu look
+        { // footer zone fills to screen bottom in bar color so no black band sits above hints
+            int fz = canvas.height();
+            if (fz < display_height) M5Cardputer.Display.fillRect(0, fz, display_width, display_height - fz, 0x0841);
             int fy = display_height - 13;
-            M5Cardputer.Display.fillRect(0, fy, display_width, 13, 0x0841);
-            M5Cardputer.Display.drawFastHLine(0, fy, display_width, theme_dim_color());
-            M5Cardputer.Display.setTextSize(text_scale);
+            M5Cardputer.Display.drawFastHLine(0, fz, display_width, theme_dim_color());
+            M5Cardputer.Display.setTextSize(1);
             if (nav_filter_active) {
                 M5Cardputer.Display.setTextColor(0xFFE0); M5Cardputer.Display.setCursor(6, fy + 2); M5Cardputer.Display.printf("Find:%s_", nav_filter);
             } else {
@@ -1250,13 +1245,14 @@ void draw_chat_view() {
     // ==========================================
     if (current_app_mode == MODE_SETTINGS || current_app_mode == MODE_BOUNCER || current_app_mode == MODE_THEME || current_app_mode == MODE_LOGS || current_app_mode == MODE_WHOIS || current_app_mode == MODE_WIFI) {
         canvas.fillSprite(0x0000); 
+        canvas.setTextSize(1); // chrome pinned: 2x is chat-only, menu rows would overlap
         // Theme palette: light vs dark background
         uint16_t bg = use_light_theme ? 0xFFFF : 0x0000;
         uint16_t fg = use_light_theme ? 0x0000 : 0xFFFF;
         if (current_app_mode == MODE_THEME) canvas.fillSprite(bg);
         canvas.setTextColor(0xFD20); canvas.setCursor(10, 8);
         if (current_app_mode == MODE_SETTINGS) {
-            canvas.print("--- SYSTEM CONFIGURATIONS ---"); canvas.setTextColor(0xFFFF);
+            canvas.print("--- SYSTEM CONFIGURATIONS ---"); canvas.setTextColor(theme_fg());
             {
                 char utcLab[20]; snprintf(utcLab, sizeof(utcLab), "UTC%+d%s", current_tz_idx, use_dst ? " DST" : "");
                 canvas.setCursor(10, 26); canvas.printf("%s Timezone: %s", (menu_selection_idx == 0 ? ">" : " "), utcLab);
@@ -1266,7 +1262,7 @@ void draw_chat_view() {
             canvas.setCursor(10, 68); canvas.printf("%s Storage Logging: %s", (menu_selection_idx == 3 ? ">" : " "), channel_log_enabled ? "ON" : "OFF");
             canvas.setCursor(10, 82); canvas.printf("%s Debug Log: %s", (menu_selection_idx == 4 ? ">" : " "), debug_log_enabled ? "ON (RAM)" : "OFF");
         } else if (current_app_mode == MODE_BOUNCER) {
-            canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(0xFFFF);
+            canvas.print("--- BOUNCER CONNECTION SCHEMAS ---"); canvas.setTextColor(theme_fg());
             canvas.setCursor(10, 26); canvas.printf("%s Server Host: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)bnc_host);
             canvas.setCursor(10, 40); canvas.printf("%s Port Address: %d", (menu_selection_idx == 1 ? ">" : " "), bnc_port);
             canvas.setCursor(10, 54); canvas.printf("%s Username Key: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)bnc_user);
@@ -1280,7 +1276,7 @@ void draw_chat_view() {
             const char* sndNames[3]={"OFF","MENTION","ALL"};
             canvas.setCursor(10, 82); canvas.printf("%s Sound: %s", (menu_selection_idx == 4 ? ">" : " "), sndNames[sound_profile%3]);
         } else if (current_app_mode == MODE_LOGS) {
-            canvas.print("--- LOG BROWSER ---"); canvas.setTextColor(0xFFFF);
+            canvas.print("--- LOG BROWSER ---"); canvas.setTextColor(theme_fg());
             refresh_log_browser_cache();
             if (log_browser_count==0) {
                 canvas.setCursor(10, 26); canvas.print("SD: /irc/logs (empty)");
@@ -1294,11 +1290,11 @@ void draw_chat_view() {
                     // add simple bars for file presence: use 1 bar per log
                     canvas.printf("%s %s", sel?">":" ", disp);
                 }
-                if (log_browser_count>7) { canvas.setTextColor(0x7BEF); canvas.setCursor(10, 110); canvas.printf("... +%d more", log_browser_count-7); }
-                else { canvas.setTextColor(0x7BEF); canvas.setCursor(10, 110); canvas.print("Enter:preview  ;/. nav"); }
+                if (log_browser_count>7) { canvas.setTextColor(theme_dim_color()); canvas.setCursor(10, 110); canvas.printf("... +%d more", log_browser_count-7); }
+                else { canvas.setTextColor(theme_dim_color()); canvas.setCursor(10, 110); canvas.print("Enter:preview  ;/. nav"); }
             }
         } else if (current_app_mode == MODE_WHOIS) {
-            canvas.print("--- WHOIS ---"); canvas.setTextColor(0xFFFF);
+            canvas.print("--- WHOIS ---"); canvas.setTextColor(theme_fg());
             canvas.setCursor(10, 26); canvas.printf("Nick: %s", whois_cache.nick);
             canvas.setCursor(10, 40); canvas.printf("User: %s@%s", whois_cache.user, whois_cache.host);
             canvas.setCursor(10, 54); canvas.printf("Real: %s", whois_cache.real);
@@ -1307,7 +1303,7 @@ void draw_chat_view() {
             canvas.setCursor(10, 96); canvas.printf("Idle: %d", whois_cache.idle);
             canvas.setCursor(10, 110); canvas.printf("Chans: %.20s", whois_cache.channels);
         } else {
-            canvas.print("--- WI-FI CONFIG MANAGER ---"); canvas.setTextColor(0xFFFF);
+            canvas.print("--- WI-FI CONFIG MANAGER ---"); canvas.setTextColor(theme_fg());
             canvas.setCursor(10, 26); canvas.printf("%s Primary SSID: %s", (menu_selection_idx == 0 ? ">" : " "), (const char*)wifi_ssid);
             canvas.setCursor(10, 40); canvas.printf("%s Primary Pass: [ **** ]", (menu_selection_idx == 1 ? ">" : " "));
             canvas.setCursor(10, 54); canvas.printf("%s Backup Hotspot: %s", (menu_selection_idx == 2 ? ">" : " "), (const char*)wifi_ssid2);
@@ -1316,7 +1312,7 @@ void draw_chat_view() {
             // WiFi scan HUD quick-reconnect (below Y=100, keep textbox integrity)
             int sc = WiFi.scanComplete();
             if (sc == -2) {
-                canvas.setTextColor(0x7BEF); canvas.setCursor(10, 102); canvas.print("Scanning...");
+                canvas.setTextColor(theme_dim_color()); canvas.setCursor(10, 102); canvas.print("Scanning...");
             } else if (sc > 0) {
                 int n = sc > 5 ? 5 : sc;
                 canvas.setTextColor(0xFD20); canvas.setCursor(10, 102); canvas.printf("Found %d:", sc);
@@ -1344,12 +1340,12 @@ void draw_chat_view() {
             }
         }
         canvas.pushSprite(0, 0); 
-        { uint16_t menu_bg = (current_app_mode==MODE_THEME && use_light_theme) ? 0xFFFF : 0x0000;
-          if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), menu_bg);
-          int fy = display_height - 13; // footer glued to screen bottom for full-height menu look
-          M5Cardputer.Display.fillRect(0, fy, display_width, 13, 0x0841);
-          M5Cardputer.Display.drawFastHLine(0, fy, display_width, theme_dim_color());
-          M5Cardputer.Display.setTextSize(text_scale);
+        { // footer zone fills to screen bottom in bar color so no black band sits above hints
+          int fz = canvas.height();
+          if (fz < display_height) M5Cardputer.Display.fillRect(0, fz, display_width, display_height - fz, 0x0841);
+          int fy = display_height - 13;
+          M5Cardputer.Display.drawFastHLine(0, fz, display_width, theme_dim_color());
+          M5Cardputer.Display.setTextSize(1);
           M5Cardputer.Display.setTextColor(0xFFFF); M5Cardputer.Display.setCursor(10, fy + 2); M5Cardputer.Display.print("Esc: Exit | ,/. Adjust Value"); }
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
@@ -1433,14 +1429,15 @@ void draw_chat_view() {
             if (current_y > wire_y - 9) { current_y -= 12*text_scale; continue; }
             
             uint16_t row_bg = theme_row_bg(i % 2 == 0);
-                int text_start_x = is_vertical ? 45 : ((current_tab_index == 0) ? 110 : 70);
+                int text_start_x = is_vertical ? 45 : 64; // tightened nick gap, nicks capped at 7 above
             ChatLine &curLine = t.lines[(t.head + i) % MSG_BUFFER_SIZE];
             const char* msg_text = curLine.message;
             int msg_len = strlen(msg_text);
             int current_char_pos = 0;
-            bool first_line_pass = true;
-            while (current_char_pos < msg_len) {
-                int active_render_x = first_line_pass ? text_start_x : (text_start_x + 6);
+            // Collect wrap chunks first so chunk[0] (message start) draws topmost, continuations below
+            uint8_t coff[40]; uint8_t clen[40]; uint8_t nch = 0;
+            while (current_char_pos < msg_len && nch < 40) {
+                int active_render_x = (nch == 0) ? text_start_x : (text_start_x + 6);
                 int dynamic_chars_budget;
                 if (is_vertical) {
                     dynamic_chars_budget = 15 / text_scale;
@@ -1453,9 +1450,18 @@ void draw_chat_view() {
                 int chunk = dynamic_chars_budget;
                 if (chunk > msg_len - current_char_pos) chunk = msg_len - current_char_pos;
                 if (chunk > 31) chunk = 31;
+                coff[nch] = (uint8_t)current_char_pos; clen[nch] = (uint8_t)chunk;
+                nch++;
+                current_char_pos += chunk;
+            }
+            // Draw last chunk at bottom so the message start sits on top, continuations below
+            for (int k = nch - 1; k >= 0; k--) {
+                if (current_y < viewport_top_y) break;
+                bool is_first = (k == 0);
+                int draw_x = is_first ? text_start_x : (text_start_x + 6);
                 char sub_line[32] = {0};
-                memcpy(sub_line, msg_text + current_char_pos, chunk);
-                sub_line[chunk] = '\0';
+                memcpy(sub_line, msg_text + coff[k], clen[k]);
+                sub_line[clen[k]] = '\0';
                 uint16_t cur_bg = row_bg;
                 if (search_active && search_query[0]) {
                     char lowSub[32]; strncpy(lowSub, sub_line,31); lowSub[31]='\0'; for(char*p=lowSub;*p;p++) *p=tolower(*p);
@@ -1463,40 +1469,34 @@ void draw_chat_view() {
                     if (strstr(lowSub, lowQ)) cur_bg = 0xFFE0;
                 }
                 canvas.fillRect(0, current_y - 2, display_width, 12*text_scale, cur_bg);
-                
-                if (first_line_pass) {
-                    int vline_h = is_vertical ? wire_y : 120;
-                    canvas.drawFastVLine(40, 0, vline_h, 0x7BEF); 
-                    char shortened_nick[9] = {0};
-                    if (strlen(curLine.nick) > 8) {
-                        strncpy(shortened_nick, curLine.nick, 6);
-                        shortened_nick[6] = '\0';
+                if (is_first) {
+                    char shortened_nick[8] = {0};
+                    if (strlen(curLine.nick) > 7) {
+                        strncpy(shortened_nick, curLine.nick, 5);
+                        shortened_nick[5] = '\0';
                         strcat(shortened_nick, "..");
                     } else {
-                        strncpy(shortened_nick, curLine.nick, 8);
-                        shortened_nick[8] = '\0';
+                        strncpy(shortened_nick, curLine.nick, 7);
+                        shortened_nick[7] = '\0';
                     }
-                    if (curLine.is_highlight) { 
-                        canvas.fillRect(8, current_y - 1, 30, 11, theme_accent_color()); canvas.setTextColor(theme_fg()); 
-                    } else { 
-                        canvas.setTextColor(get_nick_palette_color(curLine.nick)); 
+                    if (curLine.is_highlight) {
+                        canvas.fillRect(8, current_y - 1, 56, 11, theme_accent_color()); canvas.setTextColor(theme_fg());
+                    } else {
+                        canvas.setTextColor(get_nick_palette_color(curLine.nick));
                     }
                     canvas.setCursor(8, current_y);
                     if (current_tab_index == 0) canvas.printf("%s", shortened_nick);
                     else canvas.printf("<%s>", shortened_nick);
-                    first_line_pass = false;
                 }
-                
-                canvas.setTextColor(curLine.color); 
-                canvas.setCursor(active_render_x, current_y);
+                canvas.setTextColor(curLine.color);
+                canvas.setCursor(draw_x, current_y);
                 canvas.print(sub_line);
-                current_y -= 12 * text_scale; 
-                current_char_pos += chunk;
+                current_y -= 12 * text_scale;
             }
         }
         // Topic line per-tab + chan modes viewer (no navbar clutter)
         if ((t.topic[0] || t.modes[0]) && !is_scrollback_active && current_y < wire_y - 14) {
-            canvas.setTextColor(0x7BEF);
+            canvas.setTextColor(theme_dim_color());
             canvas.setCursor(42, 14);
             int maxTopic = is_vertical ? 10 : 20;
             char topic_disp[32]={0};
@@ -1511,7 +1511,7 @@ void draw_chat_view() {
             for(int u=0;u<t.line_count;u++) if(t.lines[u].is_highlight) unread++;
             if (unread>0 && !is_scrollback_active) {
                 int bar_h = unread>8? (is_vertical? 80: 40) : unread*5;
-                canvas.fillRect(0, wire_y - bar_h, 2, bar_h, 0xFD20);
+                canvas.fillRect(0, wire_y - bar_h, 2, bar_h, theme_accent_color()); // unread bar follows accent setting
             }
             // NEW separator when scrolled back
             if (is_scrollback_active && scrollback_offset>0) {
@@ -1557,13 +1557,13 @@ void draw_chat_view() {
                 char nd[12]={0}; strncpy(nd, t.nicks[n], 10);
                 canvas.print(nd);
             }
-            canvas.setTextColor(0x7BEF); canvas.setCursor(drawer_x+4, wire_y-10); canvas.print("Ent:close");
+            canvas.setTextColor(theme_dim_color()); canvas.setCursor(drawer_x+4, wire_y-10); canvas.print("Ent:close");
         }
         // Search bar at wire_y-12 when active
         if (search_active) {
             canvas.fillRect(0, wire_y-12, display_width-6, 12, 0x4208);
             canvas.drawRect(0, wire_y-12, display_width-6, 12, 0xFFE0);
-            canvas.setTextColor(0xFFFF); canvas.setCursor(4, wire_y-10);
+            canvas.setTextColor(theme_fg()); canvas.setCursor(4, wire_y-10);
             canvas.printf("?%s_", search_query);
         }
         // Split mentions peek Fn+Q 3-line strip above wire_y
@@ -1578,7 +1578,7 @@ void draw_chat_view() {
                 int idx=gTabs[0].line_count-1-i;
                 ChatLine &ml=gTabs[0].lines[idx];
                 canvas.setCursor(4, peek_y+12+i*8);
-                canvas.setTextColor(0xFFFF);
+                canvas.setTextColor(theme_fg());
                 char tmp[22]={0}; strncpy(tmp, ml.message,20);
                 canvas.print(tmp);
             }
@@ -1613,7 +1613,6 @@ void draw_chat_view() {
                     hy+=4;
                 }
                 if(discovered_network_count==0 && hy <= wire_y-8) canvas.fillRect(sb_x+2, hy, 2, 2, 0x4208);
-                if (hy < 58) hy = 58; // pin status rows to fixed heights mirroring left rail (RSSI/backup)
                 // IRC aggregate link y=hy: green any 001/376/900, amber TCP up no handshake, red down, dim no nets
                 if (hy <= wire_y-8) {
                     uint16_t irc_c = 0x4208;
@@ -1667,7 +1666,6 @@ void draw_chat_view() {
                 dot_y+=4;
                 if(dot_y > wire_y-8) break;
             }
-            if (dot_y < 58) dot_y = 58; // pin status rows to fixed heights mirroring right rail (IRC/SD)
             // RSSI quality dot: red down, green >=-60, amber >=-75, red weak (matches -85dBm LED-22 alert)
             if (dot_y <= wire_y-8) {
                 uint16_t rssi_c = 0xF800;
@@ -1683,6 +1681,22 @@ void draw_chat_view() {
             // Backup-AP dot: amber on backup AP, dim on primary (failover transient stays on vault y18)
             if (dot_y <= wire_y-8) {
                 canvas.fillRect(lsb_x+2, dot_y, 2, 2, using_backup_ap ? 0xFD20 : 0x4208);
+                dot_y+=4;
+            }
+            // Sound dot: dim speaker OFF, green MENTION-only, amber ALL
+            if (dot_y <= wire_y-8) {
+                uint16_t snd_c = !speaker_enabled ? 0x4208 : (sound_profile>=2 ? 0xFD20 : 0x07E0);
+                canvas.fillRect(lsb_x+2, dot_y, 2, 2, snd_c);
+                dot_y+=4;
+            }
+            // Away dot: amber idle-away (5m), dim live
+            if (dot_y <= wire_y-8) {
+                canvas.fillRect(lsb_x+2, dot_y, 2, 2, is_away ? 0xFD20 : 0x4208);
+                dot_y+=4;
+            }
+            // Scrollback dot: amber viewing history (new msgs hidden), dim live
+            if (dot_y <= wire_y-8) {
+                canvas.fillRect(lsb_x+2, dot_y, 2, 2, scrollback_mode_active ? 0xFD20 : 0x4208);
             }
         }
         // TextBox Workspace Integrity: Y = 225 to 240 must remain empty - ensure cleared
@@ -1716,7 +1730,7 @@ void draw_chat_view() {
                 canvas.setTextColor(theme_dim_color(), theme_header_bg()); canvas.setCursor(2, 2);
                 canvas.printf("[%s]", display_server);
                 int chan_x = is_vertical ? 45 : 54;
-                canvas.setTextColor(theme_fg(), theme_header_bg()); canvas.setCursor(chan_x, 2);
+                canvas.setTextColor(theme_accent_color(), theme_header_bg()); canvas.setCursor(chan_x, 2);
                 char truncated_name[16] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 14); // 8->14 full names
                 truncated_name[15]='\0';
                 canvas.print(truncated_name);
@@ -1783,7 +1797,8 @@ void draw_chat_view() {
         if (chrome_dirty || input_dirty || sparkline_dirty) {
             M5Cardputer.Display.waitDisplay();
         M5Cardputer.Display.startWrite();
-        // navbar
+        // navbar (chrome pinned to size 1: 2x is chat-only)
+        M5Cardputer.Display.setTextSize(1);
         M5Cardputer.Display.fillRect(0, 0, display_width, 12, theme_header_bg());
         {
             char nav_server_str[32]={0}, nav_chan_str[32]={0};
@@ -1805,7 +1820,7 @@ void draw_chat_view() {
             M5Cardputer.Display.setTextColor(theme_dim_color(), theme_header_bg()); M5Cardputer.Display.setCursor(2, 2);
             M5Cardputer.Display.printf("[%s]", display_server);
             int chan_x = is_vertical ? 45 : 54;
-            M5Cardputer.Display.setTextColor(theme_fg(), theme_header_bg()); M5Cardputer.Display.setCursor(chan_x, 2);
+            M5Cardputer.Display.setTextColor(theme_accent_color(), theme_header_bg()); M5Cardputer.Display.setCursor(chan_x, 2);
             char truncated_name[16] = {0}; strncpy(truncated_name, nav_chan_str, is_vertical ? 6 : 14); truncated_name[15]='\0';
             M5Cardputer.Display.print(truncated_name);
             // RSSI moved to left sidebar
@@ -1824,11 +1839,13 @@ void draw_chat_view() {
             }
             // Dots moved to left/right sidebars
         }
-        // input box via Display - theme synced
+        // input box via Display - theme synced (taller at 2x so glyphs don't clip)
         {
             M5Cardputer.Display.setTextSize(text_scale);
-            M5Cardputer.Display.fillRect(0, input_box_y, display_width, textbox_height, theme_bg());
-            M5Cardputer.Display.drawFastHLine(0, wire_y, display_width, theme_dim_color());
+            int iby = (!is_vertical && text_scale==2) ? 117 : input_box_y;
+            int tbh = (!is_vertical && text_scale==2) ? 18 : textbox_height;
+            M5Cardputer.Display.fillRect(0, iby, display_width, tbh, theme_bg());
+            M5Cardputer.Display.drawFastHLine(0, iby, display_width, theme_dim_color());
             M5Cardputer.Display.setTextColor(theme_accent_color(), theme_bg());
             int input_cursor_y = is_vertical ? (text_scale==2? 223 : 227) : (text_scale==2? 118 : 124);
             M5Cardputer.Display.setCursor(4, input_cursor_y);
@@ -1885,19 +1902,23 @@ void handle_keyboard_inputs() {
     auto status = M5Cardputer.Keyboard.keysState();
     bool is_alt = M5Cardputer.Keyboard.isKeyPressed(KEY_LEFT_ALT);
     bool is_fn  = M5Cardputer.Keyboard.isKeyPressed(KEY_FN);
-    // Hold repeat guard: throttled typematic 90ms
+    // Hold repeat guard: throttled typematic 90ms (char-compare, zero String churn at 15ms poll)
     {
-        static String last_hold_word="";
+        static char last_hold_word[8]={0};
+        static uint8_t last_hold_len=0;
         static unsigned long last_hold_ms=0;
-        String cur;
-        cur.reserve(status.word.size());
-        for(auto c: status.word) cur += c;
-        if (cur.length()>0 && cur == last_hold_word && millis() - last_hold_ms < 90) {
+        static bool word_released=true;
+        uint8_t n = (uint8_t)status.word.size(); if (n>8) n=8;
+        char curw[8]; for(uint8_t k=0;k<n;k++) curw[k]=status.word[k];
+        bool same = (n>0 && n==last_hold_len);
+        for(uint8_t k=0; same && k<n; k++) if(curw[k]!=last_hold_word[k]) same=false;
+        if (n==0) word_released=true;
+        else if (same && !word_released && millis() - last_hold_ms < 90) {
             // Fn combos bypass: never eat the poll carrying a hotkey edge (Fn+P/O/I/Q/L...)
             bool fnCombo = is_fn && (M5Cardputer.Keyboard.isKeyPressed('p') || M5Cardputer.Keyboard.isKeyPressed('o') || M5Cardputer.Keyboard.isKeyPressed('l') || M5Cardputer.Keyboard.isKeyPressed('i') || M5Cardputer.Keyboard.isKeyPressed('q'));
             if (!fnCombo) { esp_task_wdt_reset(); return; }
         }
-        if (cur.length()>0) { last_hold_word = cur; last_hold_ms = millis(); }
+        if (n>0) { for(uint8_t k=0;k<n;k++) last_hold_word[k]=curw[k]; last_hold_len=n; last_hold_ms=millis(); word_released=false; }
     }
     // Fn hold ghost guard: if only Fn held with no other key word/enter/del, avoid ghost matrix scan
     if (is_fn && status.word.empty() && !status.enter && !status.del) {
@@ -2711,39 +2732,48 @@ void handle_keyboard_inputs() {
                 return;
             }
         }
-        // Handle Backspace deletions - throttled 80ms repeat to avoid hold flood
-        if (status.del) { 
+        // Handle Backspace deletions - tap deletes once, hold: 300ms delay then 100ms repeat
+        {
             static unsigned long last_del_ms=0;
-            if(millis() - last_del_ms < 80) { esp_task_wdt_reset(); return; }
-            last_del_ms = millis();
-            if (input_buffer.length() > 0) {
-                input_buffer.remove(input_buffer.length() - 1); 
-                input_needs_redraw = true; 
-            } else {
-                set_led_mode(5); 
+            static bool was_del=false, del_repeat=false;
+            if (!status.del) { was_del=false; del_repeat=false; }
+            else {
+                unsigned long now=millis();
+                if (was_del) {
+                    unsigned long th = del_repeat ? 100 : 300;
+                    if (now - last_del_ms < th) { esp_task_wdt_reset(); return; }
+                    del_repeat = true;
+                }
+                was_del=true; last_del_ms=now;
+                if (input_buffer.length() > 0) {
+                    input_buffer.remove(input_buffer.length() - 1); 
+                    input_needs_redraw = true; 
+                } else {
+                    set_led_mode(5); 
+                }
             }
         }
         
-        // Hold typematic: limit burst to 1 char, initial 350ms delay then 80ms repeat
-        // Stuck-key fuse: cap one-char bursts at 30 (~2.7s), require release before more
+        // Hold typematic: limit burst to 1 char, release-aware (fresh taps always pass), 200ms delay then 80ms repeat
+        // Stuck-key fuse: cap one-char bursts at 30 (~2.6s), require release before more. Zero String churn.
         if (status.word.size() > 1) status.word.resize(1);
-        static String last_hold_word2=""; static unsigned long last_hold_ms2=0;
+        static char last_hold_c2=0; static bool have_last2=false;
+        static unsigned long last_hold_ms2=0;
         static bool first_repeat_done=false;
         static uint8_t same_key_burst=0;
-        String cur2;
-        cur2.reserve(status.word.size());
-        for(auto c: status.word) cur2 += c;
-        if (cur2.length()>0 && cur2 == last_hold_word2) {
+        static bool released2=true;
+        char cur2 = status.word.empty() ? '\0' : status.word[0];
+        if (cur2=='\0') { released2=true; have_last2=false; first_repeat_done=false; same_key_burst=0; }
+        else if (have_last2 && cur2==last_hold_c2 && !released2) {
             unsigned long elapsed = millis() - last_hold_ms2;
-            unsigned long threshold = first_repeat_done ? 80 : 350;
+            unsigned long threshold = first_repeat_done ? 80 : 200;
             if (elapsed < threshold || same_key_burst >= 30) { esp_task_wdt_reset(); return; }
             first_repeat_done = true; same_key_burst++;
         } else {
             first_repeat_done = false;
-            if (cur2.length()>0) same_key_burst = 0;
+            same_key_burst = 0;
         }
-        if (cur2.length()>0) { last_hold_word2=cur2; last_hold_ms2=millis(); }
-        else { last_hold_word2=""; first_repeat_done=false; same_key_burst=0; }
+        if (cur2!='\0') { last_hold_c2=cur2; have_last2=true; last_hold_ms2=millis(); released2=false; }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             // Filter all Fn combos to avoid polluting input when Fn is held (Fn+P/O/I/Q/L/R/S/C/B/M/F etc plus arrows ,./;)
@@ -2958,9 +2988,12 @@ void irc_network_task(void* pvParameters) {
         }
         last_wifi_fail_tick = 0; // Reset ticker once connection settles healthy
         sync_ntp_timezone();
-        // LRU cache rotator: on successful auth via Wi-Fi Manager, vault learns new AP (char-only to avoid String fragmentation)
+        // LRU cache rotator: on successful auth via Wi-Fi Manager, vault learns new AP (10s gate, no per-poll String churn)
         {
             static char lastConnectedSSID[64] = {0};
+            static unsigned long lastLearnMs = 0;
+            if (millis() - lastLearnMs < 10000) { /* gated */ } else {
+            lastLearnMs = millis();
             String curTmp = WiFi.SSID();
             char cur[64] = {0};
             strncpy(cur, curTmp.c_str(), sizeof(cur)-1);
@@ -2975,6 +3008,7 @@ void irc_network_task(void* pvParameters) {
                     Serial.printf("[VAULT-LRU] Learned new AP %s\n", cur);
                 }
                 strncpy(lastConnectedSSID, cur, sizeof(lastConnectedSSID)-1);
+            }
             }
         }
 
@@ -3137,6 +3171,28 @@ void irc_network_task(void* pvParameters) {
                     net_client.print("CAP REQ :server-time\r\n");
                     net_client.printf("NICK %s\r\n", irc_nick);
                     net_client.printf("USER %s/%s 0 * :M5 Client\r\n", bnc_user, discovered_networks[i]);
+                    net_last_inbound[i]=millis(); net_ping_outstanding[i]=false;
+                }
+            }
+
+            // Stall watchdog: half-open TLS reports connected() forever - probe after 10m silence, recycle after 60s more
+            if (net_client.connected() && network_handshake_complete[i] && net_last_inbound[i]!=0) {
+                unsigned long silent = millis() - net_last_inbound[i];
+                if (!net_ping_outstanding[i] && silent > 600000) {
+                    net_client.printf("PING :cardputer-stall%d\r\n", i);
+                    net_client.flush();
+                    net_ping_outstanding[i]=true;
+                    net_last_inbound[i]=millis(); // grace window counts from probe
+                    Serial.printf("[NET-STALL] probe %s after 10m silence\n", discovered_networks[i]);
+                } else if (net_ping_outstanding[i] && silent > 60000) {
+                    Serial.printf("[NET-STALL] recycle %s, no reply 60s\n", discovered_networks[i]);
+                    log_system("STALL recycle %s", discovered_networks[i]);
+                    net_ping_outstanding[i]=false;
+                    net_last_inbound[i]=0;
+                    network_handshake_complete[i]=false;
+                    network_authenticated[i]=false;
+                    net_client.stop();
+                    network_reconnect_cooldown[i]=millis();
                 }
             }
 
@@ -3163,6 +3219,7 @@ void irc_network_task(void* pvParameters) {
                     while(ll>0 && (cLine[ll-1]=='\r' || cLine[ll-1]=='\n' || cLine[ll-1]==' ' || cLine[ll-1]=='\t')) { cLine[ll-1]='\0'; ll--; }
                 }
                 if (*cLine=='\0') continue;
+                net_last_inbound[i] = millis(); net_ping_outstanding[i] = false; // any wire bytes = alive
 
                 // SASL Authentication Handler: Intercept CAP negotiation
                 if (strstr(cLine, "CAP LS 302") != nullptr) {
@@ -3523,6 +3580,9 @@ void irc_network_task(void* pvParameters) {
                     set_led_mode(23); // Bright Pearl Strobe for keep-alive
                     continue; 
                 }
+                if (line.indexOf(" PONG ") != -1) {
+                    continue; // reply to our stall probe (or server echo) - not chat
+                }
 
                 // Intercept the Welcome token (001) or End of MOTD (376) to fire CAP END safely
                 if (!network_handshake_complete[i] && (line.indexOf(" 001 ") != -1 || line.indexOf(" 376 ") != -1 || line.indexOf("CAP * ACK") != -1)) {
@@ -3812,14 +3872,16 @@ void irc_network_task(void* pvParameters) {
                         { char *sl2=strchr(clean_target_room,'/'); if(sl2) *sl2='\0'; }
                         { char *ts=clean_target_room; while(*ts==' '||*ts=='\t') ts++; if(ts!=clean_target_room) memmove(clean_target_room, ts, strlen(ts)+1); char *te=clean_target_room+strlen(clean_target_room)-1; while(te>=clean_target_room && (*te==' '||*te=='\t')){*te='\0'; te--;} }
                         { char *ts=isolated_packet_server; while(*ts==' '||*ts=='\t') ts++; if(ts!=isolated_packet_server) memmove(isolated_packet_server, ts, strlen(ts)+1); char *te=isolated_packet_server+strlen(isolated_packet_server)-1; while(te>=isolated_packet_server && (*te==' '||*te=='\t')){*te='\0'; te--;} }
-                        // sender nick - from prefix :nick! before priv
+                        // sender nick - from prefix :nick! before priv (@server-time tag stripped first)
                         char sender_nick[32]="Server";
-                        if(cLine[0]==':'){
-                            char *bang = strchr(cLine,'!');
+                        const char *lineStart = cLine;
+                        if (lineStart[0]=='@') { const char *sp=strchr(lineStart,' '); if(sp){ lineStart=sp+1; while(*lineStart==' ') lineStart++; } }
+                        if(lineStart[0]==':'){
+                            char *bang = strchr((char*)lineStart,'!');
                             if(bang && bang < priv){
-                                size_t nl = (size_t)(bang - (cLine+1));
+                                size_t nl = (size_t)(bang - (lineStart+1));
                                 if(nl >= sizeof(sender_nick)) nl=sizeof(sender_nick)-1;
-                                memcpy(sender_nick, cLine+1, nl); sender_nick[nl]='\0';
+                                memcpy(sender_nick, lineStart+1, nl); sender_nick[nl]='\0';
                             }
                         }
                         // clear away on activity
@@ -3849,6 +3911,8 @@ void irc_network_task(void* pvParameters) {
                             }
 
                         // Match Target Context FIRST completely free of loop variable confusion
+                        // Ignored senders drop before slot claim so the ring head never advances on them
+                        if (is_ignored(sender_nick)) { ui_needs_redraw=true; continue; }
                         int target_tab_slot = -1;
                         for (int t = 0; t < gTabCount; t++) {
                             if (strcmp(gTabs[t].name, clean_target_room) == 0 && 
@@ -3870,14 +3934,27 @@ void irc_network_task(void* pvParameters) {
                                 clp2 = &t.lines[(t.head + MSG_BUFFER_SIZE -1) % MSG_BUFFER_SIZE];
                             }
                             ChatLine &cl = *clp2;
-                            strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
-                            strncpy(cl.nick, sender_nick, sizeof(cl.nick)-1);
-                            if (is_ignored(sender_nick)) { xSemaphoreGive(irc_mutex); ui_needs_redraw=true; continue; }
-                            strncpy(cl.message, actual_msg, sizeof(cl.message)-1);
-                            cl.color = 0xFFFF;
+                            strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1); cl.timeStr[sizeof(cl.timeStr)-1]='\0';
+                            strncpy(cl.nick, sender_nick, sizeof(cl.nick)-1); cl.nick[sizeof(cl.nick)-1]='\0';
+                            strncpy(cl.message, actual_msg, sizeof(cl.message)-1); cl.message[sizeof(cl.message)-1]='\0';
+                            cl.color = theme_fg(); // themed: white on dark rows, black on paper
                             cl.is_highlight = is_mention(actual_msg, irc_nick) && !t.muted;
                             if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
                             if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
+                            // True user mentions -> tab 0 (ring discipline; nicks never contain dots)
+                            if (cl.is_highlight && target_tab_slot != 0 && strchr(sender_nick,'.')==nullptr) {
+                                Tab &mentions_tab = gTabs[0];
+                                ChatLine *mlp;
+                                if (mentions_tab.line_count < MSG_BUFFER_SIZE) mlp = &mentions_tab.lines[(mentions_tab.head + mentions_tab.line_count) % MSG_BUFFER_SIZE];
+                                else { mentions_tab.head = (mentions_tab.head + 1) % MSG_BUFFER_SIZE; mlp = &mentions_tab.lines[(mentions_tab.head + MSG_BUFFER_SIZE - 1) % MSG_BUFFER_SIZE]; }
+                                ChatLine &ml = *mlp;
+                                strncpy(ml.timeStr, "00:00", sizeof(ml.timeStr)-1); ml.timeStr[sizeof(ml.timeStr)-1]='\0';
+                                snprintf(ml.nick, sizeof(ml.nick), "[%s]%s", isolated_packet_server, sender_nick);
+                                strncpy(ml.message, actual_msg, sizeof(ml.message)-1); ml.message[sizeof(ml.message)-1]='\0';
+                                ml.color = theme_accent_color();
+                                ml.is_highlight = true;
+                                if (mentions_tab.line_count < MSG_BUFFER_SIZE) mentions_tab.line_count++;
+                            }
                             // Auto-update and keep scroll at bottom on new messages
                             if (target_tab_slot == current_tab_index) {
                                 scrollback_offset = 0;
@@ -3918,7 +3995,7 @@ void irc_network_task(void* pvParameters) {
                             dispNick[sizeof(dispNick)-1] = '\0';
                         }
                     }
-                    add_message_to_buffer(dispNick, effectiveLine, 0xFFFF, useTime);
+                    add_message_to_buffer(dispNick, effectiveLine, theme_fg(), useTime);
                     if (gLogQueue) {
                         if (uxQueueMessagesWaiting(gLogQueue) >= 10) {
                             char dummy[128];
@@ -4003,6 +4080,17 @@ void custom_ui_loop_task(void* pvParameters) {
                 flush_log_cache();
             }
         }
+        { // idle-crash forensics: 60s RAM/stack watermark to Serial only (no SD wear)
+            static unsigned long last_hb_ms=0;
+            if (millis() - last_hb_ms > 60000) {
+                last_hb_ms = millis();
+                Serial.printf("[HEAP-HB] free %u min %u largest %u netstk %u uistk %u\n",
+                    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+                    (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+                    (unsigned)uxTaskGetStackHighWaterMark(xNetworkTaskHandle),
+                    (unsigned)uxTaskGetStackHighWaterMark(NULL));
+            }
+        }
         // Auto-away 5m idle -> AWAY :auto, Mode 10; key restores
         if (current_app_mode==MODE_CHAT && !is_away && millis() - last_user_keyboard_input_tick > 300000) {
             for(int i=0;i<discovered_network_count;i++) if(clients[i].connected()){ clients[i].printf("AWAY :auto\r\n"); clients[i].flush(); }
@@ -4022,8 +4110,6 @@ void custom_ui_loop_task(void* pvParameters) {
             target_led_mode = 9;  // Wi-Fi Disconnect Fault (Solid Sharp Orange)
         } else if (WiFi.status() == WL_CONNECTED && WiFi.RSSI() <= -85) {
             target_led_mode = 22; // Antenna Alert: Urgent Flashing Ruby Red if signal drops below -85dBm
-        } else if (gTabCount >= MAX_TABS) {
-            target_led_mode = 7;  // Memory Buffer Ceiling Fault (Flash Magenta)
         } else {
             bool highlight_active = false;
             if (irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(2)) == pdTRUE) {
@@ -4065,6 +4151,9 @@ void custom_ui_loop_task(void* pvParameters) {
             static int8_t last_bkup = -1;
             static int8_t last_irc = -1;
             static int8_t last_sdh = -1;
+            static int8_t last_snd = -1;
+            static int8_t last_awy = -1;
+            static int8_t last_scr = -1;
             if (millis() - last_sidebar_tick >= 1000) {
                 last_sidebar_tick = millis();
                 size_t curHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -4094,10 +4183,17 @@ void custom_ui_loop_task(void* pvParameters) {
                 else if (gLogQueue && uxQueueMessagesWaiting(gLogQueue) >= 8) curSdh=2;
                 else curSdh=3;
                 bool sdhChanged = (curSdh != last_sdh);
-                if (heapChanged || vaultChanged || pinnedChanged || hsChanged || rssiChanged || bkupChanged || ircChanged || sdhChanged) {
+                int8_t curSnd = !speaker_enabled ? 0 : (sound_profile>=2 ? 2 : 1);
+                bool sndChanged = (curSnd != last_snd);
+                int8_t curAwy = is_away ? 1 : 0;
+                bool awyChanged = (curAwy != last_awy);
+                int8_t curScr = scrollback_mode_active ? 1 : 0;
+                bool scrChanged = (curScr != last_scr);
+                if (heapChanged || vaultChanged || pinnedChanged || hsChanged || rssiChanged || bkupChanged || ircChanged || sdhChanged || sndChanged || awyChanged || scrChanged) {
                     last_heap = curHeap; last_vault = wifi_vault_count; last_pinned = gTabs[current_tab_index].pinned; last_hs = curHs;
                     last_rssi_b = curRssiB; last_bkup = curBkup; last_irc = curIrc; last_sdh = curSdh;
-                    if (current_app_mode == MODE_CHAT) ui_needs_redraw = true; // refresh left heap/vault/RSSI/backup + right pinned/handshake/IRC/SD
+                    last_snd = curSnd; last_awy = curAwy; last_scr = curScr;
+                    if (current_app_mode == MODE_CHAT) ui_needs_redraw = true; // refresh left heap/vault/RSSI/backup/sound/away/scrollback + right pinned/handshake/IRC/SD
                 }
             }
             static unsigned long last_time_tick = 0;
@@ -4150,9 +4246,12 @@ void custom_ui_loop_task(void* pvParameters) {
                     set_led_mode(1);
                 }
                 sync_ntp_timezone();
-                // LRU cache rotator on successful auth (char-only, no String fragmentation)
+                // LRU cache rotator on successful auth (10s gate, no per-poll String churn)
                 {
                     static char lastVaultLearn[64]={0};
+                    static unsigned long lastLearnMs2=0;
+                    if (millis() - lastLearnMs2 < 10000) { /* gated */ } else {
+                    lastLearnMs2 = millis();
                     String curTmp = WiFi.SSID();
                     char cur[64]={0}; strncpy(cur, curTmp.c_str(), sizeof(cur)-1);
                     if (cur[0]!='\0' && strcmp(cur, lastVaultLearn)!=0) {
@@ -4165,6 +4264,7 @@ void custom_ui_loop_task(void* pvParameters) {
                             save_wifi_vault_lru(cur, pass);
                         }
                         strncpy(lastVaultLearn, cur, sizeof(lastVaultLearn)-1);
+                    }
                     }
                 }
             }
@@ -4188,6 +4288,7 @@ void setup() {
     use_light_theme=false; text_scale=1;
     // No PSRAM - use 240x109 middle viewport (52KB) bloat-free, never 240x135
     Serial.printf("[GFX] heap largest %d free %d\n", heap_caps_get_largest_free_block(MALLOC_CAP_8BIT), heap_caps_get_free_size(MALLOC_CAP_8BIT));
+    Serial.printf("[BOOT] reason %d free %u min %u largest %u\n", (int)esp_reset_reason(), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
     if(!canvas.createSprite(240, 109)){
         Serial.println("[GFX] 240x109 sprite fail, trying 135x214 fallback");
         for(int t=0;t<MAX_TABS;t++){ gTabs[t].line_count=0; memset(gTabs[t].lines,0,sizeof(gTabs[t].lines)); }
