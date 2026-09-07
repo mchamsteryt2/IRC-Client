@@ -301,6 +301,7 @@ void sync_ntp_timezone();
 void load_wifi_vault_from_sd();
 void save_wifi_vault_lru(const char* ssid, const char* pass);
 void handle_vault_scan_complete();
+void wifi_scan_cleanup(); // Auto-clean driver scan buffer on WiFi menu exit (frees heap, keeps link + SD vault)
 // Session state helpers
 void save_session_state();
 void load_session_state();
@@ -642,6 +643,13 @@ void handle_vault_scan_complete() {
     }
     WiFi.scanDelete();
     busy=false;
+}
+
+// Auto-clean driver scan buffer on WiFi menu exit - frees heap immediately,
+// keeps the live connection and the SD vault (wifi_cache.txt) intact.
+void wifi_scan_cleanup() {
+    int sc = WiFi.scanComplete();
+    if (sc != -1) WiFi.scanDelete(); // >=0 results ready, -2 scan in flight (abort)
 }
 
 // ==========================================
@@ -1907,7 +1915,7 @@ void handle_keyboard_inputs() {
             else if (current_app_mode == MODE_SETTINGS) { current_app_mode = MODE_BOUNCER; }
             else if (current_app_mode == MODE_BOUNCER)  { current_app_mode = MODE_THEME; }
             else if (current_app_mode == MODE_THEME)    { current_app_mode = MODE_WIFI; }
-            else                                      { current_app_mode = MODE_CHAT; }
+            else                                      { if (current_app_mode == MODE_WIFI) wifi_scan_cleanup(); current_app_mode = MODE_CHAT; }
             menu_selection_idx = 0;
             ui_needs_redraw = true; chrome_needs_redraw = true; input_needs_redraw = true; sparkline_needs_redraw = true;
             set_led_mode(18);
@@ -1964,6 +1972,7 @@ void handle_keyboard_inputs() {
         static bool was_l_prev=false;
         bool cur_l = is_fn && M5Cardputer.Keyboard.isKeyPressed('l');
         if(cur_l && !was_l_prev){
+            if (current_app_mode == MODE_WIFI) wifi_scan_cleanup();
             current_app_mode = (current_app_mode == MODE_LOGS) ? MODE_CHAT : MODE_LOGS;
             menu_selection_idx = 0;
             ui_needs_redraw = true;
@@ -1996,6 +2005,7 @@ void handle_keyboard_inputs() {
                 xSemaphoreGive(irc_mutex);
             }
         }
+        if (current_app_mode == MODE_WIFI) wifi_scan_cleanup();
         current_app_mode = MODE_CHAT;
         input_buffer = ""; // Cleanly flush stray menu characters out of memory registers
         ui_needs_redraw = true;
@@ -2003,6 +2013,7 @@ void handle_keyboard_inputs() {
     }
     // Fn+Esc quick ~mentions jump (faster than Fn+,/ swapper)
     if (is_fn && M5Cardputer.Keyboard.isKeyPressed('`')) {
+        if (current_app_mode == MODE_WIFI) wifi_scan_cleanup();
         current_tab_index = 0;
         scrollback_offset = 0; scrollback_offset_idx = 0;
         is_scrollback_active = false; scrollback_mode_active = false;
