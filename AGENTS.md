@@ -8,14 +8,14 @@
 ## Architecture
 - Target `m5stack-stamps3` (ESP32-S3): **512 KB SRAM, no PSRAM** — heap ~320 KB free at boot (`src/main.cpp:3847`), `largest<20KB` warns (`src/main.cpp:827`), `largest<35KB`/`free<45KB` guards TLS and recycles history (`src/main.cpp:2944`), `brownout` disabled (`WRITE_PERI_REG RTC_CNTL_BROWN_OUT_REG:3881`). Never assume PSRAM; `String` heap fragments quickly and is avoided in hot paths (`src/main.cpp:301,100,3149`). Debug ring is Serial-only when `debug_log_enabled` to save RAM (`src/main.cpp:100`).
 - Single source file `src/main.cpp` (~4000 LOC) — all logic in one translation unit.
-- `MAX_NETWORKS 3` (`src/main.cpp:167`, was 5 saves ~50KB TLS), `MSG_BUFFER_SIZE 8` (was 10 saves ~3KB), `MAX_TABS 10`, `input_history 6` (was 10), stacks `10240` (was 12288 saves 4KB) — tuned for 512KB; truncates 4th/5th bouncer net with WARN `src/main.cpp:2882`.
+- `MAX_NETWORKS 3` (`src/main.cpp:167`, was 5 saves ~50KB TLS), `MSG_BUFFER_SIZE 8` (was 10 saves ~3KB), `MAX_TABS 8` (was 10 saves ~3.2KB), `input_history 6` (was 10), `gLogQueue 10` (was 20 saves 1.2KB), stacks `10240` (was 12288 saves 4KB) — tuned for 512KB; truncates 4th/5th bouncer net with WARN `src/main.cpp:2947`.
 - Dual FreeRTOS tasks `15ms` poll pinned to cores: `NetworkTask` core 0 and `CustomUITask` core 1 (`src/main.cpp:3963`), both under TWDT (10s init, tasks added after create) with `wdt_emergency_flush()`; `loop()` deletes itself (`src/main.cpp:3971`). Poll was 10ms, flush was 2s now 5s to save SD wear/CPU.
 - Shared state guarded by `irc_mutex` / `sd_mutex` and `gLogQueue`; 256-byte `log_sector_cache` batches SD writes — respect mutexes when adding SD/IRC access; `handle_vault_scan_complete` has `busy` guard to avoid dual-core race (`src/main.cpp:573`).
 - Display: `M5Canvas` sprite `240x109` (~52 KB, fallback `135x214`/`240x135`) is the safe max without PSRAM (`src/main.cpp:3848,1010` re-creates on `width==0` with trim); full-screen `240x135` OOMs. Brightness forced to `180` — hardware LED on GPIO 21 is tied to backlight rail (`src/main.cpp:281`).
 
 ## SD runtime (trust code over `README.md`)
 - Repo template `irc/config.txt` → device requires `SD:/irc/config.txt`. If `wifi_ssid=YOUR_WIFI` device opens on-device config instead of connecting.
-- Runtime files under `SD:/irc/` (lowercase, not `README`'s `/IRC`/`/serialLog.txt`): `config.txt`, `wifi_cache.txt` (5-entry `SSID:PASS` vault, LRU via `save_wifi_vault_lru()`), `session_state.tmp` (`"<netIdx> <tabIdx> <scrollFlag>"`), `history.txt`, `ignore.txt`, `highlight.txt`, `alias.txt`, `logs/<server>/<room>_YYYY_MM_DD.log`, `system/system_YYYY_MM_DD.log` (`src/main.cpp:482`). SD is self-healed `3×` at `SPI 40/39/14/12 CS=12` (`src/main.cpp:3798`).
+- Runtime files under `SD:/irc/` (lowercase, not `README`'s `/IRC`/`/serialLog.txt`): `config.txt`, `wifi_cache.txt` (3-entry `SSID:PASS` vault, was 5 saves 256B, LRU via `save_wifi_vault_lru()`), `session_state.tmp` (`"<netIdx> <tabIdx> <scrollFlag>"`), `history.txt`, `ignore.txt`, `highlight.txt`, `alias.txt`, `logs/<server>/<room>_YYYY_MM_DD.log`, `system/system_YYYY_MM_DD.log` (`src/main.cpp:482`). SD is self-healed `3×` at `SPI 40/39/14/12 CS=12` (`src/main.cpp:3798`).
 - `purge_old_logs()` caps per-file `512KB` / system purge; do not add unbounded logging.
 
 ## CI artifacts (`.github/workflows/build-cardputer.yml`)

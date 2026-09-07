@@ -14,7 +14,7 @@
 // ==========================================
 // ⚡ SYSTEM CONSTANTS & HARDWARE BUFFER BOUNDS
 // ==========================================
-#define MAX_TABS 10
+#define MAX_TABS 8 // 10->8 saves ~3.2KB (2 tabs *1.6KB) for 512KB; gTabCount truncates 9th with WARN
 #define MSG_BUFFER_SIZE 8 // 10->8 saves ~3KB (2 lines *152B *10 tabs) for 512KB; history recycle now 6
 #define COLUMNS_MAX 38
 
@@ -97,7 +97,6 @@ int ignore_count = 0;
 char highlight_words[8][32] = {{0}};
 int highlight_count = 0;
 bool is_away = false;
-bool show_dBm = false;
 bool show_mentions_peek = false;
 bool debug_log_enabled = false; // test toggle in settings only - no RAM ring (512KB tight), Serial only when enabled
 unsigned long last_away_tick = 0;
@@ -117,9 +116,9 @@ char wifi_pass2[64] = {0}; // Fallback password
 bool using_backup_ap = false;
 unsigned long last_wifi_fail_tick = 0;
 unsigned long last_user_keyboard_input_tick = 0; // Tracks live inactivity intervals
-// SD Wi-Fi Vault: up to 5 SSID:PASS pairs in /irc/wifi_cache.txt (compact ASCII flat-file, NVS-free)
-char wifi_vault_ssid[5][64] = {{0}};
-char wifi_vault_pass[5][64] = {{0}};
+// SD Wi-Fi Vault: up to 3 SSID:PASS pairs (5->3 saves 256B) in /irc/wifi_cache.txt (compact ASCII flat-file, NVS-free)
+char wifi_vault_ssid[3][64] = {{0}};
+char wifi_vault_pass[3][64] = {{0}};
 int wifi_vault_count = 0;
 unsigned long last_session_write_tick = 0; // 2s debounce for session_state.tmp
 // QoL: Input history ring (6 entries, saves ~512B for 512KB; survives tab switches)
@@ -128,8 +127,6 @@ int input_history_head = 0;
 int input_history_len = 0;
 int input_history_pos = -1; // -1 = live buffer
 bool show_nicklist = false;
-int8_t rssi_history[8] = { -127,-127,-127,-127,-127,-127,-127,-127 };
-uint8_t rssi_history_idx = 0;
 
 volatile int scrollback_offset_idx = 0; // 0 = Live bottom-anchored feed, >0 = Looking at past lines
 volatile bool scrollback_mode_active = false;
@@ -164,12 +161,12 @@ inline uint16_t theme_accent_color() {
     switch(theme_accent%5){ case 0: return 0xFD20; case 1: return 0xFDA0; case 2: return 0x07FF; case 3: return 0xF81F; default: return 0xFD20; }
 }
 inline uint16_t theme_dim_color() { return use_light_theme ? 0x5AEB : 0x7BEF; }
-char alias_names[5][16] = {{0}};
-char alias_cmds[5][64] = {{0}};
+char alias_names[3][16] = {{0}};
+char alias_cmds[3][64] = {{0}};
 int alias_count = 0;
 volatile bool request_network_reload = false;
 volatile bool master_scan_complete_global = false;
-char chan_list_cache[10][32] = {{0}};
+char chan_list_cache[5][32] = {{0}};
 int chan_list_count = 0;
 unsigned long adj_time = 0; // Sync offset for wall-clock
 int use_12_hour_format  = 1;
@@ -545,11 +542,11 @@ void log_system(const char* fmt, ...) {
 }
 
 // ==========================================
-// 📶 SD WI-FI VAULT ( /irc/wifi_cache.txt ) - 5x SSID:PASS, NVS-free
+// 📶 SD WI-FI VAULT ( /irc/wifi_cache.txt ) - 3x SSID:PASS, NVS-free (5->3)
 // ==========================================
 void load_wifi_vault_from_sd() {
     wifi_vault_count = 0;
-    for (int i=0;i<5;i++){ wifi_vault_ssid[i][0]='\0'; wifi_vault_pass[i][0]='\0'; }
+    for (int i=0;i<3;i++){ wifi_vault_ssid[i][0]='\0'; wifi_vault_pass[i][0]='\0'; }
     if (safe_mode_active) return;
     bool sd_locked = false;
     if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE);
@@ -559,7 +556,7 @@ void load_wifi_vault_from_sd() {
     if (!f) { if (sd_mutex) xSemaphoreGive(sd_mutex); return; }
     char line[130];
     int idx=0;
-    while (f.available() && idx<5) {
+    while (f.available() && idx<3) {
         int len = f.readBytesUntil('\n', line, sizeof(line)-1);
         if (len<=0){ if(f.available()) f.read(); continue; }
         line[len]='\0';
@@ -587,14 +584,14 @@ void load_wifi_vault_from_sd() {
 
 void save_wifi_vault_lru(const char* ssid, const char* pass) {
     if (!ssid || strlen(ssid)==0) return;
-    // Transient dedup + shift: new at slot 0, drop oldest 5th
-    char tmp_ssid[5][64]={{0}};
-    char tmp_pass[5][64]={{0}};
+    // Transient dedup + shift: new at slot 0, drop oldest 3rd
+    char tmp_ssid[3][64]={{0}};
+    char tmp_pass[3][64]={{0}};
     int tmp_cnt=0;
     strncpy(tmp_ssid[tmp_cnt], ssid, 63);
     strncpy(tmp_pass[tmp_cnt], pass?pass:"", 63);
     tmp_cnt++;
-    for(int i=0;i<wifi_vault_count && tmp_cnt<5;i++){
+    for(int i=0;i<wifi_vault_count && tmp_cnt<3;i++){
         if(strcmp(wifi_vault_ssid[i], ssid)==0) continue; // dedup
         strncpy(tmp_ssid[tmp_cnt], wifi_vault_ssid[i], 63);
         strncpy(tmp_pass[tmp_cnt], wifi_vault_pass[i], 63);
@@ -795,7 +792,7 @@ void load_alias_list(){
     File f=SD.open("/irc/alias.txt", FILE_READ);
     if(!f){ if(sd_mutex) xSemaphoreGive(sd_mutex); return; }
     char line[96];
-    while(f.available() && alias_count<5){
+    while(f.available() && alias_count<3){
         int len=f.readBytesUntil('\n', line, sizeof(line)-1);
         if(len<=0){ if(f.available()) f.read(); continue; }
         line[len]='\0'; if(len>0 && line[len-1]=='\r') line[len-1]='\0';
@@ -1594,6 +1591,31 @@ void draw_chat_view() {
                     hy+=4;
                 }
                 if(discovered_network_count==0 && hy <= wire_y-8) canvas.fillRect(sb_x+2, hy, 2, 2, 0x4208);
+                // IRC aggregate link y=hy: green any 001/376/900, amber TCP up no handshake, red down, dim no nets
+                if (hy <= wire_y-8) {
+                    uint16_t irc_c = 0x4208;
+                    if (discovered_network_count>0) {
+                        bool anyHs=false, anyTcp=false;
+                        for(int hi=0; hi<MAX_NETWORKS && hi < (int)discovered_network_count; hi++){
+                            if(network_handshake_complete[hi]) anyHs=true;
+                            if(clients[hi].connected()) anyTcp=true;
+                        }
+                        if (anyHs) irc_c = 0x07E0;
+                        else if (anyTcp) irc_c = theme_accent_color();
+                        else irc_c = 0xF800;
+                    }
+                    canvas.fillRect(sb_x+2, hy, 2, 2, irc_c);
+                    hy+=4;
+                }
+                // SD/log health y=hy: dim logging OFF, red SD safe-mode, amber queue pressure, green OK
+                if (hy <= wire_y-8) {
+                    uint16_t sd_c = 0x4208;
+                    if (channel_log_enabled==0) sd_c = 0x4208;
+                    else if (safe_mode_active) sd_c = 0xF800;
+                    else if (gLogQueue && uxQueueMessagesWaiting(gLogQueue) >= 8) sd_c = 0xFD20;
+                    else sd_c = 0x07E0;
+                    canvas.fillRect(sb_x+2, hy, 2, 2, sd_c);
+                }
             }
             // Left: vault + heap + per-tab dots (replaces vertical sparkline weird) - theme synced
             int lsb_x = 0;
@@ -1621,6 +1643,22 @@ void draw_chat_view() {
                 else if (gTabs[ti].line_count>0) canvas.fillRect(lsb_x+2, dot_y, 2, 2, 0x07FF);
                 dot_y+=4;
                 if(dot_y > wire_y-8) break;
+            }
+            // RSSI quality dot: red down, green >=-60, amber >=-75, red weak (matches -85dBm LED-22 alert)
+            if (dot_y <= wire_y-8) {
+                uint16_t rssi_c = 0xF800;
+                if (WiFi.status()==WL_CONNECTED) {
+                    int r = WiFi.RSSI();
+                    if (r >= -60) rssi_c = 0x07E0;
+                    else if (r >= -75) rssi_c = 0xFD20;
+                    else rssi_c = 0xF800;
+                }
+                canvas.fillRect(lsb_x+2, dot_y, 2, 2, rssi_c);
+                dot_y+=4;
+            }
+            // Backup-AP dot: amber on backup AP, dim on primary (failover transient stays on vault y18)
+            if (dot_y <= wire_y-8) {
+                canvas.fillRect(lsb_x+2, dot_y, 2, 2, using_backup_ap ? 0xFD20 : 0x4208);
             }
         }
         // TextBox Workspace Integrity: Y = 225 to 240 must remain empty - ensure cleared
@@ -2752,7 +2790,7 @@ void handle_keyboard_inputs() {
                             if(n.length() && v.length()){
                                 bool upd=false;
                                 for(int i=0;i<alias_count;i++) if(strcasecmp(alias_names[i], n.c_str())==0){ strncpy(alias_cmds[i], v.c_str(),63); upd=true; break; }
-                                if(!upd && alias_count<5){ strncpy(alias_names[alias_count], n.c_str(),15); strncpy(alias_cmds[alias_count], v.c_str(),63); alias_count++; }
+                                if(!upd && alias_count<3){ strncpy(alias_names[alias_count], n.c_str(),15); strncpy(alias_cmds[alias_count], v.c_str(),63); alias_count++; }
                                 save_alias_list();
                                 add_message_to_buffer("ClientCore", (String("Alias ")+(upd?"updated":"added")+": "+n+"="+v).c_str(), 0x07E0);
                             }
@@ -3326,7 +3364,7 @@ void irc_network_task(void* pvParameters) {
                     continue;
                 } else if (line.indexOf(" 322 ") != -1) {
                     // Minimal chan list cache (10 max, light) - do not log to chat to avoid leaking into wrong channel log
-                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<10){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } } }}
+                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<5){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } } }}
                     continue;
                 } else if (line.indexOf(" 323 ") != -1) {
                     if(chan_list_count>0){
@@ -3750,7 +3788,7 @@ void irc_network_task(void* pvParameters) {
                     }
                     add_message_to_buffer(dispNick, effectiveLine, 0xFFFF, useTime);
                     if (gLogQueue) {
-                        if (uxQueueMessagesWaiting(gLogQueue) >= 20) {
+                        if (uxQueueMessagesWaiting(gLogQueue) >= 10) {
                             char dummy[128];
                             xQueueReceive(gLogQueue, &dummy, 0);
                         }
@@ -3884,17 +3922,50 @@ void custom_ui_loop_task(void* pvParameters) {
         if (q != 255) target_led_mode = q;
         set_led_mode(target_led_mode);
 
-        // Periodic UI refresh - subtle per-element, not whole bar
+        // Periodic UI refresh - heap/vault/pinned/handshake + RSSI/backup/IRC/SD dots (replaces vertical sparkline 500ms)
         {
-            static unsigned long last_rssi_tick = 0;
-            static int8_t last_rssi_val = -127;
-            if (millis() - last_rssi_tick >= 500) {
-                last_rssi_tick = millis();
-                int8_t cur = (WiFi.status()==WL_CONNECTED) ? (int8_t)WiFi.RSSI() : -127;
-                if (cur != last_rssi_val) {
-                    last_rssi_val = cur;
-                    rssi_history[rssi_history_idx]=cur; rssi_history_idx=(rssi_history_idx+1)%8;
-                    if (current_app_mode == MODE_CHAT) sparkline_needs_redraw = true;
+            static unsigned long last_sidebar_tick = 0;
+            static size_t last_heap = 0;
+            static int last_vault = -1;
+            static int8_t last_pinned = -1;
+            static uint8_t last_hs = 0;
+            static int8_t last_rssi_b = -1;
+            static int8_t last_bkup = -1;
+            static int8_t last_irc = -1;
+            static int8_t last_sdh = -1;
+            if (millis() - last_sidebar_tick >= 1000) {
+                last_sidebar_tick = millis();
+                size_t curHeap = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+                bool heapChanged = ((last_heap < 20000) != (curHeap < 20000) || (last_heap < 35000) != (curHeap < 35000));
+                bool vaultChanged = (last_vault != wifi_vault_count);
+                bool pinnedChanged = (gTabCount>0 && current_tab_index < gTabCount) ? (last_pinned != gTabs[current_tab_index].pinned) : false;
+                uint8_t curHs=0; for(int i=0;i<MAX_NETWORKS && i < (int)discovered_network_count; i++) if(network_handshake_complete[i]) curHs |= (1<<i);
+                bool hsChanged = (curHs != last_hs);
+                int8_t curRssiB=0;
+                if (WiFi.status()==WL_CONNECTED) { int r=WiFi.RSSI(); curRssiB = (r>=-60)?3:(r>=-75)?2:1; }
+                bool rssiChanged = (curRssiB != last_rssi_b);
+                int8_t curBkup = using_backup_ap ? 1 : 0;
+                bool bkupChanged = (curBkup != last_bkup);
+                int8_t curIrc=0;
+                if (discovered_network_count>0) {
+                    bool anyHs=false, anyTcp=false;
+                    for(int i=0;i<MAX_NETWORKS && i < (int)discovered_network_count; i++){
+                        if(network_handshake_complete[i]) anyHs=true;
+                        if(clients[i].connected()) anyTcp=true;
+                    }
+                    curIrc = anyHs?3:(anyTcp?2:1);
+                }
+                bool ircChanged = (curIrc != last_irc);
+                int8_t curSdh=0;
+                if (channel_log_enabled==0) curSdh=0;
+                else if (safe_mode_active) curSdh=1;
+                else if (gLogQueue && uxQueueMessagesWaiting(gLogQueue) >= 8) curSdh=2;
+                else curSdh=3;
+                bool sdhChanged = (curSdh != last_sdh);
+                if (heapChanged || vaultChanged || pinnedChanged || hsChanged || rssiChanged || bkupChanged || ircChanged || sdhChanged) {
+                    last_heap = curHeap; last_vault = wifi_vault_count; last_pinned = gTabs[current_tab_index].pinned; last_hs = curHs;
+                    last_rssi_b = curRssiB; last_bkup = curBkup; last_irc = curIrc; last_sdh = curSdh;
+                    if (current_app_mode == MODE_CHAT) ui_needs_redraw = true; // refresh left heap/vault/RSSI/backup + right pinned/handshake/IRC/SD
                 }
             }
             static unsigned long last_time_tick = 0;
@@ -4069,7 +4140,7 @@ void setup() {
 
     irc_mutex = xSemaphoreCreateMutex();
     sd_mutex = xSemaphoreCreateMutex();
-    gLogQueue = xQueueCreate(20, sizeof(char) * 128);
+    gLogQueue = xQueueCreate(10, sizeof(char) * 128); // 20->10 saves 1280B
     input_buffer.reserve(201);
     // Ensure system log dir after mutex will be created in log_system itself
     gTabCount = 1; current_tab_index = 0; memset(&gTabs, 0, sizeof(gTabs));
