@@ -192,8 +192,8 @@ int input_buffer_cursor = 0;
 // ==========================================
 void set_led_mode(uint8_t mode) {
     uint8_t r = 0, g = 0, b = 0;
-    static unsigned long last_toggle[43] = {0};
-    static bool flash_state[43] = {false};
+    static unsigned long last_toggle[56] = {0};
+    static bool flash_state[56] = {false};
     
     switch (mode) {
         case 0: // Mode 0: Inbound Private Message / Direct Query Alert (Flashing Cyan-White)
@@ -544,8 +544,11 @@ void log_system(const char* fmt, ...) {
 // 📶 SD WI-FI VAULT ( /irc/wifi_cache.txt ) - 3x SSID:PASS, NVS-free (5->3)
 // ==========================================
 void load_wifi_vault_from_sd() {
-    wifi_vault_count = 0;
-    for (int i=0;i<3;i++){ wifi_vault_ssid[i][0]='\0'; wifi_vault_pass[i][0]='\0'; }
+    // Parse into locals first - commit to globals only on success so a contended
+    // mutex or missing file never wipes the live RAM copy auto-roam depends on
+    char tmp_ssid[3][64]={{0}};
+    char tmp_pass[3][64]={{0}};
+    int idx=0;
     if (safe_mode_active) return;
     bool sd_locked = false;
     if (sd_mutex) sd_locked = (xSemaphoreTake(sd_mutex, pdMS_TO_TICKS(50)) == pdTRUE);
@@ -554,7 +557,6 @@ void load_wifi_vault_from_sd() {
     File f = SD.open("/irc/wifi_cache.txt", FILE_READ);
     if (!f) { if (sd_mutex) xSemaphoreGive(sd_mutex); return; }
     char line[130];
-    int idx=0;
     while (f.available() && idx<3) {
         int len = f.readBytesUntil('\n', line, sizeof(line)-1);
         if (len<=0){ if(f.available()) f.read(); continue; }
@@ -571,13 +573,15 @@ void load_wifi_vault_from_sd() {
         while(*pass==' '||*pass=='\t') pass++;
         char *pe=pass+strlen(pass)-1; while(pe>=pass && (*pe==' '||*pe=='\t')){*pe='\0'; pe--;}
         if (strlen(ssid)==0) continue;
-        strncpy(wifi_vault_ssid[idx], ssid, 63); wifi_vault_ssid[idx][63]='\0';
-        strncpy(wifi_vault_pass[idx], pass, 63); wifi_vault_pass[idx][63]='\0';
+        strncpy(tmp_ssid[idx], ssid, 63); tmp_ssid[idx][63]='\0';
+        strncpy(tmp_pass[idx], pass, 63); tmp_pass[idx][63]='\0';
         idx++;
     }
-    wifi_vault_count=idx;
     f.close();
     if (sd_mutex) xSemaphoreGive(sd_mutex);
+    for (int i=0;i<3;i++){ strncpy(wifi_vault_ssid[i], tmp_ssid[i], 63); wifi_vault_ssid[i][63]='\0';
+        strncpy(wifi_vault_pass[i], tmp_pass[i], 63); wifi_vault_pass[i][63]='\0'; }
+    wifi_vault_count=idx;
     // Keep Y=120 wide-open: this is background SD-only, no canvas draw
 }
 
@@ -877,20 +881,23 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         int target_idx = (gTabCount > 0 && current_tab_index < gTabCount) ? current_tab_index : 0;
         Tab &t = gTabs[target_idx];
         
-        // Auto-Scrolling Rolling Viewport Shifter Engine (memmove)
-        if (t.line_count >= MSG_BUFFER_SIZE) {
-            memmove(&t.lines[0], &t.lines[1], (MSG_BUFFER_SIZE-1)*sizeof(ChatLine));
-            t.line_count = MSG_BUFFER_SIZE - 1; // Open up the absolute bottom slot row for our incoming text
+        // Ring insert (same discipline as PRIVMSG path + readers: head advances, no memmove)
+        ChatLine *clp;
+        if (t.line_count < MSG_BUFFER_SIZE) {
+            clp = &t.lines[(t.head + t.line_count) % MSG_BUFFER_SIZE];
+        } else {
+            t.head = (t.head + 1) % MSG_BUFFER_SIZE;
+            clp = &t.lines[(t.head + MSG_BUFFER_SIZE - 1) % MSG_BUFFER_SIZE];
         }
-        // Heap guard: log largest free block <20KB
+        // Heap guard: log largest free block <20KB, LED trips lower at <15KB to cut strobe frequency
         if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 20000) {
             int largest=heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
             Serial.printf("[HEAP] largest free %d <20KB\n", largest);
             log_system("HEAP largest %d <20KB", largest);
-            set_led_mode(34);
+            if (largest < 15000) set_led_mode(34);
         }
         
-        ChatLine &cl = t.lines[t.line_count];
+        ChatLine &cl = *clp;
         if (timeStr) strncpy(cl.timeStr, timeStr, sizeof(cl.timeStr)-1);
         else strncpy(cl.timeStr, "00:00", sizeof(cl.timeStr)-1);
         strncpy(cl.nick, source, sizeof(cl.nick)-1);
@@ -899,7 +906,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         // Fixed: case-insensitive word-boundary mention, not server noise, muted suppress
         cl.is_highlight = is_mention(msg, irc_nick) && strcasecmp(source, "server")!=0 && strcasecmp(source, "ClientCore")!=0 && !is_ignored(source) && !t.muted;
         if (cl.is_highlight && speaker_enabled && sound_profile>=1) M5.Speaker.tone(800, 80);
-        t.line_count++;
+        if (t.line_count < MSG_BUFFER_SIZE) t.line_count++;
         // Auto-update and keep scroll at bottom on new messages (requested)
         if (target_idx == current_tab_index) {
             scrollback_offset = 0;
@@ -937,7 +944,7 @@ void add_message_to_buffer(const char* source, const char* msg, uint16_t color, 
         if (heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) < 20000) {
             heapLargest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
             needHeapLog = true;
-            set_led_mode(34);
+            if (heapLargest < 15000) set_led_mode(34); // LED trips lower to cut strobe frequency
         }
         xSemaphoreGive(irc_mutex);
         ui_needs_redraw = true;
@@ -3021,7 +3028,7 @@ void irc_network_task(void* pvParameters) {
                         net_name.trim();
                         
                         if (net_name.length() > 0) { 
-                            strncpy(discovered_networks[discovered_network_count], net_name.c_str(), 31); 
+                            strncpy(discovered_networks[discovered_network_count], net_name.c_str(), 31); discovered_networks[discovered_network_count][31]='\0';
                             discovered_network_count++; 
                         }
                         if (comma_idx == -1) break; 
@@ -3029,7 +3036,7 @@ void irc_network_task(void* pvParameters) {
                     }
                     if(discovered_network_count==0){
                         // Fallback: bouncer didn't send Available:, use bnc_host as single network
-                        strncpy(discovered_networks[0], bnc_host, 31);
+                        strncpy(discovered_networks[0], bnc_host, 31); discovered_networks[0][31]='\0';
                         discovered_network_count=1;
                         Serial.println("[NET] No Available: line, fallback to bnc_host");
                     }
@@ -3391,7 +3398,7 @@ void irc_network_task(void* pvParameters) {
                     continue;
                 } else if (line.indexOf(" 322 ") != -1) {
                     // Minimal chan list cache (10 max, light) - do not log to chat to avoid leaking into wrong channel log
-                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<5){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_count++; } } }}
+                    int p322=line.indexOf(" 322 "); int s1=line.indexOf(' ', p322+5); if(s1!=-1){ int s2=line.indexOf(' ', s1+1); if(s2!=-1){ int s3=line.indexOf(' ', s2+1); int s4=line.indexOf(' ', s3+1); String chan=(s4==-1)? line.substring(s3+1): line.substring(s3+1, s4); chan.trim(); if(chan.startsWith("#")||chan.startsWith("&")){ if(chan_list_count<5){ strncpy(chan_list_cache[chan_list_count], chan.c_str(),31); chan_list_cache[chan_list_count][31]='\0'; chan_list_count++; } } }}
                     continue;
                 } else if (line.indexOf(" 323 ") != -1) {
                     if(chan_list_count>0){
