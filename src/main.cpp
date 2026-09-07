@@ -209,9 +209,7 @@ void set_led_mode(uint8_t mode) {
         case 5:  r = 95; g = 95; b = 95; break; // Mode 5: TextBox Underflow Boundary (High-Contrast Pure White Strobe)
         case 6:  // Mode 6: Battery Critical Alert (Crimson Breathe Wave)
             r = (sin(millis() / 200.0) + 1.0) * 20; break;
-        case 7:  // Mode 7: Tab Memory Ceiling Barrier (Alternating Teal/Red Double Strobe) - de-conflicted
-            if (millis() - last_toggle[mode] > 180) { flash_state[mode] = !flash_state[mode]; last_toggle[mode] = millis(); }
-            if (flash_state[mode]) { b = 60; g = 65; r = 5; } else { r = 75; g = 5; b = 5; } break;
+        case 7:  r = 70; b = 45; break; // Mode 7: Tab Memory Ceiling Barrier (solid violet-red, no strobe)
         case 8:  r = 40; g = 20; b = 40; break; // Mode 8: Pinned channel indicator
         case 9:  r = 90; g = 12; break; // Mode 9: Wi-Fi Disconnect Fault (Solid Sharp Orange)
         case 10: r = 0; g = 0; b = 0; break; // Mode 10: Privacy Stealth Blackout Mode (Zero Dark Panel)
@@ -1068,6 +1066,12 @@ bool is_mention(const char* msg, const char* nick) {
 // 🎬 RETRO-TERMINAL GRAPHICS RENDERING ENGINE
 // ==========================================
 void draw_chat_view() {
+    // Mode-change full redraw: menus push at (0,0), chat at (0,12) - repaint all zones so no menu pixels survive
+    static AppMode last_drawn_mode = MODE_CHAT;
+    if (current_app_mode != last_drawn_mode) {
+        last_drawn_mode = current_app_mode;
+        ui_needs_redraw = true; chrome_needs_redraw = true; input_needs_redraw = true; sparkline_needs_redraw = true;
+    }
     if (!ui_needs_redraw && !chrome_needs_redraw && !input_needs_redraw && !sparkline_needs_redraw && ui_scroll_y_interpolation == 0.0f) return;
     // OOM guard: canvas may be null after heap collapse - recreate or abort draw to avoid null deref reboot
     if (canvas.width()==0 || canvas.height()==0) {
@@ -1093,7 +1097,7 @@ void draw_chat_view() {
     bool is_vertical = (display_width < display_height);
     int navbar_clamp_x = is_vertical ? 65 : 135; // 115->135 for full 14-char chan after moving rssi/dots left
     int rssi_anchor_x = is_vertical ? 85 : 120; // rssi now left sidebar, anchor kept for fallback
-    int battery_anchor_x = is_vertical ? 110 : 225;
+    int battery_anchor_x = is_vertical ? 110 : 212; // 225->212: "100%" (24px) wrapped past 240 onto next line
     int wire_y = is_vertical ? 224 : 121;
     int input_box_y = is_vertical ? 225 : 121;
     // Disable scroll interpolation animation (was 97+interpolation causing 12px bounce flicker on every new message / flood)
@@ -1224,7 +1228,7 @@ void draw_chat_view() {
             canvas.setCursor(6, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print(";/. Scroll | Enter:Open Fn+F Find Fn+S Pin");
         }
         canvas.pushSprite(0, 0); 
-        if (canvas.height()==109) M5Cardputer.Display.fillRect(0, 109, 240, 26, 0x0000);
+        if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), 0x0000);
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
@@ -1336,7 +1340,8 @@ void draw_chat_view() {
         canvas.drawFastHLine(0, bar_y - 1, display_width, 0x7BEF);
         canvas.setCursor(10, bar_y + 2); canvas.setTextColor(0xFFFF); canvas.print("Esc: Exit | ,/. Adjust Value");
         canvas.pushSprite(0, 0); 
-        if (canvas.height()==109) M5Cardputer.Display.fillRect(0, 109, 240, 26, 0x0000);
+        { uint16_t menu_bg = (current_app_mode==MODE_THEME && use_light_theme) ? 0xFFFF : 0x0000;
+          if (canvas.height() < display_height) M5Cardputer.Display.fillRect(0, canvas.height(), display_width, display_height - canvas.height(), menu_bg); }
         ui_needs_redraw = false; 
         chrome_needs_redraw = false;
         input_needs_redraw = false;
@@ -1432,7 +1437,7 @@ void draw_chat_view() {
                     dynamic_chars_budget = 15 / text_scale;
                     if (dynamic_chars_budget < 5) dynamic_chars_budget = 5;
                 } else {
-                    int dynamic_max_width = display_width - 4 - active_render_x;
+                    int dynamic_max_width = display_width - 8 - active_render_x; // -8 keeps last char clear of 6px right rail
                     dynamic_chars_budget = dynamic_max_width / (6*text_scale);
                 }
                 if (dynamic_chars_budget <= 0) break;
@@ -1573,8 +1578,8 @@ void draw_chat_view() {
         {
             // Right: WiFi + battery (battery % stays top) - theme synced
             int sb_x = display_width - 6;
-            canvas.fillRect(sb_x, 12, 6, wire_y - 12, theme_header_bg());
-            canvas.drawFastVLine(sb_x, 12, wire_y - 12, theme_dim_color());
+            canvas.fillRect(sb_x, 0, 6, canvas.height(), theme_header_bg());
+            canvas.drawFastVLine(sb_x, 0, canvas.height(), theme_dim_color());
             uint16_t wifi_c = (WiFi.status()==WL_CONNECTED) ? 0x07E0 : 0xF800;
             canvas.fillRect(sb_x+2, 14, 2, 2, wifi_c);
             float bp = get_calibrated_battery_percentage();
@@ -1627,8 +1632,8 @@ void draw_chat_view() {
             }
             // Left: vault + heap + per-tab dots (replaces vertical sparkline weird) - theme synced
             int lsb_x = 0;
-            canvas.fillRect(lsb_x, 12, 6, wire_y - 12, theme_header_bg());
-            canvas.drawFastVLine(lsb_x+5, 12, wire_y - 12, theme_dim_color());
+            canvas.fillRect(lsb_x, 0, 6, canvas.height(), theme_header_bg());
+            canvas.drawFastVLine(lsb_x+5, 0, canvas.height(), theme_dim_color());
             // Heap largest 2x2 y14: red <20KB 34, amber <35KB guard 2944, dim 4208 ok
             {
                 size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -2248,9 +2253,12 @@ void handle_keyboard_inputs() {
     // 🎮 TRUE HARDWARE PHYSICAL D-PAD LAYER (ACTIVE IN MENUS)
     // ==========================================
     if (current_app_mode != MODE_CHAT) {
-        
+        // Menu hold-repeat guard: D-pad fires every 15ms poll, throttle to 150ms like chat layers
+        static unsigned long last_menu_up_ms=0, last_menu_dn_ms=0, last_menu_adj_ms=0;
         // 1. VERTICAL SCROLLING AXIS (Semicolon = UP | Period = DOWN)
         if (M5Cardputer.Keyboard.isKeyPressed(';')) { // Physical UP Key
+            if (millis() - last_menu_up_ms < 150) { esp_task_wdt_reset(); return; }
+            last_menu_up_ms = millis();
             if (current_app_mode == MODE_NAVIGATOR) {
                 if (nav_channel_select_idx > 0) { nav_channel_select_idx--; ui_needs_redraw = true; }
             } else {
@@ -2259,6 +2267,8 @@ void handle_keyboard_inputs() {
             return;
         }
         if (M5Cardputer.Keyboard.isKeyPressed('.')) { // Physical DOWN Key
+            if (millis() - last_menu_dn_ms < 150) { esp_task_wdt_reset(); return; }
+            last_menu_dn_ms = millis();
             if (current_app_mode == MODE_NAVIGATOR) {
                 int total_chans = 0;
                 for (int i = 0; i < gTabCount; i++) {
@@ -2291,6 +2301,8 @@ void handle_keyboard_inputs() {
 
         // 2. HORIZONTAL ADJUSTMENT AXIS (Comma = LEFT / DECREMENT | Forward Slash = RIGHT / INCREMENT)
         if (M5Cardputer.Keyboard.isKeyPressed(',') || M5Cardputer.Keyboard.isKeyPressed('/')) {
+            if (millis() - last_menu_adj_ms < 150) { esp_task_wdt_reset(); return; }
+            last_menu_adj_ms = millis();
             bool forward = M5Cardputer.Keyboard.isKeyPressed('/'); // Right = True, Left = False
             ui_needs_redraw = true;
             
@@ -2696,21 +2708,25 @@ void handle_keyboard_inputs() {
         }
         
         // Hold typematic: limit burst to 1 char, initial 350ms delay then 80ms repeat
+        // Stuck-key fuse: cap one-char bursts at 30 (~2.7s), require release before more
         if (status.word.size() > 1) status.word.resize(1);
         static String last_hold_word2=""; static unsigned long last_hold_ms2=0;
         static bool first_repeat_done=false;
+        static uint8_t same_key_burst=0;
         String cur2;
         cur2.reserve(status.word.size());
         for(auto c: status.word) cur2 += c;
         if (cur2.length()>0 && cur2 == last_hold_word2) {
             unsigned long elapsed = millis() - last_hold_ms2;
             unsigned long threshold = first_repeat_done ? 80 : 350;
-            if (elapsed < threshold) { esp_task_wdt_reset(); return; }
-            first_repeat_done = true;
+            if (elapsed < threshold || same_key_burst >= 30) { esp_task_wdt_reset(); return; }
+            first_repeat_done = true; same_key_burst++;
         } else {
             first_repeat_done = false;
+            if (cur2.length()>0) same_key_burst = 0;
         }
         if (cur2.length()>0) { last_hold_word2=cur2; last_hold_ms2=millis(); }
+        else { last_hold_word2=""; first_repeat_done=false; same_key_burst=0; }
         // Append standard printable characters into the buffer
         for (auto c : status.word) {
             // Filter all Fn combos to avoid polluting input when Fn is held (Fn+P/O/I/Q/L/R/S/C/B/M/F etc plus arrows ,./;)
@@ -3601,8 +3617,84 @@ void irc_network_task(void* pvParameters) {
                         }
                     }
                 }
-                if (line.indexOf(" ACCOUNT ") != -1 || line.indexOf(" AWAY ") != -1) {
+                if (line.indexOf(" 305 ") != -1 || line.indexOf(" 306 ") != -1) {
+                    continue; // self away on/off echo (auto-away 5m + key restore) - tracked locally, keep out of chat/mentions
+                }
+                if (line.indexOf(" ACCOUNT ") != -1) {
                     continue;
+                }
+                // AWAY-NOTIFY both forms - mark nicklist state, keep raw protocol out of chat/mentions
+                {
+                    int pA = line.indexOf(" AWAY");
+                    if (pA != -1) {
+                        bool isMsg = line.indexOf(" AWAY ") != -1;
+                        bool isBack = line.endsWith(" AWAY") || line.indexOf(" AWAY\r") != -1;
+                        if (isMsg || isBack) {
+                            int bang = line.indexOf('!');
+                            String anick = "";
+                            if (line.startsWith(":") && bang != -1 && bang < pA) anick = line.substring(1, bang);
+                            anick.trim();
+                            if (anick.length() && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE) {
+                                for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k], anick.c_str())==0) gTabs[t].nicks_away[k] = !isBack;
+                                xSemaphoreGive(irc_mutex); ui_needs_redraw=true;
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // QUIT / PART / NICK / KICK - nicklist maintenance, keep raw protocol out of chat/mentions
+                {
+                    const char *p = cLine;
+                    if (p[0]=='@') { const char *s=strchr(p,' '); if(s){ p=s+1; while(*p==' ') p++; } }
+                    if (p[0]==':') {
+                        const char *s1=strchr(p,' ');
+                        if (s1) {
+                            const char *cs=s1+1; const char *ce=strchr(cs,' '); size_t cl=ce?(size_t)(ce-cs):strlen(cs);
+                            if (cl==4||cl==5) {
+                                char cmd[6]={0}; memcpy(cmd,cs,cl); cmd[cl]='\0';
+                                bool isCmd = (!strcmp(cmd,"QUIT")||!strcmp(cmd,"PART")||!strcmp(cmd,"NICK")||!strcmp(cmd,"KICK"));
+                                if (isCmd) {
+                                    char who[32]={0};
+                                    const char *bang=strchr(p,'!');
+                                    if (bang && bang<s1) { size_t nl=(size_t)(bang-(p+1)); if(nl>=sizeof(who)) nl=sizeof(who)-1; memcpy(who,p+1,nl); who[nl]='\0'; }
+                                    // params after command
+                                    char p1[64]={0}, p2[32]={0};
+                                    if (ce) { const char *ps=ce+1; while(*ps==' ') ps++; if(*ps==':') ps++;
+                                        const char *pe=strchr(ps,' '); size_t l1=pe?(size_t)(pe-ps):strlen(ps);
+                                        if(l1>=sizeof(p1)) l1=sizeof(p1)-1; memcpy(p1,ps,l1); p1[l1]='\0';
+                                        if(pe){ ps=pe+1; while(*ps==' ') ps++; if(*ps==':') ps++;
+                                            pe=strchr(ps,' '); size_t l2=pe?(size_t)(pe-ps):strlen(ps);
+                                            if(l2>=sizeof(p2)) l2=sizeof(p2)-1; memcpy(p2,ps,l2); p2[l2]='\0'; } }
+                                    { char *cr=strchr(p1,'\r'); if(cr) *cr='\0'; cr=strchr(p1,'\n'); if(cr) *cr='\0';
+                                      cr=strchr(p2,'\r'); if(cr) *cr='\0'; cr=strchr(p2,'\n'); if(cr) *cr='\0'; }
+                                    if (who[0] && irc_mutex && xSemaphoreTake(irc_mutex, pdMS_TO_TICKS(5))==pdTRUE) {
+                                        if (!strcmp(cmd,"QUIT")) {
+                                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k],who)==0){
+                                                for(int m=k;m<gTabs[t].nick_count-1;m++){ strncpy(gTabs[t].nicks[m],gTabs[t].nicks[m+1],15); gTabs[t].nicks_away[m]=gTabs[t].nicks_away[m+1]; }
+                                                memset(gTabs[t].nicks[gTabs[t].nick_count-1],0,16); gTabs[t].nicks_away[gTabs[t].nick_count-1]=false;
+                                                gTabs[t].nick_count--; k--;
+                                            }
+                                        } else if (!strcmp(cmd,"NICK") && p1[0]) {
+                                            for(int t=0;t<gTabCount;t++) for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k],who)==0){
+                                                strncpy(gTabs[t].nicks[k],p1,15); gTabs[t].nicks[k][15]='\0';
+                                            }
+                                        } else {
+                                            // PART (p1=chan, who leaves) / KICK (p1=chan, p2=victim) - prune victim from matching chan tabs
+                                            const char *victim = !strcmp(cmd,"KICK") ? (p2[0]?p2:who) : who;
+                                            for(int t=0;t<gTabCount;t++) if(strcmp(gTabs[t].name,p1)==0 && strcasecmp(gTabs[t].server,isolated_packet_server)==0)
+                                                for(int k=0;k<gTabs[t].nick_count;k++) if(strcasecmp(gTabs[t].nicks[k],victim)==0){
+                                                    for(int m=k;m<gTabs[t].nick_count-1;m++){ strncpy(gTabs[t].nicks[m],gTabs[t].nicks[m+1],15); gTabs[t].nicks_away[m]=gTabs[t].nicks_away[m+1]; }
+                                                    memset(gTabs[t].nicks[gTabs[t].nick_count-1],0,16); gTabs[t].nicks_away[gTabs[t].nick_count-1]=false;
+                                                    gTabs[t].nick_count--; k--;
+                                                }
+                                        }
+                                        xSemaphoreGive(irc_mutex); ui_needs_redraw=true;
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                 }
                 // Chan modes viewer: capture MODE #chan +nt etc
                 if (line.indexOf(" MODE ") != -1) {
@@ -3626,6 +3718,7 @@ void irc_network_task(void* pvParameters) {
                             xSemaphoreGive(irc_mutex); ui_needs_redraw=true;
                         }
                     }
+                    continue; // captured to tab modes viewer above, keep raw MODE out of chat/mentions
                 }
                 
                 if (line.indexOf(" 001 ") != -1 || line.indexOf(" JOIN ") != -1) {
@@ -3638,6 +3731,17 @@ void irc_network_task(void* pvParameters) {
                     }
                     // Do not show JOIN in main screen / current tab chat - already handled via tab creation
                     if (line.indexOf(" JOIN ") != -1) continue;
+                }
+                // Blanket server-numeric shield: 001/MOTD/lusers/005/etc never chat (char-only, @tag aware)
+                {
+                    const char *p = cLine;
+                    if (p[0]=='@') { const char *s=strchr(p,' '); if(s){ p=s+1; while(*p==' ') p++; } }
+                    if (!strncmp(p,"ERROR",5)) continue;
+                    if (p[0]==':') {
+                        const char *s1=strchr(p,' ');
+                        if (s1 && s1[1]>='0'&&s1[1]<='9'&&s1[2]>='0'&&s1[2]<='9'&&s1[3]>='0'&&s1[3]<='9'&&(s1[4]==' '||s1[4]=='\0'||s1[4]=='\r'||s1[4]=='\n')) continue;
+                        if (s1 && (!strncmp(s1+1,"ERROR ",6)||!strncmp(s1+1,"ERROR",5))) continue;
+                    }
                 }
                 String network_context = String(discovered_networks[i]);
                 if (network_context.length() == 0) network_context = "BNC";
